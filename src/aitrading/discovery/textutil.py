@@ -60,6 +60,8 @@ _IMPLIED_END = {
     "td": frozenset({"td", "th", "tr"}),
     "th": frozenset({"td", "th", "tr"}),
 }
+# Elements that bound the "button scope" in which a start tag implicitly closes an open <p>.
+_SCOPE_TAGS = frozenset({"applet", "button", "caption", "html", "marquee", "object", "table", "td", "template", "th"})
 # Elements that start / end a block of text (a paragraph break in the output).
 _BLOCK_TAGS = frozenset(
     {
@@ -124,12 +126,15 @@ class _HtmlExtractor(HTMLParser):
     ``self._stack`` holds the open elements of a skipped region as ``(tag, kind)`` frames, where kind
     is "hard" (never text: script, head, hidden elements, ...), "soft" (page furniture: nav, footer,
     ...) or "inner" (an ordinary element nested inside a skipped region, tracked so that end tags
-    match the right element). The stack is empty while reading normal text.
+    match the right element). The stack is empty while reading normal text. ``self._open`` tracks the
+    elements open outside skipped regions, so that an end tag closing one of them also ends a skipped
+    region left open inside it (``<h1>Title <span hidden>x</h1>``), as browsers do.
     """
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)  # decodes &amp; &#8217; &nbsp; ...
         self._stack: list[tuple[str, str]] = []
+        self._open: list[str] = []
         self._pre = 0
         self._blocks: list[str] = []
         self._buf: list[str] = []
@@ -179,6 +184,15 @@ class _HtmlExtractor(HTMLParser):
         if had_soft and not any(kind == "soft" for _, kind in self._stack):
             self._close_soft_capture()
 
+    def _close_implied(self, tag: str) -> None:
+        """Pop open (non-skipped) elements whose end tag is implied by start tag ``tag`` (HTML5)."""
+        if tag in _P_CLOSERS and "p" in self._open:
+            i = len(self._open) - 1 - self._open[::-1].index("p")
+            if not any(t in _SCOPE_TAGS for t in self._open[i + 1 :]):
+                del self._open[i:]
+        while self._open and tag in _IMPLIED_END.get(self._open[-1], ()):
+            self._open.pop()
+
     def _maybe_close_head(self) -> None:
         """HTML5 ends <head> implicitly at the first body element or text, even without </head>.
 
@@ -211,7 +225,9 @@ class _HtmlExtractor(HTMLParser):
             self._pop_to(0)  # ...and read the main content
         hidden = _is_hidden(attrs)
         mode = self._mode()
-        if mode != "normal":
+        if mode == "normal":
+            self._close_implied(tag)
+        else:
             if tag in _VOID_TAGS:
                 if mode == "soft":
                     if tag == "br":
@@ -227,13 +243,17 @@ class _HtmlExtractor(HTMLParser):
         if tag in _VOID_TAGS:
             if hidden:
                 return
-        elif tag in _HARD_SKIP or hidden:
-            self._stack.append((tag, "hard"))
+        elif tag in _HARD_SKIP or hidden or tag in _SOFT_SKIP:
+            if tag in _BLOCK_TAGS or tag in ("nav", "footer"):
+                self._flush()  # a skipped block still separates the text before and after it
+            if tag in _SOFT_SKIP and not hidden:
+                self._stack.append((tag, "soft"))
+                self._soft_buf, self._soft_blocks = [], []
+            else:
+                self._stack.append((tag, "hard"))
             return
-        elif tag in _SOFT_SKIP:
-            self._stack.append((tag, "soft"))
-            self._soft_buf, self._soft_blocks = [], []
-            return
+        else:
+            self._open.append(tag)
         if tag == "h1" and self.h1 is None:
             self._in_h1 = True
         if tag == "pre":
@@ -273,8 +293,13 @@ class _HtmlExtractor(HTMLParser):
                     if mode == "soft" and tag in _BLOCK_TAGS:
                         self._flush_soft()
                     self._pop_to(i)
-                    break
-            return  # an end tag inside (or closing) a skipped region; stray end tags are ignored
+                    return
+            if tag not in self._open or tag in ("body", "html"):
+                return  # a stray end tag (ignored, like browsers do); </body> is treated as end of input
+            self._pop_to(0)  # it closes an element that encloses the whole skipped region
+        if tag in self._open:
+            while self._open.pop() != tag:
+                pass
         if tag == "h1" and self._in_h1:
             self._in_h1 = False
             h1 = normalize_whitespace("".join(self._h1))

@@ -177,6 +177,8 @@ def test_html_unclosed_page_furniture_does_not_swallow_the_article():
     # regression: an unclosed <nav> used to drop everything after it
     assert html_to_text("<nav><a>Home</a><article><p>Main article text.</p></article>") == "Main article text."
     assert html_to_text("<nav><a>Home</a><main><p>Main text.</p></main><footer>(c) 2026</footer>") == "Main text."
+    # closed implicitly by the end tag of the wrapper it sits in
+    assert html_to_text("<div class=w><nav><a>Home</a></div><div class=c><p>Article.</p></div>") == "Article."
     # never closed and no <main>/<article>: keep the text (browsers show it) rather than lose the page
     text = html_to_text("<p>Intro.</p><nav><a>Home</a></div><div><p>Swallowed article text.</p></div></body></html>")
     assert "Intro." in text and "Swallowed article text." in text
@@ -201,6 +203,11 @@ def test_html_hidden_content_is_dropped():
     assert html_to_text("<p hidden>Hidden<p>Visible") == "Visible"
     assert html_to_text("<ul><li hidden>x<ul><li>nested</li></ul><li>shown</ul>") == "shown"
     assert html_to_text("<table><tr hidden><td>a<td>b<tr><td>c</table>") == "c"
+    # an end tag of an enclosing element ends a hidden region left open inside it (as in browsers)...
+    assert html_to_text("<h1>Title <span hidden>x</h1><p>Text") == "Title\n\nText"
+    # ...but a stray end tag does not reveal hidden text
+    assert html_to_text("<div hidden>text</p>more hidden</div><p>v</p>") == "v"
+    assert html_to_text("<p>a<p>b<div hidden>x</p>y</div>z") == "a\n\nb\n\nz"
     # hidden="until-found" is collapsed (expandable) content, and look-alike style properties are not hidden
     assert html_to_text('<div hidden="until-found">Collapsed section.</div>') == "Collapsed section."
     assert html_to_text('<div style="min-display:none">Shown.</div><div hidden/><p>After.</p>') == "Shown.\n\nAfter."
@@ -519,6 +526,26 @@ def test_parse_feed_rejects_non_feeds_and_entity_bombs():
         parse_feed(b"<html><body>hi</body></html>", name="x")
     with pytest.raises(ValueError, match="entities"):
         parse_feed(b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY a "aaaa">]><rss><channel/></rss>', name="x")
+    # regression: the same declarations in a UTF-16 document slipped past a raw byte search
+    utf16 = (
+        '<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE rss [<!ENTITY a "aaaaaaaaaa">'
+        '<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]><rss><channel><item><title>&b;</title>'
+        "<link>https://x.example.com/1</link></item></channel></rss>"
+    ).encode("utf-16")
+    assert b"<!ENTITY" not in utf16
+    with pytest.raises(ValueError, match="entities"):
+        parse_feed(utf16, name="x")
+    with pytest.raises(ValueError, match="entities"):  # parameter entities too
+        parse_feed(b'<!DOCTYPE r [<!ENTITY % p "x">]><rss><channel/></rss>', name="x")
+    # a plain DOCTYPE (RSS 0.91) and non-UTF-8 encodings are still fine
+    rss091 = (
+        '<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE rss PUBLIC "-//Netscape Communications//DTD RSS 0.91//EN" '
+        '"http://my.netscape.com/publish/formats/rss-0.91.dtd"><rss version="0.91"><channel><item><title>Café</title>'
+        "<link>https://x.example.com/1</link></item></channel></rss>"
+    ).encode("utf-16")
+    assert [d.title for d in parse_feed(rss091, name="x")] == ["Café"]
+    with pytest.raises(ValueError, match="malformed XML"):
+        parse_feed(b"", name="x")
     warnings: list[str] = []
     parse_feed(fixture_bytes("research_atom.xml"), name="x", kind="rss", warnings=warnings)
     assert "configured as 'rss' but is 'atom'" in warnings[0]
@@ -612,6 +639,23 @@ def test_feed_config_loading(tmp_path, monkeypatch):
         load_feed_config(bad)
     with pytest.raises(FileNotFoundError):
         load_feed_config(tmp_path / "nope.json")
+
+
+def test_feed_config_tolerates_bom_and_quoted_env_path(tmp_path, monkeypatch):
+    # regression: Windows PowerShell 5.1 / old Notepad write a UTF-8 BOM; cmd keeps quotes in `set X="..."`
+    monkeypatch.delenv(S.SOURCES_ENV, raising=False)
+    cfg = {"feeds": [{"name": "Blog", "url": "https://blog.example.com/feed.xml"}]}
+    bom = tmp_path / "sources.json"
+    bom.write_bytes(codecs.BOM_UTF8 + json.dumps(cfg).encode("utf-8"))
+    assert [f.name for f in load_feed_config(bom)] == ["Blog"]
+    monkeypatch.setenv(S.SOURCES_ENV, f'"{bom}"')
+    assert [f.name for f in load_feed_config()] == ["Blog"]
+    monkeypatch.setenv(S.SOURCES_ENV, f"'{bom}'")
+    assert [f.name for f in load_feed_config()] == ["Blog"]
+    monkeypatch.setenv(S.SOURCES_ENV, "﻿" + json.dumps(cfg))
+    assert [f.name for f in load_feed_config()] == ["Blog"]
+    src = FeedSource(client=mock_client(lambda r: httpx.Response(500)))  # feeds=None reads the same config
+    assert [f.name for f in src.feeds] == ["Blog"]
 
 
 def test_parse_date_formats():
@@ -1158,3 +1202,140 @@ def test_echo_content_after_mid_output_fallback():
     assert out[1]["id"] == "a" and out[-1]["id"] == "c"
     no_fallback = [{"type": "thinking"}, {"type": "server_tool_use", "id": "z"}]
     assert _echo_content(no_fallback) == no_fallback
+
+
+# --- web search: what becomes the document text, and which URLs count as verified -----------------
+
+
+def _research(blocks: list[dict]) -> dict:
+    return {
+        "id": "msg_research", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": blocks,
+        "stop_reason": "end_turn", "stop_sequence": None,
+        "usage": {"input_tokens": 100, "output_tokens": 50, "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 1}},
+    }
+
+
+def _structure(items: list[dict]) -> dict:
+    return {
+        "id": "msg_structure", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+        "content": [{"type": "text", "text": json.dumps({"items": items})}],
+        "stop_reason": "end_turn", "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 10},
+    }
+
+
+def _search_block(tool_id: str, *results: tuple[str, str]) -> list[dict]:
+    return [
+        {"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": {"query": "q"}},
+        {"type": "web_search_tool_result", "tool_use_id": tool_id, "content": [
+            {"type": "web_search_result", "url": url, "title": title, "encrypted_content": "Eo8J", "page_age": None}
+            for url, title in results
+        ]},
+    ]
+
+
+def _fetch_block(tool_id: str, url: str, source: dict, title: str | None = None) -> list[dict]:
+    return [
+        {"type": "server_tool_use", "id": tool_id, "name": "web_fetch", "input": {"url": url}},
+        {"type": "web_fetch_tool_result", "tool_use_id": tool_id, "content": {
+            "type": "web_fetch_result", "url": url, "retrieved_at": "2026-10-02T09:00:00Z",
+            "content": {"type": "document", "title": title, "source": source},
+        }},
+    ]
+
+
+def _item(url: str, title: str, excerpt: str) -> dict:
+    return {"title": title, "url": url, "authors": [], "published": "2026-05-01", "excerpt": excerpt}
+
+
+SSRN_A = "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1111111"
+FAKE_EXCERPT = "The long-short portfolio earns a Sharpe ratio of 1.8 (t = 4.2)."
+
+
+def test_websearch_never_uses_the_model_excerpt_as_document_text():
+    # regression: a search-only hit used to become a document whose text was the model-written excerpt,
+    # so invented quotes / numbers "verified" against themselves downstream
+    blocks = [
+        *_search_block("s1", (SSRN_A, "Accrual Momentum :: SSRN")),
+        {"type": "text", "text": f"1. Title: Accrual Momentum\nURL: {SSRN_A}\nExcerpt: {FAKE_EXCERPT}"},
+    ]
+    src = make_source(FakeAnthropic([_research(blocks)], [_structure([_item(SSRN_A, "Accrual Momentum", FAKE_EXCERPT)])]))
+    [doc] = src.discover("accruals")
+    assert doc.text == "" and FAKE_EXCERPT not in doc.text
+    assert doc.source_name.endswith(NOT_READ_MARK) and doc.title == "Accrual Momentum"
+    assert any("could not read the page" in w and "fetch_url" in w for w in src.warnings)
+
+
+def test_websearch_uses_passages_cited_by_the_api_when_the_page_was_not_fetched():
+    cited = "Firms with low accruals outperform firms with high accruals by 0.4% per month."
+    blocks = [
+        *_search_block("s1", (SSRN_A, "Accrual Momentum :: SSRN")),
+        {"type": "text", "text": "Accruals predict returns.", "citations": [
+            {"type": "web_search_result_location", "url": SSRN_A, "title": "Accrual Momentum :: SSRN",
+             "encrypted_index": "Eo8B", "cited_text": cited},
+        ]},
+        {"type": "text", "text": f"1. Title: Accrual Momentum\nURL: {SSRN_A}\nExcerpt: {FAKE_EXCERPT}"},
+    ]
+    src = make_source(FakeAnthropic([_research(blocks)], [_structure([_item(SSRN_A, "Accrual Momentum", FAKE_EXCERPT)])]))
+    [doc] = src.discover("accruals")
+    assert doc.text == cited and doc.source_name.endswith("[cited passages only]")
+
+
+def test_websearch_reads_a_fetched_pdf(monkeypatch):
+    _install_fake_pypdf(monkeypatch, FAKE_PDF_PAGES)
+    pdf_url = "https://www.nber.org/system/files/working_papers/w99999/w99999.pdf"
+    blocks = [
+        *_fetch_block("f1", pdf_url, {"type": "base64", "media_type": "application/pdf",
+                                      "data": base64.b64encode(b"%PDF-1.7 fake").decode()}),
+        {"type": "text", "text": f"1. Title: Industry-Neutral Momentum\nURL: {pdf_url}\nExcerpt: {FAKE_EXCERPT}"},
+    ]
+    src = make_source(FakeAnthropic([_research(blocks)], [_structure([_item(pdf_url, "Industry-Neutral Momentum", FAKE_EXCERPT)])]))
+    [doc] = src.discover("momentum")
+    assert "It earns 0.92% per month." in doc.text and FAKE_EXCERPT not in doc.text
+    assert doc.title == "Industry-Neutral Momentum"  # confirmed by the PDF text
+    assert any("not verbatim in the fetched page text" in w for w in src.warnings)
+
+    monkeypatch.setitem(sys.modules, "pypdf", None)  # pypdf not installed: the page counts as not read
+    src = make_source(FakeAnthropic([_research(blocks)], [_structure([_item(pdf_url, "Industry-Neutral Momentum", FAKE_EXCERPT)])]))
+    [doc] = src.discover("momentum")
+    assert doc.text == "" and doc.source_name.endswith(NOT_READ_MARK)
+    assert any("pip install pypdf" in w for w in src.warnings)
+
+
+def test_websearch_ignores_urls_seen_only_in_code_execution_output():
+    # regression: stdout of code the model wrote (dynamic filtering) is not evidence that a URL exists
+    invented = "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=9999999"
+    blocks = [
+        *_search_block("s1", (SSRN_A, "Accrual Momentum :: SSRN")),
+        {"type": "server_tool_use", "id": "c1", "name": "code_execution", "input": {"code": f"print('{invented}')"}},
+        {"type": "code_execution_tool_result", "tool_use_id": "c1", "content": {
+            "type": "code_execution_result", "stdout": f"best match: {invented}\n{SSRN_A}", "stderr": "",
+            "return_code": 0, "content": []}},
+        {"type": "text", "text": f"1. Title: Sentiment Alpha\nURL: {invented}\n\n2. Title: Accrual Momentum\nURL: {SSRN_A}"},
+    ]
+    items = [_item(invented, "Sentiment Alpha", "A sentiment signal earns large returns."),
+             _item(SSRN_A, "Accrual Momentum", "Accruals predict returns.")]
+    client = FakeAnthropic([_research(blocks)], [_structure(items)])
+    src = make_source(client)
+    docs = src.discover("sentiment")
+    assert [d.url for d in docs] == [SSRN_A]
+    assert any("Sentiment Alpha" in w and "only in code-execution output" in w for w in src.warnings)
+    sources_offered = [r for r in client.requests if r["method"] == "parse"][0]["messages"][0]["content"].split("<source_urls>")[1]
+    assert invented not in sources_offered
+    assert canonical_url(invented) in src.last_trace.code_only_urls()
+
+
+def test_websearch_malformed_or_unconfirmed_model_output_does_not_abort_discovery():
+    # regression: a model-written URL with a bad port raised ValueError out of canonical_url()
+    page = "Accrual Momentum\nAbstract\nFirms with low accruals outperform."
+    blocks = [
+        *_search_block("s1", (SSRN_A, "Accrual Momentum by J. Doe :: SSRN")),
+        *_fetch_block("f1", SSRN_A, {"type": "text", "media_type": "text/plain", "data": page}),
+        {"type": "text", "text": f"1. Title: X\nURL: https://ssrn.com:abc/x\n\n2. Title: Y\nURL: {SSRN_A}"},
+    ]
+    items = [_item("https://ssrn.com:abc/x", "Broken", "x"),
+             _item(SSRN_A, "Accruals Earn a Sharpe Ratio of 3", "Firms with low accruals outperform.")]
+    src = make_source(FakeAnthropic([_research(blocks)], [_structure(items)]))
+    [doc] = src.discover("accruals")
+    assert any("'Broken'" in w and "not a valid http(s) URL" in w for w in src.warnings)
+    # the model's title is not on the page or in a search result: the server-given title is used instead
+    assert doc.title == "Accrual Momentum by J. Doe :: SSRN" and doc.text == page

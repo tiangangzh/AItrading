@@ -80,10 +80,55 @@ _CHAR_MAP = {
 }
 _TRANS = str.maketrans(_CHAR_MAP)
 
+# --- LaTeX-lite: arXiv abstracts arrive as raw LaTeX ("1.2\% per month", "$t$-statistic", "1990--2020") ---
+_DOLLAR = "\ue000"  # private-use placeholder for an escaped \$ while math delimiters are removed
+_LATEX_TEXT_MACRO = re.compile(
+    r"\\(?:text(?:it|bf|rm|sf|tt|sc|up|md|normal)?|emph|math(?:rm|bf|it|sf|tt|cal|bb|frak)?|mbox|hbox|operatorname|"
+    r"underline|textsuperscript|textsubscript|boldsymbol)\s*\{([^{}]*)\}"
+)
+_LATEX_GREEK = re.compile(
+    r"\\(alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|vartheta|kappa|lambda|mu|nu|xi|pi|rho|sigma|tau|"
+    r"upsilon|phi|varphi|chi|psi|omega|Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Phi|Psi|Omega)(?![A-Za-z])"
+)
+_LATEX_SYMBOLS = {
+    "times": "x", "cdot": "*", "approx": "~", "simeq": "~", "sim": "~", "leq": "<=", "le": "<=", "geq": ">=", "ge": ">=",
+    "neq": "!=", "pm": "+/-", "infty": "infinity", "ldots": "...", "dots": "...", "cdots": "...", "textendash": "-",
+    "textemdash": "-", "textpercent": "%", "textdollar": "$", "%": "%", "&": "&", "#": "#", "_": "_", "{": "{", "}": "}",
+}
+_LATEX_SYMBOL_RE = re.compile(
+    r"\\(" + "|".join(re.escape(k) for k in sorted(_LATEX_SYMBOLS, key=len, reverse=True)) + r")(?![A-Za-z])"
+)
+_LATEX_ACCENT = re.compile(r"\\['\"`^~=.]\{?([A-Za-z])\}?")  # \'e, \"{o} -> e, o
+_LATEX_SPACE = re.compile(r"\\[,;:! ]|\\\\")
+_LATEX_MATH = re.compile(r"\$(?=\S)([^$\n]{0,60}?)(?<=\S)\$")  # $t$, $\alpha$, $R^2$ - not "$5 and $10"
+_LATEX_TIE = re.compile(r"(?<=\w)~(?=\w)")
+_DOUBLE_DASH = re.compile(r"(?<!-)-{2,3}(?!-)")
+
+
+def _delatex(s: str) -> str:
+    """Strip the LaTeX markup common in arXiv abstracts so numbers, periods and quotes compare as plain text."""
+    if "\\" not in s and "$" not in s and "--" not in s and "``" not in s and "''" not in s and "~" not in s:
+        return s
+    s = s.replace("\\$", _DOLLAR)
+    s = _LATEX_MATH.sub(r"\1", s)
+    for _ in range(3):  # nested \textbf{\emph{x}}
+        new = _LATEX_TEXT_MACRO.sub(r"\1", s)
+        if new == s:
+            break
+        s = new
+    s = _LATEX_GREEK.sub(r"\1", s)
+    s = _LATEX_SYMBOL_RE.sub(lambda m: _LATEX_SYMBOLS[m.group(1)], s)
+    s = _LATEX_ACCENT.sub(r"\1", s)
+    s = _LATEX_SPACE.sub(" ", s)
+    s = _LATEX_TIE.sub(" ", s)
+    s = _DOUBLE_DASH.sub("-", s)
+    s = s.replace("``", '"').replace("''", '"')
+    return s.replace(_DOLLAR, "$")
+
 
 def _ascii_punct(s: str) -> str:
-    """Map typographic quotes/dashes/spaces to ASCII and apply NFKC (ligatures, full-width forms)."""
-    s = (s or "").translate(_TRANS)
+    """Strip LaTeX-lite markup, map typographic quotes/dashes/spaces to ASCII and apply NFKC."""
+    s = _delatex(s or "").translate(_TRANS)
     s = unicodedata.normalize("NFKC", s)
     return s.translate(_TRANS)
 
@@ -91,9 +136,9 @@ def _ascii_punct(s: str) -> str:
 def normalize_for_match(s: str) -> str:
     """Canonical form used to compare a quote with a document.
 
-    Unicode quotes / dashes / ellipses / spaces -> ASCII, NFKC, double quotes dropped, case folded,
-    whitespace collapsed, spaces around hyphens and before closing punctuation removed (PDF text
-    extraction often inserts them).
+    LaTeX-lite markup stripped (``\\%``, ``$t$``, ``--``, ``\\textit{x}``), unicode quotes / dashes /
+    ellipses / spaces -> ASCII, NFKC, double quotes dropped, case folded, whitespace collapsed, spaces
+    around hyphens and before closing punctuation removed (PDF text extraction often inserts them).
     """
     s = _ascii_punct(s).replace('"', "")
     s = s.casefold()
@@ -104,12 +149,29 @@ def normalize_for_match(s: str) -> str:
     return s.strip()
 
 
-_LINEBREAK_HYPHEN = re.compile(r"(\w)[-\u00ad\u2010\u2011]\s*\n\s*(\w)")
+_LINEBREAK_HYPHEN = re.compile(r"(\w)[-­‐‑]\s*\n\s*(\w)")
 _ELLIPSIS_SPLIT = re.compile(r"\[?\s*\.{3,}\s*\]?")
 _SPACED_DOTS = re.compile(r"\.\s\.\s\.")
 _FRAGMENT_EDGE = " ,;:.'-()[]"
-_MIN_QUOTE_CHARS = 8
+MIN_QUOTE_WORDS = 6  # a quote must be a real passage, not a keyword ("momentum") or a stitched phrase
+MIN_FRAGMENT_WORDS = 2  # each piece of a "..." quote
 _MAX_SENTENCES_FOR_HINT = 5000
+_MAX_OCCURRENCES = 50
+# Words that, when skipped by "...", can reverse what the source says.
+_GAP_NEGATION = re.compile(
+    r"\b(?:not|no|never|neither|nor|none|cannot|without|fails?|failed|lacks?|lacked|hardly|barely|insignificant(?:ly)?|"
+    r"unprofitable|unable|unlikely|\w+n't)\b"
+)
+# Sentence ends that are abbreviations, not boundaries ("et al.", "e.g.", "U.S.", "Fig.", initials).
+_ABBREV_END = re.compile(
+    r"(?:\b(?:al|e\.g|i\.e|etc|vs|cf|fig|figs|eq|eqs|no|nos|vol|pp|approx|inc|corp|ltd|co|jr|sr|dr|mr|ms|prof|st|resp|"
+    r"u\.s|u\.k|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)|\b[A-Z])\.$",
+    re.IGNORECASE,
+)
+
+
+def _n_words(s: str) -> int:
+    return sum(1 for tok in s.split() if any(ch.isalnum() for ch in tok))
 
 
 def _quote_fragments(quote: str) -> list[str]:
@@ -119,14 +181,63 @@ def _quote_fragments(quote: str) -> list[str]:
     return [f for f in frags if f]
 
 
-def _find_in_order(fragments: list[str], text: str) -> bool:
-    pos = 0
-    for frag in fragments:
-        idx = text.find(frag, pos)
+def _word_occurrences(text: str, frag: str, start: int, end: int | None = None) -> Iterable[int]:
+    """Start offsets of ``frag`` in ``text[start:end]`` that begin and end on word boundaries.
+
+    'profitable' does not match inside 'unprofitable', nor 'significant' inside 'insignificant'.
+    """
+    end = len(text) if end is None else end
+    check_left = frag[:1].isalnum()
+    check_right = frag[-1:].isalnum()
+    pos = start
+    found = 0
+    while found < _MAX_OCCURRENCES:
+        idx = text.find(frag, pos, end)
         if idx < 0:
-            return False
-        pos = idx + len(frag)
-    return True
+            return
+        stop = idx + len(frag)
+        left_ok = not check_left or idx == 0 or not text[idx - 1].isalnum()
+        right_ok = not check_right or stop == len(text) or not text[stop].isalnum()
+        if left_ok and right_ok:
+            found += 1
+            yield idx
+        pos = idx + 1
+
+
+def _match_fragments(fragments: list[str], text: str, *, check_gaps: bool) -> str | None:
+    """Find the fragments in order in ``text`` (word-bounded). Returns 'ok', 'negated_gap' or None.
+
+    With ``check_gaps`` the text skipped between consecutive fragments must not contain a negation;
+    the search backtracks over occurrences so a clean placement is preferred when one exists.
+    """
+    saw_negated = False
+
+    def place(k: int, pos: int) -> bool:
+        nonlocal saw_negated
+        if k == len(fragments):
+            return True
+        for idx in _word_occurrences(text, fragments[k], pos):
+            if check_gaps and k > 0 and _GAP_NEGATION.search(text[pos:idx]):
+                saw_negated = True
+                continue
+            if place(k + 1, idx + len(fragments[k])):
+                return True
+        return False
+
+    if place(0, 0):
+        return "ok"
+    return "negated_gap" if saw_negated else None
+
+
+def _quote_sentences(raw: str) -> list[str]:
+    """Normalised sentences of ``raw`` (abbreviation-ended pieces re-joined), for '...' quotes."""
+    merged: list[str] = []
+    for sent in split_sentences(raw):
+        if merged and _ABBREV_END.search(merged[-1]):
+            merged[-1] = f"{merged[-1]} {sent}"
+        else:
+            merged.append(sent)
+    return [normalize_for_match(s) for s in merged]
 
 
 def _closest_passage(fragment: str, sentences: list[str]) -> tuple[float, str] | None:
@@ -141,44 +252,73 @@ def _closest_passage(fragment: str, sentences: list[str]) -> tuple[float, str] |
 def verify_quotes(quotes: list[str], text: str, ref: str = "", *, url: str | None = None) -> list[EvidenceCheck]:
     """Check that each quote occurs verbatim (after normalisation) in ``text``.
 
-    Normalisation: unicode quotes/dashes/ellipses -> ASCII, case, whitespace (and line-break
-    hyphenation in PDF text). A quote may skip words with ``...`` / ``[...]``: its fragments must then
-    appear in order. Returns one ``EvidenceCheck(kind="quote", ref=<source url>)`` per quote with
-    status ``verified`` or ``not_found`` (the detail names the closest passage when there is one).
-    ``ref`` (or the alias ``url``) is the source URL recorded on every check.
+    Normalisation: LaTeX-lite markup, unicode quotes/dashes/ellipses -> ASCII, case, whitespace (and
+    line-break hyphenation in PDF text). Matches must start and end on word boundaries. A quote needs at
+    least ``MIN_QUOTE_WORDS`` words. It may skip words with ``...`` / ``[...]`` only *within one
+    sentence*: every fragment needs ``MIN_FRAGMENT_WORDS`` words, the fragments must appear in order in
+    a single sentence, and the skipped words must not contain a negation ("not", "insignificant", ...).
+
+    Returns one ``EvidenceCheck(kind="quote", ref=<source url>)`` per quote with status ``verified``,
+    ``mismatch`` (the pieces exist but are stitched across sentences or skip a negation) or
+    ``not_found`` (the detail names the closest passage when there is one). ``ref`` (or the alias
+    ``url``) is the source URL recorded on every check.
     """
     ref = url if url is not None else ref
     raw = text or ""
-    variants = [normalize_for_match(raw)]
+    raws = [raw]
     dehyphenated = _LINEBREAK_HYPHEN.sub(r"\1\2", raw)
     if dehyphenated != raw:
-        variants.append(normalize_for_match(dehyphenated))
-    sentences: list[str] | None = None
+        raws.append(dehyphenated)
+    variants = [normalize_for_match(r) for r in raws]
+    sentence_variants: list[list[str]] | None = None
+    hint_sentences: list[str] | None = None
+
+    def check(claim: str, status: str, detail: str) -> EvidenceCheck:
+        return EvidenceCheck(kind="quote", ref=ref, claim=claim, status=status, detail=detail)
 
     checks: list[EvidenceCheck] = []
     for quote in quotes or []:
         claim = quote if isinstance(quote, str) else str(quote)
         frags = _quote_fragments(claim)
-        n_chars = sum(len(f) for f in frags)
         if not frags:
-            checks.append(EvidenceCheck(kind="quote", ref=ref, claim=claim, status="not_found", detail="empty quote"))
+            checks.append(check(claim, "not_found", "empty quote"))
             continue
-        if n_chars < _MIN_QUOTE_CHARS:
-            checks.append(EvidenceCheck(kind="quote", ref=ref, claim=claim, status="not_found",
-                                        detail=f"quote too short to verify ({n_chars} characters)"))
+        n_words = sum(_n_words(f) for f in frags)
+        if n_words < MIN_QUOTE_WORDS:
+            checks.append(check(claim, "not_found", f"quote too short to verify ({n_words} words; at least {MIN_QUOTE_WORDS} needed)"))
             continue
-        if any(_find_in_order(frags, v) for v in variants):
-            detail = "verbatim match (normalised)" if len(frags) == 1 else f"all {len(frags)} fragments found in order"
-            checks.append(EvidenceCheck(kind="quote", ref=ref, claim=claim, status="verified", detail=detail))
-            continue
-        if sentences is None:
-            sentences = [s for s in re.split(r"(?<=[.!?])\s+", variants[-1]) if s][:_MAX_SENTENCES_FOR_HINT]
-        hint = _closest_passage(max(frags, key=len), sentences)
+        if len(frags) == 1:
+            if any(_match_fragments(frags, v, check_gaps=False) for v in variants):
+                checks.append(check(claim, "verified", "verbatim match (normalised)"))
+                continue
+        else:
+            short = next((f for f in frags if _n_words(f) < MIN_FRAGMENT_WORDS), None)
+            if short is not None:
+                checks.append(check(claim, "not_found",
+                                    f"'...' fragment '{short}' too short to verify (at least {MIN_FRAGMENT_WORDS} words each)"))
+                continue
+            if sentence_variants is None:
+                sentence_variants = [_quote_sentences(r) for r in raws]
+            outcomes = {_match_fragments(frags, sent, check_gaps=True) for sents in sentence_variants for sent in sents}
+            if "ok" in outcomes:
+                checks.append(check(claim, "verified", f"all {len(frags)} fragments found in order within one sentence"))
+                continue
+            if "negated_gap" in outcomes:
+                checks.append(check(claim, "mismatch",
+                                    "fragments found, but the words skipped by '...' contain a negation that changes the meaning"))
+                continue
+            if any(_match_fragments(frags, v, check_gaps=False) for v in variants):
+                checks.append(check(claim, "mismatch",
+                                    "fragments occur in the source but not within one sentence ('...' may only skip words inside a sentence)"))
+                continue
+        if hint_sentences is None:
+            hint_sentences = [s for s in re.split(r"(?<=[.!?])\s+", variants[-1]) if s][:_MAX_SENTENCES_FOR_HINT]
+        hint = _closest_passage(max(frags, key=len), hint_sentences)
         if hint:
             detail = f"not in source; closest passage (similarity {hint[0]:.2f}): '{hint[1][:200]}'"
         else:
             detail = "not in source; no similar passage found"
-        checks.append(EvidenceCheck(kind="quote", ref=ref, claim=claim, status="not_found", detail=detail))
+        checks.append(check(claim, "not_found", detail))
     return checks
 
 
