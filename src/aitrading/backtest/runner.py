@@ -190,6 +190,7 @@ __all__ = [
 
 #: Calendar days of history loaded before ``start`` (the feature engine's look-back).
 PRELOAD_LOOKBACK_DAYS = LOOKBACK_CALENDAR_DAYS
+MARKET_PROXIES = frozenset({"SPY", "VOO", "IVV", "VTI", "^GSPC", "SPX", "^SPX", "SPX INDEX", "MARKET", "US MARKET"})
 REBALANCES_PER_YEAR: dict[str, float] = {"daily": 252.0, "weekly": 52.0, "monthly": 12.0, "quarterly": 4.0, "annual": 1.0}
 _SNAPSHOT_DATASETS = ("estimates", "short_interest", "options")
 #: Features that read a snapshot dataset but stay point-in-time when the provider's snapshots are
@@ -607,6 +608,33 @@ class StrategyRunner:
         del self._price_store[3:]
         return slice_panel(panel, tickers, start, end)
 
+    def _market_proxy_fill(self, spec: StrategySpec, prices: PricePanel, start: date, end: date, warnings: list[str]) -> PricePanel:
+        """A timing rule on 'the market' (SPY, ^GSPC, ...) uses the provider's benchmark index when the
+        provider has no such ticker (e.g. the simulated market), with a warning; OHLC = close, no volume."""
+        missing = [t for t in prices.close.columns if t.upper() in MARKET_PROXIES and prices.close[t].isna().all()]
+        if not missing:
+            return prices
+        try:
+            bench = pd.Series(self.provider.get_benchmark_history(start, end), dtype=float)
+        except Exception:  # noqa: BLE001 - leave the gap; the caller reports missing prices
+            return prices
+        bench = bench[bench > 0]
+        if len(bench) < 2:
+            return prices
+        idx = prices.close.index.union(pd.DatetimeIndex(bench.index))
+        frames = {k: getattr(prices, k).reindex(idx) for k in ("open", "high", "low", "close", "volume")}
+        aligned = bench.reindex(idx)
+        for t in missing:
+            for k in ("open", "high", "low", "close"):
+                frames[k][t] = aligned
+            frames["volume"][t] = np.nan
+        label = getattr(self.provider, "benchmark", None) or getattr(bench, "name", None) or "benchmark"
+        warnings.append(
+            f"{', '.join(missing)}: not available from provider '{self.provider_name}'; the provider's market index ({label}) "
+            "is used as a stand-in (no volume, so volume-based conditions cannot fire)"
+        )
+        return PricePanel(**frames)
+
     def _needed_features(self, spec: StrategySpec) -> set[str]:
         needed = set(spec.features()) | {"price"}
         if spec.kind in ("cross_sectional", "screen"):
@@ -689,6 +717,8 @@ class StrategyRunner:
                 raise ValueError(f"the provider returned an empty universe as of {end} for {spec.universe.model_dump_json()}")
         tickers = list(universe.index)
         prices = self._load_prices(tickers, preload_start, end)
+        if spec.kind == "time_series":
+            prices = self._market_proxy_fill(spec, prices, preload_start, end, warnings)
         close = prices.close
         valid = close.notna().any(axis=1)
         if not valid.any():

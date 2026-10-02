@@ -782,11 +782,13 @@ def _drawdown_section(frame: pd.DataFrame, key: str | None, stats: PerformanceSt
     r = frame[key]
     first = r.first_valid_index()
     dd = drawdown_series(r.loc[first:])
-    chart = svg.area_drawdown_chart(dd, title=f"{_series_label(key)} drawdown")
+    chart = svg.area_drawdown_chart(dd, title=f"{_series_label(key)} drawdown (month-end values)")
     extra = ""
     if stats is not None:
-        extra = (f"<p>Worst peak-to-trough loss: <b>{_pct(stats.max_drawdown_pct)}</b>; longest time under water: "
-                 f"<b>{_int(stats.max_drawdown_duration_periods)}</b> periods.</p>")
+        unit = {252: "trading days", 52: "weeks", 12: "months", 4: "quarters", 1: "years"}.get(round(stats.periods_per_year), "periods")
+        extra = (f"<p>Worst peak-to-trough loss on daily data: <b>{_pct(stats.max_drawdown_pct)}</b> (the chart uses month-end values, "
+                 f"so intra-month troughs look shallower); longest time under water: "
+                 f"<b>{_int(stats.max_drawdown_duration_periods)}</b> {unit}.</p>")
     return _section("drawdown", "Drawdown", _chart(chart) + extra,
                     intro="How far the strategy fell below its previous peak - the losses you would have had to sit through.")
 

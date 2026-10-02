@@ -717,7 +717,8 @@ class HeuristicInterpreter:
                 why = f"alpha t-stat {_fmt(t)} clears {th['promising_alpha_t']:g} but not the {th['robust_alpha_t']:g} hurdle for a new factor"
             return "promising", why
         if ge(sr, "promising_sharpe") and ge(mono, "promising_monotonicity"):
-            return "promising", f"Sharpe {_fmt(sr)} with fairly monotonic quantiles ({_fmt(mono)}), but alpha t-stat only {_fmt(t)}"
+            tail = f"but alpha t-stat only {_fmt(t)}" if t is not None else "but no factor attribution was available (official factors not loaded)"
+            return "promising", f"Sharpe {_fmt(sr)} with fairly monotonic quantiles ({_fmt(mono)}), {tail}"
         if t is not None and t < th["spurious_alpha_t"] and mono is not None and mono < th["spurious_monotonicity"]:
             return "likely_spurious", f"alpha t-stat {_fmt(t)} < {th['spurious_alpha_t']:g} and quantile monotonicity {_fmt(mono)} < {th['spurious_monotonicity']:g}"
         return "weak", f"Sharpe {_fmt(sr)}, alpha t-stat {_fmt(t)}" + (f", monotonicity {_fmt(mono)}" if has_q else "") + ": little evidence either way"

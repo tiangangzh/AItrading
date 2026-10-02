@@ -46,6 +46,18 @@ def _out_dir(args: argparse.Namespace) -> Path:
     return Path(getattr(args, "out", None) or "aitrading_output")
 
 
+SYNTHETIC_HISTORY_START = date(2012, 1, 2)  # backtests on the simulated market need a long history
+
+
+def _lab_provider(args: argparse.Namespace) -> Any:
+    """Provider for backtest-style commands; the simulated market gets a long history."""
+    if getattr(args, "provider", None) == "synthetic" and not getattr(args, "tickers", None) and not getattr(args, "universe_file", None):
+        from aitrading.cli import make_provider
+
+        return make_provider("synthetic", start=SYNTHETIC_HISTORY_START)
+    return _provider_from_args(args)
+
+
 def _llm_or_none(args: argparse.Namespace) -> Any:
     return make_llm(args.model, args.effort) if resolve_engine(args) == "claude" else None
 
@@ -106,7 +118,10 @@ def _summary_lines(result: Any) -> list[str]:
             f" correlation with official {_fmt(chk.correlation_with_official)}"
         )
     if interp is not None:
-        lines.append(f"Verdict: {interp.verdict.upper()} - {interp.summary}")
+        summary = interp.summary
+        if summary.lower().startswith("verdict:"):
+            summary = summary.split("-", 1)[-1].strip() if " - " in summary else summary[8:].strip()
+        lines.append(f"Verdict: {interp.verdict.upper()} - {summary}")
     if result.warnings:
         lines.append(f"{len(result.warnings)} warning(s) in the report (survivorship, data coverage, costs ...).")
     return lines
@@ -142,7 +157,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
     idea = " ".join(args.idea or []).strip()
     if not idea and not args.spec_file:
         raise UsageError("give an idea (e.g. aitrading backtest \"Fama-French 3 factor model\") or --spec-file")
-    provider = _provider_from_args(args)
+    provider = _lab_provider(args)
     llm = _llm_or_none(args)
     lab = _lab(args, provider, llm)
     spec = None
@@ -245,7 +260,7 @@ def _cmd_strategy(args: argparse.Namespace) -> int:
         return EXIT_OK
     if action == "run":
         spec, backtest, _meta = store.load(name)
-        provider = _provider_from_args(args)
+        provider = _lab_provider(args)
         as_of = args.as_of or default_as_of(args.provider, provider)
         account = PaperAccount(store, name, initial_capital=args.capital) if args.capital else PaperAccount(store, name)
         report = account.rebalance(_runner(provider), spec, as_of, force=args.force)
@@ -450,7 +465,7 @@ def _cmd_discover(args: argparse.Namespace, ask: Prompt = input) -> int:
             _emit(_idea_card(c) + "\n")
         _emit("Review them later with: aitrading ideas try <idea_id>\n")
         return EXIT_OK
-    provider = _provider_from_args(args)
+    provider = _lab_provider(args)
     _review_loop(new, args, lab=_lab(args, provider, llm), inbox=inbox, ask=ask)
     return EXIT_OK
 
@@ -488,7 +503,7 @@ def _cmd_ideas(args: argparse.Namespace, ask: Prompt = input) -> int:
         return EXIT_OK
     # try
     llm = _llm_or_none(args)
-    provider = _provider_from_args(args)
+    provider = _lab_provider(args)
     print(_idea_card(c))
     _try_idea(c, args, lab=_lab(args, provider, llm), inbox=inbox, ask=ask)
     return EXIT_OK

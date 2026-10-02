@@ -559,9 +559,15 @@ def test_time_series_short_never_opens_a_position_on_missing_data(provider, fren
 
 
 def test_time_series_on_an_asset_without_prices_fails_clearly(provider, runner):
-    spec = _trend_spec("SPY")  # the synthetic market has no SPY
-    with pytest.raises(ValueError, match=r"no price data for 1 ticker\(s\) \(SPY\)"):
+    spec = _trend_spec("ZZZZQ")  # not in the synthetic market and not a market proxy
+    with pytest.raises(ValueError, match=r"no price data for 1 ticker\(s\) \(ZZZZQ\)"):
         runner.backtest(spec)
+
+
+def test_time_series_on_the_market_uses_the_provider_index_as_stand_in(provider, runner):
+    res = runner.backtest(_trend_spec("SPY"))  # the synthetic market has no SPY ticker
+    assert any("SPY: not available from provider" in w and "stand-in" in w for w in res.warnings)
+    assert res.stats["strategy"].n_periods > 100
 
 
 def test_repeated_dated_warnings_are_compressed():
