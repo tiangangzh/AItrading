@@ -28,7 +28,7 @@ from typing import Callable
 
 from pydantic import ValidationError
 
-from aitrading.llm.base import LLMError, StructuredLLM
+from aitrading.llm.base import LLMError, LLMOutputError, StructuredLLM
 from aitrading.screen.catalog import FeatureCatalog, default_catalog
 from aitrading.screen.spec import Condition, RankFactor, ScreenSpec, UniverseSpec
 
@@ -225,7 +225,7 @@ def build_system_prompt(catalog: FeatureCatalog | None = None) -> str:
     return SYSTEM_PROMPT_TEMPLATE.replace("{catalog}", cat.to_prompt())
 
 
-def _validation_messages(err: ValidationError) -> list[str]:
+def _validation_messages(err: ValidationError | LLMOutputError) -> list[str]:
     out = []
     for e in err.errors():
         loc = ".".join(str(p) for p in e.get("loc", ()))
@@ -240,7 +240,9 @@ class NLScreenTranslator:
     the observation, the previous spec as JSON and the validation errors. After normalisation
     (``observation`` overwritten with the input, ``top_n`` clamped to [1, 100]) the spec must pass
     ``validate_against(catalog)``; otherwise :class:`ScreenTranslationError` is raised once
-    ``max_repair_rounds`` repairs are spent. ``LLMError`` / ``LLMRefusalError`` propagate.
+    ``max_repair_rounds`` repairs are spent. A reply that does not validate as a ``ScreenSpec``
+    (``LLMOutputError`` / pydantic ``ValidationError``) uses a repair round too; other ``LLMError`` /
+    ``LLMRefusalError`` propagate.
     """
 
     def __init__(
@@ -303,7 +305,7 @@ class NLScreenTranslator:
                 )
                 if not isinstance(out, ScreenSpec):
                     out = ScreenSpec.model_validate(out)
-            except ValidationError as e:  # schema-level failure (e.g. a bound the API cannot enforce)
+            except (ValidationError, LLMOutputError) as e:  # schema-level failure (e.g. a bound the API cannot enforce)
                 errors = _validation_messages(e)
                 errors_by_round.append(errors)
                 continue

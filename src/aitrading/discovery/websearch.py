@@ -7,12 +7,18 @@ use a fake client. Two calls per ``discover()``:
    and reads abstract / article pages (``web_fetch_20260209``), both executed on Anthropic's
    servers - nothing is fetched locally. Long turns stop with ``stop_reason="pause_turn"``; the
    conversation is re-sent with the paused assistant content appended (no extra user message), at
-   most ``max_continuations`` times. Server-tool failures arrive as result blocks whose content is an
+   most ``max_continuations`` times. The system prompt carries an explicit cache breakpoint and the
+   request top-level ``cache_control`` (automatic caching), so each continuation reads the fetched
+   pages already sent from the cache instead of paying for them again. Server-tool failures arrive as result blocks whose content is an
    error object (they are not raised) and are collected in ``.warnings``.
 2. **Structuring** (``purpose="discover:structure"``, no tools): the research report plus the list
    of URLs that actually appeared in search / fetch results are turned into a typed list via
    structured outputs. It is a separate call because web-search citations cannot be combined with
-   structured outputs.
+   structured outputs. As in :class:`~aitrading.llm.anthropic_client.AnthropicLLM`, the schema goes in
+   ``output_config.format`` (``output_schema``) rather than ``output_format``, and the reply is
+   validated after ``stop_reason`` is checked: a refusal raises ``LLMRefusalError``, a truncated reply
+   ``LLMError``, JSON that breaks the schema ``LLMOutputError`` - each with the stop reason and token
+   usage in the call record.
 
 Anti-hallucination: an idea is kept only if its URL (canonicalised) appeared in a result block the
 API itself produced during the research call - a ``web_search_tool_result``, a
@@ -53,12 +59,13 @@ from aitrading.discovery.sources import (
     MAX_FETCH_BYTES,
     MAX_PDF_PAGES,
     finalize_documents,
+    load_sources_config,
     normalize_doc_url,
     parse_date,
 )
 from aitrading.discovery.textutil import canonical_url, normalize_whitespace, pdf_to_text, truncate_text
-from aitrading.llm.anthropic_client import FALLBACK_BETA
-from aitrading.llm.base import LLMError, LLMRefusalError
+from aitrading.llm.anthropic_client import FALLBACK_BETA, output_schema
+from aitrading.llm.base import LLMError, LLMRefusalError, output_error
 
 __all__ = [
     "CITED_ONLY_MARK",
@@ -243,7 +250,13 @@ def _clean_domains(domains: list[str] | None, what: str) -> list[str] | None:
 
 
 class ClaudeWebSearchSource:
-    """Find strategy ideas on the open web with Claude's server-side web search + fetch."""
+    """Find strategy ideas on the open web with Claude's server-side web search + fetch.
+
+    ``allowed_domains`` / ``blocked_domains`` restrict both server tools (one or the other: the API
+    rejects both). When neither is given they come from the user's sources.json
+    (``web_allowed_domains`` / ``web_blocked_domains``, see ``aitrading.discovery.sources``);
+    ``domains_from_config=False`` skips that file.
+    """
 
     source_type = "web_search"
     name = "Claude web search"
@@ -258,6 +271,7 @@ class ClaudeWebSearchSource:
         effort: str = "high",
         allowed_domains: list[str] | None = None,
         blocked_domains: list[str] | None = None,
+        domains_from_config: bool = True,
         use_fallbacks: bool = True,
         max_tokens: int = 16_000,
         structure_effort: str = "medium",
@@ -277,10 +291,17 @@ class ClaudeWebSearchSource:
             raise ValueError("max_fetches must be a non-negative integer (0 disables web_fetch)")
         if max_continuations < 0:
             raise ValueError("max_continuations must be >= 0")
+        origin = ""
+        if allowed_domains is None and blocked_domains is None and domains_from_config:
+            # like FeedSource: the user's sources.json ("web_allowed_domains" / "web_blocked_domains")
+            # restricts the search unless the caller passes domains (or domains_from_config=False)
+            cfg = load_sources_config()
+            allowed_domains, blocked_domains = cfg.web_allowed_domains, cfg.web_blocked_domains
+            origin = " in sources.json (web_allowed_domains / web_blocked_domains)"
         self.allowed_domains = _clean_domains(allowed_domains, "allowed_domains")
         self.blocked_domains = _clean_domains(blocked_domains, "blocked_domains")
         if self.allowed_domains and self.blocked_domains:
-            raise ValueError("use either allowed_domains or blocked_domains, not both (the API rejects both)")
+            raise ValueError(f"use either allowed_domains or blocked_domains{origin}, not both (the API rejects both)")
         self.model = model
         self.max_searches = max_searches
         self.max_fetches = max_fetches
@@ -355,14 +376,21 @@ class ClaudeWebSearchSource:
         return self._to_documents(items, trace, max_ideas)
 
     # ------------------------------------------------------------------------------------------
-    def _call(self, purpose: str, *, parse: bool, effort: str, max_tokens: int, **kwargs: Any) -> Any:
+    def _call(self, purpose: str, *, parse: bool, effort: str, max_tokens: int,
+              output_model: type[BaseModel] | None = None, **kwargs: Any) -> Any:
+        """One API call, recorded in ``calls``. With ``output_model`` the request carries its schema in
+        ``output_config.format`` (no ``output_format``: the SDK would validate inside the call, before
+        the stop reason is known); the caller validates the reply."""
         import anthropic
 
+        output_config: dict[str, Any] = {"effort": effort}
+        if output_model is not None:
+            output_config["format"] = output_schema(output_model)
         kwargs.update(
             model=self.model,
             max_tokens=max_tokens,
             thinking={"type": "adaptive"},
-            output_config={"effort": effort},
+            output_config=output_config,
         )
         if self.use_fallbacks:
             kwargs["betas"] = [FALLBACK_BETA]
@@ -438,6 +466,9 @@ class ClaudeWebSearchSource:
                 system=system,
                 messages=list(messages),
                 tools=tools,
+                # automatic caching of the growing conversation: a pause_turn continuation re-sends every
+                # search result and fetched page (up to ~160k tokens) - read from the cache, not re-billed
+                cache_control={"type": "ephemeral"},
             )
             responses.append(resp)
             stop = _get(resp, "stop_reason")
@@ -535,19 +566,33 @@ class ClaudeWebSearchSource:
             max_tokens=self.structure_max_tokens,
             system=[{"type": "text", "text": STRUCTURE_SYSTEM, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user}],
-            output_format=WebIdeaList,
+            output_model=WebIdeaList,
         )
-        stop = _get(resp, "stop_reason")
+        record = self.calls[-1]
+        stop = _get(resp, "stop_reason")  # a refusal was raised by _call
         if stop == "max_tokens":
-            self.calls[-1].error = "max_tokens"
+            record.error = "max_tokens"
             raise LLMError(f"[discover:structure] output truncated at max_tokens={self.structure_max_tokens}")
         parsed = _get(resp, "parsed_output")
-        if parsed is None:
-            self.calls[-1].error = "unparsed"
+        if parsed is not None:
+            try:
+                return list((parsed if isinstance(parsed, WebIdeaList) else WebIdeaList.model_validate(parsed)).items)
+            except ValidationError as e:
+                record.error = f"invalid_output: {e.error_count()} error(s)"
+                raise output_error("discover:structure", WebIdeaList, e) from e
+        texts = [_get(b, "text") for b in (_get(resp, "content") or []) if _get(b, "type") == "text" and _get(b, "text")]
+        if not texts:
+            record.error = "unparsed"
             raise LLMError(f"[discover:structure] no structured output in response (stop_reason={stop})")
-        if not isinstance(parsed, WebIdeaList):
-            parsed = WebIdeaList.model_validate(parsed)
-        return list(parsed.items)
+        first: ValidationError | None = None
+        for text in texts:  # like ParsedBetaMessage.parsed_output: the first text block that validates
+            try:
+                return list(WebIdeaList.model_validate_json(text).items)
+            except ValidationError as e:
+                first = first or e
+        assert first is not None
+        record.error = f"invalid_output: {first.error_count()} error(s)"
+        raise output_error("discover:structure", WebIdeaList, first) from first
 
     def _page_text(self, cu: str, trace: ResearchTrace) -> str | None:
         """The page text web_fetch returned for canonical URL ``cu`` (a fetched PDF is read here), else None."""

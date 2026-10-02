@@ -30,8 +30,14 @@ Price floor: ``UniverseSpec.min_price`` is a floor on the price a stock TRADED a
 split- and dividend-adjusted closes (the ``PricePanel`` contract), which later splits and dividends
 restate downwards, so on adjusted prices the floor is suspended at dates before the provider's latest
 data date (a warning and the ``universe`` data-usage note say so; the liquidity floor, which is
-split-invariant, still applies). It applies at every date when the prices are as traded (the
-synthetic market, or a provider declaring ``prices_as_traded = True``).
+split-invariant, still applies - but at past dates it is computed from dividend-adjusted closes, so it
+understates the dollar volume of names that paid dividends later, more so the further back). It
+applies at every date when the prices are as traded (the synthetic market, or a provider declaring
+``prices_as_traded = True``). For the same reason a run that uses a ratio of a per-share vendor value
+to the close (``PER_SHARE_PRICE_RATIOS``: ``pe_ntm``, ``earnings_yield_ntm_pct``,
+``target_price_upside_pct``) at those dates gets a "not point-in-time" warning (later splits and
+dividends restate the denominator), which caps the verdict at inconclusive; it only fires for
+providers that serve historical estimates (the free provider's are blank at past dates).
 
 Market cap (only computed when something uses it: ``MARKET_CAP_FEATURES`` - size and the valuation
 ratios book-to-market, FCF / earnings yield, EV ... - value weights, or a factor model; otherwise the
@@ -51,6 +57,15 @@ universe's cap column is blank so the END snapshot can never stand in for a past
   POINT-IN-TIME`` warning and a ``market_cap`` data-usage entry with ``point_in_time=False`` make the
   interpreter treat it as look-ahead. An anchored snapshot that fails falls back to this estimate for
   the dates that depend on it, flagged the same way.
+
+A provider that had to price some names of a past snapshot with a later (e.g. today's) share count
+lists them in the snapshot's ``attrs[MCAP_CURRENT_SHARES_ATTR]``; the ``market_cap`` entry is then
+``point_in_time=False`` and a ``MARKET CAPS NOT POINT-IN-TIME`` warning names them.
+
+Universe labels (sector, industry, exchange, security type) are the END snapshot's values at every
+date. Unless the provider never reclassifies (the synthetic market), the ``universe`` data-usage note
+says so, and an ``END-DATE LABELS`` warning appears when they drive the run (sector exclusions,
+sector-neutral signals, label conditions, NYSE breakpoints of a factor model).
 
 A name is given a cap only if it traded within 10 days of the date (no stale caps for dead names).
 The ``market_cap`` data-usage entry records the mode.
@@ -170,7 +185,7 @@ from aitrading.backtest.panel import PreloadedProvider, slice_panel
 from aitrading.backtest.quantiles import forward_returns_from_close, quantile_analysis
 from aitrading.backtest.regression import FACTOR_COLUMNS, MIN_REGRESSION_OBS, factor_regression
 from aitrading.core import fields as F
-from aitrading.data.base import PricePanel
+from aitrading.data.base import MCAP_CURRENT_SHARES_ATTR, PricePanel
 from aitrading.factors.construct import CharacteristicsPanel, compare_with_official, construct_factors, two_by_three_sort
 from aitrading.factors.french import FRENCH_SOURCE, align_factor_dates, load_french_factors
 from aitrading.screen.catalog import FeatureCatalog, default_catalog
@@ -202,9 +217,19 @@ MARKET_CAP_FEATURES = frozenset({
     "market_cap_usd_bn", "enterprise_value_usd_bn", "fcf_yield_pct", "ev_to_ebitda", "ev_to_sales",
     "cash_pct_market_cap", "book_to_market", "earnings_yield_ttm_pct",
 })
+#: Ratios of a per-share vendor value (consensus EPS, target price) to the close. On adjusted prices at a
+#: date before the latest data date the close is restated for later splits and dividends, so the ratio
+#: is not point-in-time (same list as ``pipeline.PER_SHARE_PRICE_RATIOS``).
+PER_SHARE_PRICE_RATIOS = ("pe_ntm", "earnings_yield_ntm_pct", "target_price_upside_pct")
 #: Calendar months whose last session is a market-cap snapshot date in ``anchored`` mode (the
 #: Fama-French formation months: June for size, December for book-to-market).
 MCAP_ANCHOR_MONTHS = (6, 12)
+#: ``MCAP_CURRENT_SHARES_ATTR`` (defined in ``aitrading.data.base``, re-exported here): the ``attrs`` key
+#: of a universe snapshot listing the tickers whose market cap uses a share count from AFTER its
+#: ``as_of``, i.e. caps that are NOT point-in-time. The runner then reports market caps as look-ahead.
+#: Universe label columns (catalog features) that can drive a run: sector exclusions, sector-neutral
+#: signals, exchange conditions and NYSE breakpoints.
+_LABEL_FEATURES = frozenset({F.GICS_SECTOR, F.GICS_INDUSTRY, F.EXCHANGE})
 #: A market cap is only estimated for a name that traded within this many calendar days of the date.
 _MCAP_STALE_DAYS = 10
 _MARKET = {"capm": "Mkt-RF"}
@@ -422,8 +447,10 @@ class _Context:
     data_start: date | None = None
     eligible_counts: list[int] = field(default_factory=list)
     floor_suspended: list[pd.Timestamp] = field(default_factory=list)
+    per_share_biased: dict[str, list[pd.Timestamp]] = field(default_factory=dict)  # ratio -> dates with values on adjusted past prices
     ts_unavailable: dict[str, list[pd.Timestamp]] = field(default_factory=dict)
     mcap_fallback: list[str] = field(default_factory=list)  # snapshot dates estimated from the END cap
+    mcap_current_shares: dict[str, list[str]] = field(default_factory=dict)  # snapshot date -> names capped with a later share count
     _mcap_cache: dict = field(default_factory=dict)
     _mcap_snapshots: dict = field(default_factory=dict)
     _mcap_anchors: pd.DatetimeIndex | None = None
@@ -807,8 +834,12 @@ class StrategyRunner:
         key = pd.Timestamp(a)
         if key in ctx._mcap_snapshots:
             return ctx._mcap_snapshots[key]
+        flagged: set[str] = set()
         try:
             snap = ctx.wrapped.get_universe(ctx.universe_spec, key.date())
+            raw_flag = snap.attrs.get(MCAP_CURRENT_SHARES_ATTR) if isinstance(getattr(snap, "attrs", None), dict) else None
+            if raw_flag is not None:
+                flagged = {str(raw_flag)} if isinstance(raw_flag, str) else {str(x) for x in raw_flag}
             if F.TICKER in snap.columns and snap.index.name != F.TICKER:
                 snap = snap.set_index(F.TICKER)
             snap = snap[~snap.index.duplicated(keep="last")]
@@ -833,6 +864,10 @@ class StrategyRunner:
                 )
             ctx.mcap_fallback.append(_fmt(key))
             out = self._mcap_end_scaled(ctx, key)
+            flagged = set()
+        names = sorted(n for n in flagged if n in out.index and np.isfinite(out[n]))
+        if names:
+            ctx.mcap_current_shares[_fmt(key)] = names
         ctx._mcap_snapshots[key] = out
         return out
 
@@ -909,6 +944,7 @@ class StrategyRunner:
         uni = self._universe_at(ctx, t)
         ff = ctx.engine.build(uni, t.date(), features=ctx.needed)
         frame = ff.frame
+        self._note_per_share_ratios(ctx, t, frame)
         mask, _ = apply_universe(self._universe_filters(ctx, t), frame)
         px = pd.to_numeric(frame["price"], errors="coerce")
         mask &= px.notna() & (px > 0)
@@ -1070,8 +1106,10 @@ class StrategyRunner:
             result = self._portfolio_backtest(spec, ctx, rf_daily, rf_source, label, started)
         survivorship = self._survivorship_warning(spec, ctx, result.start)
         mcap = self._mcap_warning(ctx)
+        labels = self._label_warning(spec, ctx)
         prov_w = list(getattr(self.provider, "warnings", []) or [])[n_provider_warnings:]
-        all_w = _dedupe(([survivorship] if survivorship else []) + ([mcap] if mcap else []) + ctx.warnings
+        all_w = _dedupe(([survivorship] if survivorship else []) + ([mcap] if mcap else [])
+                        + ([labels] if labels else []) + ctx.warnings
                         + [f"provider {self.provider_name}: {w}" for w in prov_w])
         if len(all_w) > _MAX_WARNINGS:
             all_w = all_w[:_MAX_WARNINGS] + [f"... {len(all_w) - _MAX_WARNINGS} more warnings omitted"]
@@ -1081,8 +1119,20 @@ class StrategyRunner:
         return result
 
     def _mcap_warning(self, ctx: _Context) -> str | None:
-        if ctx.mcap_mode != "end_scaled" or not ctx.mcap_needed or not ctx._mcap_cache:
+        if not ctx.mcap_needed or not ctx._mcap_cache:
             return None
+        if ctx.mcap_mode != "end_scaled":
+            if not ctx.mcap_current_shares:
+                return None
+            names = sorted({n for v in ctx.mcap_current_shares.values() for n in v})
+            dates = sorted(ctx.mcap_current_shares)
+            return (
+                f"MARKET CAPS NOT POINT-IN-TIME for {len(names)} name(s) ({_names(names)}): provider '{self.provider_name}' "
+                f"had no point-in-time share count for them, so their market cap on {len(dates)} snapshot date(s) "
+                f"({dates[0]} to {dates[-1]}) uses a later (current) share count. Buybacks and issuance after those dates "
+                "feed size, value weights and valuation ratios (book-to-market, FCF / earnings yield, EV) at earlier "
+                "dates: look-ahead bias."
+            )
         return (
             f"MARKET CAPS NOT POINT-IN-TIME: provider '{self.provider_name}' declares no point-in-time market caps, so the "
             f"market cap at each date before {ctx.end} is the end-date market cap x the adjusted-price ratio. Share counts "
@@ -1103,6 +1153,27 @@ class StrategyRunner:
             f"applied to every date back to {first} instead of the index membership on each date. Companies that were delisted, "
             f"acquired or dropped before {ctx.end} are missing, which usually flatters backtested returns "
             "(point-in-time index membership needs institutional data)."
+        )
+
+    def _labels_static(self) -> bool:
+        """True when the provider's sector / industry / exchange labels never change over time (the
+        synthetic market), so the END snapshot's labels are valid at every date."""
+        return self.provider_name == "synthetic"
+
+    def _label_warning(self, spec: StrategySpec, ctx: _Context) -> str | None:
+        """Universe labels are END-date values applied to every date: say so when they drive the run."""
+        if spec.kind == "time_series" or self._labels_static():
+            return None
+        used = sorted(ctx.needed & _LABEL_FEATURES)
+        if spec.kind == "factor_model" and F.EXCHANGE in ctx.universe.columns and ctx.universe[F.EXCHANGE].notna().any():
+            used = sorted({*used, F.EXCHANGE})
+        if not used:
+            return None
+        return (
+            f"END-DATE LABELS: {' / '.join(used)} come from the provider's universe as of {ctx.end} and are applied to every "
+            "rebalance date; a name reclassified or relisted later is filtered, sector-neutralised or given NYSE "
+            "breakpoints by its later label at earlier dates (e.g. GOOGL and META were Information Technology and DIS "
+            "Consumer Discretionary until the GICS Communication Services sector was created in September 2018)."
         )
 
     def provider_fingerprint(self) -> dict[str, str]:
@@ -1145,6 +1216,35 @@ class StrategyRunner:
         rid = f"{_slug(spec.name)}-{digest}"
         return f"{rid}-{_slug(label, 32)}" if label else rid
 
+    @staticmethod
+    def _note_per_share_ratios(ctx: _Context, t: pd.Timestamp, frame: pd.DataFrame) -> None:
+        """Record the per-share price ratios the run uses that have values at ``t`` on adjusted past prices
+        (the dates at which the price floor is suspended): their denominator is restated for later splits
+        and dividends. The free provider's estimates are blank at past dates and the synthetic market
+        is as traded, so this only fires for providers serving historical estimates (e.g. BQL)."""
+        if ctx.prices_as_traded or (ctx.price_floor_from is not None and pd.Timestamp(t).date() >= ctx.price_floor_from):
+            return
+        for f in PER_SHARE_PRICE_RATIOS:
+            if f in ctx.needed and f in frame.columns and pd.to_numeric(frame[f], errors="coerce").notna().any():
+                ctx.per_share_biased.setdefault(f, []).append(pd.Timestamp(t))
+
+    def _per_share_ratio_warning(self, ctx: _Context, dates: list[pd.Timestamp]) -> None:
+        kept = set(dates)
+        biased = {f: sorted(set(ts) & kept) for f, ts in ctx.per_share_biased.items()}
+        biased = {f: ts for f, ts in biased.items() if ts}
+        if not biased:
+            return
+        first = min(ts[0] for ts in biased.values())
+        last = max(ts[-1] for ts in biased.values())
+        one = len(biased) == 1
+        ctx.warnings.append(
+            f"{', '.join(f for f in PER_SHARE_PRICE_RATIOS if f in biased)} at rebalance dates {_fmt(first)} to {_fmt(last)} "
+            f"{'divides' if one else 'divide'} per-share vendor values (consensus EPS / target price) by a close that provider "
+            f"'{self.provider_name}' has adjusted for splits and dividends after those dates, so "
+            f"{'it is' if one else 'they are'} not point-in-time (upside and earnings yield read high for later dividend "
+            "payers and splitters)"
+        )
+
     def _price_floor_warning(self, ctx: _Context, dates: list[pd.Timestamp]) -> None:
         kept = set(dates)
         sus = sorted(t for t in set(ctx.floor_suspended) if t in kept)
@@ -1156,7 +1256,9 @@ class StrategyRunner:
             f"{_fmt(sus[-1])}): provider '{self.provider_name}' serves split- and dividend-adjusted prices, so an adjusted "
             f"close under ${floor:g} does not mean the stock traded under ${floor:g} then (later splits and dividends lower "
             "earlier adjusted prices) and the floor would drop later winners using splits that had not happened yet. It "
-            f"applies from {ctx.price_floor_from} (current prices); the liquidity floor and every filter still apply."
+            f"applies from {ctx.price_floor_from} (current prices); the liquidity floor and every filter still apply (the "
+            "liquidity floor is split-invariant, but dollar volume from dividend-adjusted closes understates later "
+            "dividend payers at past dates)."
         )
 
     def _signal_dates(self, ctx: _Context) -> list[pd.Timestamp]:
@@ -1217,6 +1319,7 @@ class StrategyRunner:
         if spec.kind == "time_series":
             self._ts_unavailable_warnings(ctx, dates)
         self._price_floor_warning(ctx, dates)
+        self._per_share_ratio_warning(ctx, dates)
         ctx.eligible_counts = n_eligible
 
         self._say(f"{spec.name}: simulating {len(targets)} rebalance(s)")
@@ -1428,10 +1531,17 @@ class StrategyRunner:
             return None
         name = self.provider_name
         n = len(ctx._mcap_snapshots)
+        current = sorted({x for v in ctx.mcap_current_shares.values() for x in v})
+        current_note = ""
+        if current:
+            dates = sorted(ctx.mcap_current_shares)
+            current_note = (f"NOT point-in-time for {len(current)} name(s) ({_names(current)}) on {len(dates)} snapshot "
+                            f"date(s) ({dates[0]} to {dates[-1]}): the provider priced them with a later (current) share "
+                            "count (look-ahead in size, value weights and valuation ratios); ")
         if ctx.mcap_mode == "snapshot":
             return DataUsage(dataset="market_cap", source=f"{name}: universe snapshot at each date",
-                             coverage=f"{len(ctx._mcap_cache)} date(s)", point_in_time=True,
-                             notes="market cap as of each date from the provider")
+                             coverage=f"{len(ctx._mcap_cache)} date(s)", point_in_time=not current,
+                             notes=current_note + "market cap as of each date from the provider")
         if ctx.mcap_mode == "end_scaled":
             return DataUsage(dataset="market_cap", source=f"{name}: end-date market cap x adjusted-price ratio",
                              coverage=f"{len(ctx._mcap_cache)} date(s)", point_in_time=False,
@@ -1446,9 +1556,11 @@ class StrategyRunner:
         if fb:
             notes = (f"NOT point-in-time on {len(fb)} snapshot date(s) ({fb[0]} to {fb[-1]}): the provider gave no snapshot, "
                      "so the end-date market cap x adjusted-price ratio was used; otherwise " + notes)
-        return DataUsage(dataset="market_cap", source=f"{name}: universe snapshots (point-in-time)",
-                         coverage=f"{n} snapshot date(s) for {len(ctx._mcap_cache)} date(s)", point_in_time=not fb,
-                         notes=notes)
+        pit = not fb and not current
+        return DataUsage(dataset="market_cap",
+                         source=f"{name}: universe snapshots" + (" (point-in-time)" if pit else ""),
+                         coverage=f"{n} snapshot date(s) for {len(ctx._mcap_cache)} date(s)", point_in_time=pit,
+                         notes=current_note + notes)
 
     def _snapshots_point_in_time(self, ctx: _Context) -> bool:
         is_stale = getattr(self.provider, "is_stale", None)
@@ -1477,6 +1589,9 @@ class StrategyRunner:
             pit = bool(getattr(self.provider, "point_in_time_universe", False))
             notes = ("point-in-time membership" if pit else
                      f"constituents as of {ctx.end} applied to every date (today's survivors): survivorship bias")
+            if not self._labels_static():
+                notes += (f"; sector, industry, exchange and security-type labels are the values as of {ctx.end}, applied "
+                          "to every date (later reclassifications are used at earlier dates)")
             sus = sorted(set(ctx.floor_suspended))
             if sus and spec.kind in ("cross_sectional", "screen"):
                 notes += (f"; the ${spec.universe.min_price:g} price floor is not applied before {ctx.price_floor_from} "
@@ -1644,6 +1759,12 @@ class StrategyRunner:
         days = self._month_days(ctx)
         if len(days) < 3:
             raise ValueError("factor models need at least three months of prices")
+        if spec.rebalance != "monthly":
+            ctx.warnings.append(
+                f"rebalance '{spec.rebalance}' does not apply to a factor model: the factor-mimicking portfolios are "
+                "re-weighted at every month-end (sorts re-formed each June, the Fama-French convention), so the run "
+                "is reported, and its costs counted, as monthly"
+            )
         labels = pd.DatetimeIndex([d + pd.offsets.MonthEnd(0) for d in days]).normalize()
         close_m, returns, dead = self._monthly_panel(ctx, days, labels, float(spec.delisting_return))
         self._say(f"{spec.name}: point-in-time market caps at {len(days)} month-ends")
@@ -1796,7 +1917,7 @@ class StrategyRunner:
             llm="none",
             start=max(ctx.start, (fac.index[0] - pd.offsets.MonthBegin(1)).date()),
             end=ctx.end,
-            rebalance=spec.rebalance,
+            rebalance="monthly",  # what was simulated, whatever spec.rebalance says (warning above)
             returns=returns_out,
             dates=out_dates,
             stats=stats,
@@ -1958,13 +2079,34 @@ class StrategyRunner:
         if not req:
             return pd.Series(dtype=float)
         as_of = _as_date(as_of)
+        return self.prices_at(req, [as_of]).loc[pd.Timestamp(as_of)].rename(None)
+
+    def prices_at(self, tickers: list[str], dates: list[date]) -> pd.DataFrame:
+        """Adjusted close on or before each of ``dates`` (within 31 days) per ticker, all taken from ONE
+        price download over ``(min(dates) - 31 days, max(dates)]``; NaN when unavailable.
+
+        Rows: the distinct ``dates`` (as Timestamps, ascending); columns: ``tickers`` (deduplicated, in order).
+        Because every row comes from the same download, all of them share one adjustment vintage:
+        paper trading compares a re-read past price with today's price to detect splits and
+        dividends, which a past window served from a provider's cache (adjusted before the event)
+        would hide.
+        """
+        req = list(dict.fromkeys(str(t) for t in tickers))
+        days = sorted({_as_date(d) for d in dates})
+        index = pd.DatetimeIndex([pd.Timestamp(d) for d in days])
+        out = pd.DataFrame(np.nan, index=index, columns=req, dtype=float)
+        if not req or not days:
+            return out
         try:
-            panel = self.provider.get_price_history(req, as_of - timedelta(days=31), as_of)
-            close = panel.close
-            close = close.loc[close.index <= pd.Timestamp(as_of)]
-            last = close.ffill().iloc[-1] if len(close) else pd.Series(np.nan, index=req)
+            panel = self.provider.get_price_history(req, days[0] - timedelta(days=31), days[-1])
+            close = panel.close.copy()
+            close.columns = [str(c) for c in close.columns]
+            close = close.loc[:, ~close.columns.duplicated(keep="last")]
+            close = close.apply(pd.to_numeric, errors="coerce").sort_index()
         except Exception:  # noqa: BLE001 - unavailable prices are NaN
-            last = pd.Series(np.nan, index=req)
-        last.index = [str(i) for i in last.index]
-        out = pd.to_numeric(last, errors="coerce").reindex(req).astype(float)
+            return out
+        for d, ts in zip(days, index):
+            rows = close.loc[(close.index >= pd.Timestamp(d - timedelta(days=31))) & (close.index <= ts)]
+            if len(rows):
+                out.loc[ts] = rows.ffill().iloc[-1].reindex(req).astype(float)
         return out.where(np.isfinite(out.to_numpy()) & (out > 0))

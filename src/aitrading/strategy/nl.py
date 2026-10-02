@@ -25,7 +25,9 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
-from aitrading.llm.base import LLMError, StructuredLLM
+from pydantic import ValidationError
+
+from aitrading.llm.base import LLMError, LLMOutputError, StructuredLLM
 from aitrading.screen.catalog import FeatureCatalog, default_catalog
 from aitrading.screen.spec import Condition
 from aitrading.strategy.library import TEMPLATES, suggest_templates, templates_prompt
@@ -195,8 +197,23 @@ def build_system_prompt(catalog: FeatureCatalog | None = None) -> str:
     return _SYSTEM_TEMPLATE.replace("{catalog}", cat.to_prompt()).replace("{templates}", templates_prompt())
 
 
+def _validation_messages(err: ValidationError | LLMOutputError) -> list[str]:
+    out = []
+    for e in err.errors():
+        loc = ".".join(str(p) for p in e.get("loc", ()))
+        out.append(f"schema error at '{loc or '<root>'}': {e.get('msg', 'invalid')}")
+    return out or [str(err)]
+
+
 class StrategyTranslator:
-    """Claude-backed idea -> ``StrategySpec`` translation with validate-and-repair rounds."""
+    """Claude-backed idea -> ``StrategySpec`` translation with validate-and-repair rounds.
+
+    A spec that fails :func:`spec_errors` is sent back with its errors for up to
+    ``max_repair_rounds`` repair calls (purpose ``"strategy_spec:repair"``). A reply that does not
+    validate as a ``StrategySpec`` at all (``LLMOutputError`` / pydantic ``ValidationError``, e.g. a
+    bound the API's schema cannot enforce) uses a repair round too, as in the screen translator;
+    other ``LLMError`` / ``LLMRefusalError`` propagate.
+    """
 
     def __init__(
         self,
@@ -232,14 +249,17 @@ class StrategyTranslator:
             "Translate the idea above into a StrategySpec."
         )
 
-    def repair_prompt(self, idea: str, previous: StrategySpec, errors: list[str]) -> str:
-        prev = json.dumps(previous.model_dump(mode="json"), separators=(",", ":"))
+    def repair_prompt(self, idea: str, previous: StrategySpec | None, errors: list[str]) -> str:
         bullet = "\n".join(f"- {e}" for e in errors)
+        if previous is not None:
+            prev = json.dumps(previous.model_dump(mode="json"), separators=(",", ":"))
+            head = f"Your previous StrategySpec cannot be executed:\n<previous_spec>\n{prev}\n</previous_spec>\n"
+        else:
+            head = "Your previous response was not a valid StrategySpec.\n"
         return (
             f"Today's date: {self._today().isoformat()}.\n\n"
             f"<idea>\n{idea}\n</idea>\n\n"
-            "Your previous StrategySpec cannot be executed:\n"
-            f"<previous_spec>\n{prev}\n</previous_spec>\n"
+            f"{head}"
             f"<errors>\n{bullet}\n</errors>\n\n"
             "Return the complete corrected StrategySpec. Fix exactly what the errors require and keep the idea's intent. "
             "Anything that cannot be expressed with catalog features goes into unsupported_requests - do not invent a feature."
@@ -255,11 +275,17 @@ class StrategyTranslator:
             if rnd == 0:
                 purpose, user = "strategy_spec", self.user_prompt(idea)
             else:
-                assert spec is not None
                 purpose, user = "strategy_spec:repair", self.repair_prompt(idea, spec, errors)
-            out = self.llm.structured(
-                purpose=purpose, system=self.system_prompt, user=user, output_model=StrategySpec, effort=self.effort
-            )
+            try:
+                out = self.llm.structured(
+                    purpose=purpose, system=self.system_prompt, user=user, output_model=StrategySpec, effort=self.effort
+                )
+                if not isinstance(out, StrategySpec):
+                    out = StrategySpec.model_validate(out)
+            except (ValidationError, LLMOutputError) as e:  # schema-level failure: repair it like a spec error
+                errors = _validation_messages(e)
+                errors_by_round.append(errors)
+                continue
             spec = out.model_copy(update={"idea": idea})
             errors = spec_errors(spec, self.catalog)
             errors_by_round.append(errors)

@@ -44,6 +44,11 @@ Factor characteristics (the academic factor sort variables)
   ``fields.TOTAL_ASSETS_PRIOR_YEAR`` columns (``fields.FUNDAMENTAL_OPTIONAL_COLUMNS``) and are
   NaN when a provider does not supply them; total assets must be > 0.
 * earnings_yield_ttm_pct = net income TTM / market cap x 100 (negative for loss-makers).
+
+Adjustment basis: pe_ntm, earnings_yield_ntm_pct and target_price_upside_pct divide a per-share vendor
+value (consensus EPS, target price) as of as_of by the panel's adjusted close, which is restated for
+splits and dividends after as_of. At the latest data date the two agree; at a past date on a
+provider that serves historical estimates they are not point-in-time (``ResearchPipeline`` warns).
 """
 
 from __future__ import annotations

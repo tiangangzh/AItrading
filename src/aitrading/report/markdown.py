@@ -21,7 +21,8 @@ Conventions
   text the explainer saw and the grounding verifier checked, so report and evidence agree.
 * Grounding marks: ``✓`` verified, ``✗`` mismatch / not found, ``–`` no matching check. Checks are
   matched to evidence items by position when ``verify_thesis``'s order lines up (quant evidence
-  first, then quotes), otherwise by feature / quote text.
+  first, then quotes), otherwise by feature / quote text. Only evidence items are checked: the
+  grounding line says so ("narrative text not checked") rather than calling a thesis fully grounded.
 * Table cells collapse whitespace and escape ``|`` as ``\\|``. Free text has raw HTML tags
   neutralised (``<tag`` -> ``&lt;tag``) so document text cannot inject markup into a rendered page.
 * The output is a pure function of the result (no clock, no randomness).
@@ -258,7 +259,7 @@ def _grounding_line(report: GroundingReport | None) -> str:
     if not report.checks:
         return "no evidence items to check"
     n, total = report.n_verified, len(report.checks)
-    tail = "fully grounded" if report.is_fully_grounded else f"{total - n} failed"
+    tail = "all evidence verified (narrative text not checked)" if report.is_fully_grounded else f"{total - n} failed"
     return f"{n}/{total} evidence items verified ({_pct(report.verified_ratio, 0)}) - {tail}"
 
 
@@ -556,8 +557,9 @@ def _ideas_section(result: PipelineResult) -> list[str]:
         lines.append("_No candidates were explained in this run (screen only)._")
     else:
         lines += [
-            "Every quoted sentence and every cited number below was checked programmatically against the "
-            "source documents and the feature table (✓ verified, ✗ mismatch or not found, – not checked).",
+            "Every quoted sentence and every number cited as evidence below was checked programmatically against "
+            "the source documents and the feature table (✓ verified, ✗ mismatch or not found, – not checked). "
+            "Numbers in the narrative text (thesis, catalysts, risks) are not individually checked.",
         ]
         for n, idea in enumerate(shown, 1):
             lines += ["", *_idea_section(n, idea)]

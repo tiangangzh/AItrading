@@ -141,7 +141,7 @@ The verified research gives five facts that drive the decision:
     - citations combined with a format (expect 400);
     - forced `tool_choice` (expect 400);
     - fallback header pairing;
-    - whether `messages.parse` merges `output_config.effort` with `output_format` (UNVERIFIED).
+    - structured output sent as `output_config={'effort': ..., 'format': <JSON schema>}` (no `output_format`, so the SDK does not validate inside the call), with the reply validated only after the `stop_reason` check.
 
 We do **not** claim the pipeline is automated end to end today. In Phase 1 the narrative step is analyst-driven by design.
 
@@ -199,9 +199,9 @@ We do **not** claim the pipeline is automated end to end today. In Phase 1 the n
 ```
 
 1. **Observation to ScreenSpec. Claude involved; no vendor data.**
-   - Call `client.messages.parse(model='claude-opus-5-5', max_tokens=16000, output_format=ScreenSpec, output_config={'effort':'high'}, system=<catalogue>, messages=[observation])`.
+   - Call `client.beta.messages.parse(model='claude-opus-5-5', max_tokens=16000, output_config={'effort':'high', 'format': <ScreenSpec JSON schema>}, system=<catalogue>, messages=[observation])`. The schema goes in `output_config.format` rather than `output_format`, so the SDK does not validate inside the call and a truncated or refused reply keeps its stop reason and token usage in the audit record.
    - The features form a closed enum and include `revenue_growth_ltm_yoy` as distinct from `revenue_growth_fy1_fwd`. Anything the catalogue cannot express goes into `unmapped_requests`.
-   - Code then checks the bounds, that each condition has exactly one right-hand side, and that `stop_reason` is not `refusal` or `max_tokens`. **The LLM does not see or produce any number from the market.**
+   - Code first checks that `stop_reason` is not `refusal` or `max_tokens`, then validates the JSON as a ScreenSpec (a failure gets a repair round), then checks the bounds and that each condition has exactly one right-hand side. **The LLM does not see or produce any number from the market.**
 2. **Compile. Deterministic.**
    - The FieldMap lists, for each feature: its vendor expression, unit, sign and admission status.
    - Only admitted predicates are pushed. The analyst approves the pushed/residual/unmapped lists, and the approval is logged.
@@ -238,7 +238,7 @@ We do **not** claim the pipeline is automated end to end today. In Phase 1 the n
    - Call `client.messages.create(..., output_config={'effort':'high'}, inference_geo='us')`.
    - Inputs: transcript paragraphs as `search_result` blocks with `citations: {enabled: true}`, plus a metrics table containing **only L0/L1 values** (Kensho market cap and line items, and indicators computed locally from them). Bloomberg-derived facts appear only as booleans or ranks.
    - No tools and no output format.
-   - Optional second pass: `messages.parse(output_format=Dislocation)` over the verified prose.
+   - Optional second pass: `messages.parse` with `output_config.format` = the `Dislocation` schema over the verified prose, validated after the `stop_reason` check.
 10. **Verify.**
     - `cited_text` must be found in the normalised corpus.
     - Every number in the prose must match the metric it claims to be, in the table or in cited text.

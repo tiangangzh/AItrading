@@ -3,15 +3,20 @@
 Quotes (``QuoteEvidence``)
     Both the quote and the source are normalised (HTML entities, Unicode compatibility forms,
     curly quotes / dashes -> ASCII, whitespace collapsed, case-folded); surrounding quote marks and
-    leading / trailing ellipses are stripped from the quote. A quote containing an ellipsis
-    ("...", "…", "[...]") is split into fragments; fragments shorter than ``MIN_FRAGMENT_CHARS``
-    are ignored, at least one must remain, and all remaining fragments must occur in order. The
-    cited document is searched first (its ``text`` and, for transcripts, the
-    ``Speaker (Role): text`` rendering of its segments, so a quote copied from an excerpt with or
-    without the attribution prefix verifies). A quote found only in another provided document is
-    a ``mismatch`` naming that document; a quote found nowhere is ``not_found``. For transcript
-    quotes with a ``speaker``, a clear mis-attribution (the quote lies in another speaker's turn) is
-    a ``mismatch``.
+    leading / trailing ellipses are stripped from the quote. A match must start and end on word
+    boundaries of the source ("profitable" does not verify inside "unprofitable", "1.2%" not inside
+    "11.2%"). A quote with an interior ellipsis ("...", "…", "[...]") verifies when it occurs
+    verbatim, ellipsis included (the source itself has one); otherwise it is split into fragments,
+    and EVERY fragment must have at least ``MIN_FRAGMENT_CHARS`` characters (a shorter one, e.g. an
+    invented "... by 900 bps" tail, cannot be checked, so the quote is ``not_found``), the fragments
+    must occur in order within ONE sentence of the source, and the words the ellipsis skips must not
+    contain a negation ("We do ... expect" for "We do not expect"); stitched or negation-skipping
+    quotes are a ``mismatch``. The cited document is searched first (its ``text`` and, for
+    transcripts, the ``Speaker (Role): text`` rendering of its segments, so a quote copied from an
+    excerpt with or without the attribution prefix verifies). A quote found only in another provided
+    document is a ``mismatch`` naming that document; a quote found nowhere is ``not_found``. For
+    transcript quotes with a ``speaker``, a clear mis-attribution (the quote lies in another
+    speaker's turn) is a ``mismatch``.
 
 Numbers (``QuantEvidence``)
     The feature must exist in the feature table (else ``not_found``). A value passes if
@@ -40,7 +45,7 @@ from aitrading.core.models import (
     QuoteEvidence,
     TranscriptSegment,
 )
-from aitrading.narrative.excerpts import segment_prefix
+from aitrading.narrative.excerpts import segment_prefix, sentence_spans
 
 __all__ = [
     "MIN_FRAGMENT_CHARS",
@@ -64,6 +69,12 @@ _CHAR_MAP = str.maketrans({
 _WS = re.compile(r"\s+")
 _ELLIPSIS = re.compile(r"\s*(?:\[\s*(?:\.\s*){3,}\]|\(\s*(?:\.\s*){3,}\)|(?:\.\s*){2}\.)\s*")
 _EDGE_JUNK = " \t\n\"'"
+# Words that, when skipped by "...", can reverse what the source says (as in discovery.extract).
+_GAP_NEGATION = re.compile(
+    r"\b(?:not|no|never|neither|nor|none|nothing|cannot|without|fails?|failed|lacks?|lacked|hardly|barely|"
+    r"insignificant(?:ly)?|unprofitable|unable|unlikely|\w+n't)\b"
+)
+_MAX_OCCURRENCES = 50
 
 
 def normalize_text(text: str) -> str:
@@ -88,24 +99,77 @@ def _strip_edges(q: str) -> str:
     return q
 
 
+def _split(q: str) -> list[str]:
+    """Non-empty fragments of an already normalised, edge-stripped quote, split at ellipses."""
+    return [p for p in (_strip_edges(x) for x in _ELLIPSIS.split(q)) if p]
+
+
 def quote_fragments(quote: str) -> list[str]:
-    """Normalised fragments of ``quote`` to locate in order (fragments < MIN_FRAGMENT_CHARS dropped)."""
-    q = _strip_edges(normalize_text(quote))
-    parts = (_strip_edges(p) for p in _ELLIPSIS.split(q))
-    return [p for p in parts if len(p) >= MIN_FRAGMENT_CHARS]
+    """Normalised fragments of ``quote`` between ellipses, in order (none dropped: a fragment shorter
+    than ``MIN_FRAGMENT_CHARS`` makes the quote unverifiable unless it occurs verbatim)."""
+    return _split(_strip_edges(normalize_text(quote)))
+
+
+def _canon_ellipses(text: str) -> str:
+    """``text`` with every ellipsis written " ... " (for verbatim matches of quotes containing one)."""
+    return _WS.sub(" ", _ELLIPSIS.sub(" ... ", text)).strip()
+
+
+def _occurrences(haystack: str, frag: str, start: int = 0):
+    """Start offsets (from ``start``) where ``frag`` occurs beginning and ending on word boundaries."""
+    left, right = frag[:1].isalnum(), frag[-1:].isalnum()
+    pos, found = start, 0
+    while found < _MAX_OCCURRENCES:
+        i = haystack.find(frag, pos)
+        if i < 0:
+            return
+        j = i + len(frag)
+        if (not left or i == 0 or not haystack[i - 1].isalnum()) and (not right or j == len(haystack) or not haystack[j].isalnum()):
+            found += 1
+            yield i
+        pos = i + 1
 
 
 def _find_in_order(fragments: list[str], haystack: str) -> int | None:
-    """Start position of the first fragment if all fragments occur in order, else None."""
+    """Start position of the first fragment if all fragments occur in order (word-bounded), else None.
+
+    Taking the earliest occurrence of each fragment is optimal for existence, so this is greedy."""
     pos, first = 0, None
     for frag in fragments:
-        i = haystack.find(frag, pos)
-        if i < 0:
+        i = next(_occurrences(haystack, frag, pos), None)
+        if i is None:
             return None
         if first is None:
             first = i
         pos = i + len(frag)
     return first
+
+
+def _in_sentence(fragments: list[str], sentence: str) -> str | None:
+    """'ok' if the fragments occur in order in ``sentence`` with no negation in the skipped text,
+    'negated_gap' if they only occur skipping a negation, else None (backtracking, memoised)."""
+    saw_negated = False
+    memo: dict[tuple[int, int], bool] = {}
+
+    def place(k: int, pos: int) -> bool:
+        nonlocal saw_negated
+        if k == len(fragments):
+            return True
+        if (k, pos) not in memo:
+            ok = False
+            for i in _occurrences(sentence, fragments[k], pos):
+                if k > 0 and _GAP_NEGATION.search(sentence[pos:i]):
+                    saw_negated = True
+                    continue
+                if place(k + 1, i + len(fragments[k])):
+                    ok = True
+                    break
+            memo[(k, pos)] = ok
+        return memo[(k, pos)]
+
+    if place(0, 0):
+        return "ok"
+    return "negated_gap" if saw_negated else None
 
 
 @dataclass
@@ -114,6 +178,20 @@ class _DocIndex:
     spaces: list[str]  # normalised search spaces: Document.text, transcript rendering
     segments: list[tuple[TranscriptSegment, str]]  # (segment, normalised text)
     speakers: list[str]  # normalised speaker names
+    _sentences: list[str] | None = None
+    _canon: list[str] | None = None
+
+    def sentences(self) -> list[str]:
+        """Normalised sentences of ``Document.text`` and of each transcript segment (built lazily)."""
+        if self._sentences is None:
+            raws = [self.doc.text or ""] + [s.text for s, _ in self.segments]
+            self._sentences = [normalize_text(r[a:b]) for r in raws for a, b in sentence_spans(r)]
+        return self._sentences
+
+    def canon_spaces(self) -> list[str]:
+        if self._canon is None:
+            self._canon = [_canon_ellipses(sp) for sp in self.spaces]
+        return self._canon
 
 
 def _index(doc: Document) -> _DocIndex:
@@ -197,6 +275,28 @@ def _short(text: str, n: int = 60) -> str:
     return text if len(text) <= n else text[: n - 3] + "..."
 
 
+_VERIFIED = ("verbatim", "in_sentence")
+
+
+def _match(fragments: list[str], idx: _DocIndex) -> str | None:
+    """How ``fragments`` occur in ``idx``: 'verbatim' (one fragment, or the quote with its ellipses
+    as written), 'in_sentence' (in order within one sentence, no negation skipped), 'negated_gap',
+    'cross_sentence' (in order, but stitched across sentences), or None."""
+    if len(fragments) == 1:
+        return "verbatim" if len(fragments[0]) >= MIN_FRAGMENT_CHARS and _locate(fragments, idx) else None
+    joined = " ... ".join(fragments)
+    if any(_find_in_order([joined], sp) is not None for sp in idx.canon_spaces()):
+        return "verbatim"
+    if any(len(f) < MIN_FRAGMENT_CHARS for f in fragments):
+        return None
+    outcomes = {_in_sentence(fragments, sent) for sent in idx.sentences()}
+    if "ok" in outcomes:
+        return "in_sentence"
+    if "negated_gap" in outcomes:
+        return "negated_gap"
+    return "cross_sentence" if _locate(fragments, idx) else None
+
+
 def verify_quote(q: QuoteEvidence, indexes: dict[str, _DocIndex], order: list[str]) -> EvidenceCheck:
     """Check one quote against the indexed documents (``order``: doc_ids in caller order)."""
 
@@ -204,41 +304,56 @@ def verify_quote(q: QuoteEvidence, indexes: dict[str, _DocIndex], order: list[st
         return EvidenceCheck(kind="quote", ref=q.doc_id, claim=q.quote, status=status, detail=detail)
 
     fragments = quote_fragments(q.quote)
-    if not fragments:
+    if not fragments or (len(fragments) == 1 and len(fragments[0]) < MIN_FRAGMENT_CHARS):
         return check("not_found", f"quote too short to verify (needs a fragment of >= {MIN_FRAGMENT_CHARS} chars)")
     cited = _resolve_doc_id(q.doc_id, indexes)
 
-    def found_in(idx: _DocIndex) -> list[str] | None:
-        """Fragments as located (prefix-stripped if needed), or None."""
-        if _locate(fragments, idx):
-            return fragments
+    def found_in(idx: _DocIndex) -> tuple[str, list[str]] | None:
+        """(how, fragments as located - prefix-stripped if needed) for the best match, or None."""
+        best: tuple[str, list[str]] | None = None
+        variants = [fragments]
         stripped = _strip_speaker_prefix(_strip_edges(normalize_text(q.quote)), idx, q.speaker)
         if stripped is not None:
-            alt = [p for p in (_strip_edges(x) for x in _ELLIPSIS.split(stripped)) if len(p) >= MIN_FRAGMENT_CHARS]
-            if alt and _locate(alt, idx):
-                return alt
-        return None
+            alt = _split(stripped)
+            if alt:
+                variants.append(alt)
+        for frags in variants:
+            how = _match(frags, idx)
+            if how in _VERIFIED:
+                return how, frags
+            if how is not None and best is None:
+                best = (how, frags)
+        return best
 
     n = len(fragments)
-    what = "verbatim" if n == 1 else f"all {n} fragments in order"
-    if cited is not None:
-        located = found_in(indexes[cited])
-        if located is not None:
-            mis = _speaker_check(located, indexes[cited], q.speaker)
-            if mis:
-                return check("mismatch", f"found in {cited} but {mis}")
-            return check("verified", f"found {what} in {cited}")
-    others = [d for d in order if d != cited and found_in(indexes[d]) is not None]
+    hit = found_in(indexes[cited]) if cited is not None else None
+    if hit is not None and hit[0] in _VERIFIED:
+        mis = _speaker_check(hit[1], indexes[cited], q.speaker)
+        if mis:
+            return check("mismatch", f"found in {cited} but {mis}")
+        what = "verbatim" if hit[0] == "verbatim" else f"all {len(hit[1])} fragments in order within one sentence"
+        return check("verified", f"found {what} in {cited}")
+    others = [d for d in order if d != cited and (h := found_in(indexes[d])) is not None and h[0] in _VERIFIED]
     if others:
         where = ", ".join(others[:3]) + (f" (+{len(others) - 3} more)" if len(others) > 3 else "")
         head = f"not in cited document {q.doc_id}" if cited is not None else f"cited doc_id '{q.doc_id}' not provided"
         return check("mismatch", f"{head}; found in {where}")
     if cited is None:
         return check("not_found", f"cited doc_id '{q.doc_id}' not provided and quote not found in any document")
+    short = [f for f in fragments if len(f) < MIN_FRAGMENT_CHARS]
+    if short:
+        return check("not_found", f"fragment '{_short(short[0], 40)}' between '...' is too short to verify (each needs >= "
+                                  f"{MIN_FRAGMENT_CHARS} chars); quote one contiguous passage instead")
+    if hit is not None and hit[0] == "negated_gap":
+        return check("mismatch", f"fragments found in {cited}, but the words skipped by '...' contain a negation that "
+                                 "changes the meaning")
+    if hit is not None and hit[0] == "cross_sentence":
+        return check("mismatch", f"fragments occur in {cited} but not within one sentence ('...' may only skip words "
+                                 "inside a sentence)")
     if n > 1:
         idx = indexes[cited]
         k = 0  # number of leading fragments that do occur in order
-        while k < n and any(_find_in_order(fragments[: k + 1], s) is not None for s in idx.spaces):
+        while k < n - 1 and any(_find_in_order(fragments[: k + 1], s) is not None for s in idx.spaces):
             k += 1
         return check("not_found", f"fragment {k + 1}/{n} ('{_short(fragments[k], 40)}') not found in {cited} or any other document")
     return check("not_found", f"quote not found in {cited} or any other provided document")

@@ -37,10 +37,12 @@ Exit codes: 0 ok, 1 runtime error, 2 usage error (130 on Ctrl-C).
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib
 import inspect
 import json
 import os
+import re
 import sys
 import traceback
 from dataclasses import asdict
@@ -289,13 +291,43 @@ def _non_negative(text: str) -> int:
     return n
 
 
+def default_provider_name() -> str:
+    """``$AITRADING_PROVIDER`` when it names a known provider, else ``free``."""
+    name = (os.environ.get("AITRADING_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
+    return name if name in PROVIDERS else DEFAULT_PROVIDER
+
+
+def data_options(provider_default: str | None = "") -> argparse.ArgumentParser:
+    """Parent parser with --provider / --as-of / --tickers / --universe-file.
+
+    ``provider_default`` "" means :func:`default_provider_name`; ``None`` leaves ``args.provider``
+    None when --provider is not given (``strategy run`` then uses the strategy's own provider).
+    """
+    shown = default_provider_name()
+    default = shown if provider_default == "" else provider_default
+    data = argparse.ArgumentParser(add_help=False)
+    shown_default = shown if default is not None else f"the strategy's own, else {shown}"
+    data.add_argument("--provider", choices=list(PROVIDERS), default=default,
+                      help=f"data provider (default: {shown_default}; 'free' = Yahoo + SEC EDGAR, 'synthetic' = simulated market)")
+    data.add_argument("--as-of", type=_iso_date, default=None, metavar="YYYY-MM-DD",
+                      help="point-in-time date (default: latest business day; the synthetic market's last day for --provider synthetic)")
+    tick = data.add_mutually_exclusive_group()
+    tick.add_argument("--tickers", default=None, metavar="LIST",
+                      help="explicit universe for providers that take one: comma-separated, or @PATH (a file, as for --universe-file)")
+    tick.add_argument("--universe-file", default=None, metavar="PATH",
+                      help="explicit universe from a file: one ticker per line ('#' comments), or a CSV with a 'ticker' "
+                           "(or 'symbol') column; UTF-8, UTF-16 or Windows-1252")
+    return data
+
+
 def build_parser() -> argparse.ArgumentParser:
     base = argparse.ArgumentParser(add_help=False)
     base.add_argument("--debug", action="store_true", help="print a traceback when a command fails")
 
     obs = argparse.ArgumentParser(add_help=False)
     obs.add_argument("observation", nargs="*", help="the investment observation (quote it in the shell)")
-    obs.add_argument("-f", "--observation-file", metavar="PATH", help="read the observation from a UTF-8 text file ('-' = stdin)")
+    obs.add_argument("-f", "--observation-file", metavar="PATH",
+                     help="read the observation from a text file (UTF-8, UTF-16 or Windows-1252; '-' = stdin)")
 
     engine = argparse.ArgumentParser(add_help=False)
     mode = engine.add_mutually_exclusive_group()
@@ -304,19 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
     engine.add_argument("--model", default=None, help="Claude model id (default: $AITRADING_MODEL or claude-opus-5-5)")
     engine.add_argument("--effort", choices=EFFORTS, default="high", help="Claude effort level (default: high)")
 
-    default_provider = (os.environ.get("AITRADING_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
-    if default_provider not in PROVIDERS:
-        default_provider = DEFAULT_PROVIDER
-    data = argparse.ArgumentParser(add_help=False)
-    data.add_argument("--provider", choices=list(PROVIDERS), default=default_provider,
-                      help=f"data provider (default: {default_provider}; 'free' = Yahoo + SEC EDGAR, 'synthetic' = simulated market)")
-    data.add_argument("--as-of", type=_iso_date, default=None, metavar="YYYY-MM-DD",
-                      help="point-in-time date (default: latest business day; the synthetic market's last day for --provider synthetic)")
-    tick = data.add_mutually_exclusive_group()
-    tick.add_argument("--tickers", default=None, metavar="LIST",
-                      help="explicit universe for providers that take one: comma-separated, or @PATH (one per line)")
-    tick.add_argument("--universe-file", default=None, metavar="PATH",
-                      help="explicit universe from a file (one ticker per line, '#' comments)")
+    data = data_options()
 
     output = argparse.ArgumentParser(add_help=False)
     output.add_argument("--top", type=_top_n, default=None, metavar="N", help="number of ranked candidates (1-100; default: the spec's top_n)")
@@ -371,8 +391,21 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------------------------
 
 
+# C0 controls except tab and newline, DEL and C1 controls: terminal escape sequences (ANSI / OSC,
+# e.g. "conceal", cursor movement, clipboard writes) and carriage returns that could hide or forge
+# lines. Text from papers, web pages, feeds and models is printed, so it is never sent raw.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def terminal_safe(text: str) -> str:
+    """``text`` with terminal control characters replaced by U+FFFD (tab, newline and CRLF kept as a newline)."""
+    return _CONTROL_CHARS.sub("\ufffd", text.replace("\r\n", "\n"))
+
+
 def _emit(text: str) -> None:
-    """Write to stdout; characters the console cannot encode are replaced, a closed pipe is ignored."""
+    """Write to stdout; control characters are neutralised (:func:`terminal_safe`), characters the
+    console cannot encode are replaced, a closed pipe is ignored."""
+    text = terminal_safe(text)
     try:
         sys.stdout.write(text)
         sys.stdout.flush()
@@ -390,7 +423,25 @@ def _emit(text: str) -> None:
 
 
 def _note(text: str) -> None:
-    print(text, file=sys.stderr)
+    """Write a line to stderr (control characters neutralised, unencodable characters replaced)."""
+    text = terminal_safe(text) + "\n"
+    try:
+        sys.stderr.write(text)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stderr, "encoding", None) or "utf-8"
+        sys.stderr.write(text.encode(enc, errors="replace").decode(enc, errors="replace"))
+    try:
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def read_text_file(path: str | Path) -> str:
+    """A user-supplied text file: UTF-16 (Windows PowerShell 5.1 ``>`` / ``Out-File``), UTF-8 (BOM
+    optional) or Windows-1252, as :func:`aitrading.data.free.read_ticker_file` reads them."""
+    from aitrading.data.free import _read_text_any
+
+    return _read_text_any(Path(path))
 
 
 def _read_observation(args: argparse.Namespace) -> str:
@@ -403,7 +454,7 @@ def _read_observation(args: argparse.Namespace) -> str:
             text = sys.stdin.read()
         else:
             try:
-                text = Path(path).read_text(encoding="utf-8-sig")
+                text = read_text_file(path)
             except (OSError, UnicodeDecodeError) as exc:
                 raise UsageError(f"cannot read observation file '{path}': {exc}") from exc
     else:
@@ -414,21 +465,56 @@ def _read_observation(args: argparse.Namespace) -> str:
     return text
 
 
+_TICKER_COLUMNS = ("ticker", "tickers", "symbol", "symbols")
+
+
+def _tickers_from_file(path: str) -> list[str]:
+    """Tickers from a file: one per line (or several separated by commas / spaces), '#' comments,
+    or a CSV / TSV with a 'ticker' (or 'symbol') column - other columns (names, sectors) are ignored."""
+    try:
+        text = read_text_file(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise UsageError(f"cannot read tickers file '{path}': {exc}") from exc
+    lines = [ln for ln in (line.split("#", 1)[0].strip() for line in text.splitlines()) if ln]
+    if not lines:
+        return []
+    first = lines[0]
+    delim = "\t" if "\t" in first else (";" if ";" in first and "," not in first else ",")
+    rows = list(csv.reader(lines, delimiter=delim))
+    header = [c.strip().lower() for c in rows[0]]
+    col = next((header.index(h) for h in _TICKER_COLUMNS if h in header), None)
+    if col is not None:
+        return [r[col].strip() for r in rows[1:] if len(r) > col and r[col].strip()]
+    # a table without a ticker column ("CROX,Crocs Inc"): its other columns would become tickers
+    widths = {len(r) for r in rows}
+    tabular = len(rows) > 1 and len(widths) == 1 and widths.pop() > 1 and (
+        Path(path).suffix.lower() in (".csv", ".tsv") or any(" " in c.strip() for r in rows for c in r))
+    if tabular:
+        raise UsageError(f"tickers file '{path}' looks like a table: give it a 'ticker' (or 'symbol') header column "
+                         f"(first row found: {rows[0]})")
+    return [t for ln in lines for t in re.split(r"[,;\s]+", ln) if t]
+
+
 def _read_tickers(spec: str | None) -> list[str] | None:
-    """``--tickers``: 'A,B C' or '@path' (one ticker per line, '#' comments); None when not given."""
+    """``--tickers``: 'A,B C' or '@path' (see :func:`_tickers_from_file`); None when not given."""
     if spec is None:
         return None
-    text = spec
     if spec.startswith("@"):
-        try:
-            text = Path(spec[1:]).read_text(encoding="utf-8-sig")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise UsageError(f"cannot read tickers file '{spec[1:]}': {exc}") from exc
-        text = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
-    tickers = list(dict.fromkeys(t.strip().upper() for t in text.replace(",", " ").split() if t.strip()))
+        raw = _tickers_from_file(spec[1:])
+    else:
+        raw = spec.replace(",", " ").split()
+    tickers = list(dict.fromkeys(t.strip().strip('"').strip().upper() for t in raw if t.strip().strip('"').strip()))
     if not tickers:
-        raise UsageError("--tickers is empty")
+        raise UsageError("--tickers is empty" if not spec.startswith("@") else f"tickers file '{spec[1:]}' contains no tickers")
     return tickers
+
+
+def explicit_tickers(args: argparse.Namespace) -> list[str] | None:
+    """The universe given with --tickers / --universe-file, or None."""
+    spec = getattr(args, "tickers", None)
+    if getattr(args, "universe_file", None):
+        spec = "@" + args.universe_file
+    return _read_tickers(spec)
 
 
 def _describe(exc: BaseException) -> str:
@@ -460,10 +546,7 @@ def default_as_of(provider_name: str, provider: Any = None, today: date | None =
 
 
 def _provider_from_args(args: argparse.Namespace) -> Any:
-    spec = getattr(args, "tickers", None)
-    if getattr(args, "universe_file", None):
-        spec = "@" + args.universe_file
-    tickers = _read_tickers(spec)
+    tickers = explicit_tickers(args)
     provider = make_provider(args.provider, **({"tickers": tickers} if tickers else {}))
     diagnostics = getattr(provider, "diagnostics", None)
     if callable(diagnostics):

@@ -32,5 +32,11 @@ class BacktestRunner(Protocol):
         ...
 
     def latest_prices(self, tickers: list[str], as_of: date) -> pd.Series:
-        """Adjusted close on or before ``as_of`` for each ticker (NaN when unavailable)."""
+        """Adjusted close on or before ``as_of`` for each ticker (NaN when unavailable).
+
+        Optional companion (not part of the protocol, looked up with ``getattr``):
+        ``prices_at(tickers, dates) -> DataFrame`` (rows: dates, columns: tickers) with the close on or
+        before each date, all from ONE download, so the rows share one adjustment vintage. Paper
+        trading uses it to detect splits and dividends; without it, it calls ``latest_prices`` per date.
+        """
         ...

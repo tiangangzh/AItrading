@@ -208,6 +208,19 @@ def test_apply_universe_defaults(uframe):
     ]
 
 
+def test_suspended_price_floor_keeps_a_labelled_step_and_removes_nobody(uframe):
+    mask, funnel = apply_universe(UniverseSpec(), uframe, price_floor_suspended="adjusted prices at a past date")
+    assert passing(mask) == ["A", "D", "F", "G", "I"]  # D ($4.99) and G (no price) are no longer dropped by the floor
+    step = funnel[2]
+    assert step.label == "price >= 5 - NOT APPLIED (adjusted prices at a past date)"
+    assert (step.passed_alone, step.remaining, step.missing_data) == (9, 7, 0)
+    out = run_screen(spec([], universe=UniverseSpec()), uframe, CATALOG, price_floor_suspended="adjusted prices at a past date")
+    assert out.funnel[2].label == step.label and out.survivors == ["A", "D", "F", "G", "I"]
+    # without a floor there is nothing to suspend
+    _, plain = apply_universe(UniverseSpec(min_price=None), uframe, price_floor_suspended="x")
+    assert not any("NOT APPLIED" in s.label for s in plain)
+
+
 def test_apply_universe_exclude_sectors_and_disabled_filters(uframe):
     uframe.loc["I", "gics_sector"] = None
     u = UniverseSpec(country="US", security_types=["common_stock", "adr"], min_price=None,

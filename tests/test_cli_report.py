@@ -297,7 +297,7 @@ def test_report_idea_sections(offline_result, offline_md):
             assert f"`{q.doc_id}`" in sec and (q.speaker is None or q.speaker in sec)
         for item in [*t.catalysts, *t.risks, *t.invalidation_triggers, *t.data_gaps]:
             assert f"- {' '.join(item.split())}" in sec
-        assert f"**Grounding score:** {g.n_verified}/{len(g.checks)} evidence items verified (100%) - fully grounded." in sec
+        assert f"**Grounding score:** {g.n_verified}/{len(g.checks)} evidence items verified (100%) - all evidence verified (narrative text not checked)." in sec
     rest = [i for i in offline_result.ideas if i.thesis is None]
     assert "Not explained (ranked below the explanation cut-off): " + ", ".join(f"#{i.candidate.rank} {i.candidate.ticker}" for i in rest) in offline_md
 
@@ -973,3 +973,55 @@ def test_cli_demo_scores_against_ground_truth(capsys, tmp_path, shared_provider)
     assert code == 0 and "matched the planted ground truth" in out
     (run_dir,) = list(tmp_path.iterdir())
     assert (run_dir / "report.html").exists() and (run_dir / "report.md").exists()
+
+
+# --------------------------------------------------------------------------------------------
+# user files: CSV universes, UTF-16 / cp1252 text
+# --------------------------------------------------------------------------------------------
+
+
+def test_cli_universe_file_csv_and_windows_encodings(capsys, tmp_path, monkeypatch, shared_provider):
+    seen = {}
+
+    def spy(name, **kw):
+        seen.clear()
+        seen.update(kw)
+        return shared_provider
+
+    monkeypatch.setattr(cli, "make_provider", spy)
+
+    def tickers(name, content, encoding="utf-8"):
+        path = tmp_path / name
+        path.write_text(content, encoding=encoding)
+        code, _, err = run_cli(capsys, "screen", "--offline", OBS, "--universe-file", str(path), "--no-save", "--format", "json")
+        return code, seen.get("tickers"), err
+
+    # the documented CSV layout (as the bundled us_starter.csv): only the ticker column is used
+    assert tickers("w.csv", 'ticker,name,gics_sector\nCROX,"Crocs, Inc",Consumer\nDECK,Deckers,Consumer\n')[1] == ["CROX", "DECK"]
+    assert tickers("w.txt", "Symbol;Name\nCROX;Crocs Inc\nELF;e.l.f. Beauty\n")[1] == ["CROX", "ELF"]
+    assert tickers("w.tsv", "Name\tTicker\nCrocs Inc\tCROX\n")[1] == ["CROX"]
+    assert tickers("one.csv", "ticker\nAAPL\nMSFT\n")[1] == ["AAPL", "MSFT"]
+    # Windows PowerShell 5.1 `> file` writes UTF-16LE with a BOM; Excel's CSV is Windows-1252
+    assert tickers("wl16.txt", "AAPL\r\nMSFT\r\n", encoding="utf-16")[1] == ["AAPL", "MSFT"]
+    assert tickers("x.csv", "ticker,name\nNESN,Nestlé\n", encoding="cp1252")[1] == ["NESN"]
+    # plain lists keep working: one per line, '#' comments, or comma / space separated
+    assert tickers("l.txt", "# watchlist\naapl  # Apple\nmsft, ibm ge\n")[1] == ["AAPL", "MSFT", "IBM", "GE"]
+    # a table without a ticker column is refused instead of turning company names into tickers
+    code, _, err = tickers("bad.csv", "CROX,Crocs Inc\nDECK,Deckers Outdoor\n")
+    assert code == 2 and "'ticker' (or 'symbol') header column" in err
+    code, _, err = tickers("empty.txt", "# nothing\n")
+    assert code == 2 and "contains no tickers" in err
+
+
+def test_cli_observation_file_in_utf16(capsys, tmp_path):
+    path = tmp_path / "obs.txt"
+    path.write_text("US mid-caps with RSI under 40 and FCF yield above 4%\r\n", encoding="utf-16")
+    code, out, err = run_cli(capsys, "spec", "--offline", "-f", str(path))
+    assert code == 0, err
+    assert '"rsi_14"' in out and '"fcf_yield_pct"' in out
+
+
+def test_emit_neutralises_terminal_control_characters(capsys):
+    cli._emit("ok\x1b[8mhidden\x07\r\x9b\tkept\n")
+    out = capsys.readouterr().out
+    assert out == "ok�[8mhidden���\tkept\n"

@@ -22,6 +22,10 @@ Semantics (see ``aitrading.screen.spec``)
   ``remaining`` is cumulative, ``missing_data`` counts names that were still remaining and were
   dropped by this step because an input was missing. For an any_of group that is a name for which
   no alternative passed and at least one alternative had missing data.
+* ``price_floor_suspended`` (``run_screen`` / ``apply_universe``): a reason the minimum-price floor
+  must not be applied (e.g. split- and dividend-adjusted prices at a past date, where an adjusted
+  close under the floor says nothing about the price the stock traded at). The floor's funnel step
+  is then kept, labelled ``... - NOT APPLIED (<reason>)``, and removes nobody.
 """
 
 from __future__ import annotations
@@ -139,7 +143,7 @@ def evaluate_condition(cond: Condition, frame: pd.DataFrame, *, catalog: Feature
     return passes.astype(bool)
 
 
-def _universe_steps(universe: UniverseSpec, frame: pd.DataFrame) -> list[_Step]:
+def _universe_steps(universe: UniverseSpec, frame: pd.DataFrame, price_floor_suspended: str | None = None) -> list[_Step]:
     steps: list[_Step] = []
 
     def not_evaluated(label: str, missing: pd.Series) -> bool:
@@ -169,7 +173,10 @@ def _universe_steps(universe: UniverseSpec, frame: pd.DataFrame) -> list[_Step]:
     if universe.security_types:
         types = ", ".join(universe.security_types)
         labels_step(f"{SECURITY_TYPE_COLUMN} in [{types}]", SECURITY_TYPE_COLUMN, universe.security_types, True)
-    if universe.min_price is not None:
+    if universe.min_price is not None and price_floor_suspended:
+        label = f"{PRICE_COLUMN} >= {universe.min_price:g} - NOT APPLIED ({price_floor_suspended})"
+        steps.append((label, pd.Series(True, index=frame.index), pd.Series(False, index=frame.index)))
+    elif universe.min_price is not None:
         floor_step(PRICE_COLUMN, universe.min_price)
     if universe.min_avg_dollar_volume_usd_mn is not None:
         floor_step(LIQUIDITY_COLUMN, universe.min_avg_dollar_volume_usd_mn)
@@ -202,9 +209,11 @@ def _run_steps(steps: list[_Step], index: pd.Index) -> tuple[pd.Series, list[Fun
     return remaining.astype(bool), funnel
 
 
-def apply_universe(universe: UniverseSpec, frame: pd.DataFrame) -> tuple[pd.Series, list[FunnelStep]]:
+def apply_universe(
+    universe: UniverseSpec, frame: pd.DataFrame, *, price_floor_suspended: str | None = None
+) -> tuple[pd.Series, list[FunnelStep]]:
     """Mask of rows passing the universe filters and one FunnelStep per enabled filter."""
-    return _run_steps(_universe_steps(universe, frame), frame.index)
+    return _run_steps(_universe_steps(universe, frame, price_floor_suspended), frame.index)
 
 
 def _frame_errors(spec: ScreenSpec, frame: pd.DataFrame, catalog: FeatureCatalog) -> list[str]:
@@ -219,17 +228,24 @@ def _frame_errors(spec: ScreenSpec, frame: pd.DataFrame, catalog: FeatureCatalog
     return errs
 
 
-def run_screen(spec: ScreenSpec, frame: pd.DataFrame, catalog: FeatureCatalog | None = None) -> ScreenOutcome:
+def run_screen(
+    spec: ScreenSpec,
+    frame: pd.DataFrame,
+    catalog: FeatureCatalog | None = None,
+    *,
+    price_floor_suspended: str | None = None,
+) -> ScreenOutcome:
     """Validate ``spec`` against the catalog and the frame, then evaluate it step by step.
 
-    Raises ScreenValidationError listing every problem when the spec is not executable.
+    ``price_floor_suspended``: see the module docstring. Raises ScreenValidationError listing every
+    problem when the spec is not executable.
     """
     catalog = catalog or default_catalog()
     errors = spec.validate_against(catalog) + _frame_errors(spec, frame, catalog)
     if errors:
         raise ScreenValidationError(errors)
 
-    steps = _universe_steps(spec.universe, frame)
+    steps = _universe_steps(spec.universe, frame, price_floor_suspended)
     for cond in spec.conditions:
         passes, missing = _evaluate(cond, frame, catalog)
         steps.append((cond.describe(), passes, missing))

@@ -34,8 +34,10 @@ Accounting convention
 * ``NAV = cash + sum_i shares_i * price_i`` at all times (the identity holds after every
   operation). Shorts are negative share counts: selling short credits the proceeds to cash and
   the short position is a negative market value; buying to cover debits cash. Cash earns 0% and
-  there is no margin interest or borrow fee (the backtest engine's convention); leverage simply
-  shows as negative cash.
+  there is no margin interest or borrow fee; leverage simply shows as negative cash. (The backtest
+  of a long-only, screen or timing strategy credits the daily T-bill rate on idle cash and on
+  short-sale proceeds - see ``StrategyRunner._cash_credit`` - so it is not the same convention:
+  see the differences listed below.)
 * Orders bring each name from its current shares to ``target_weight x NAV' / price``, where NAV'
   is the NAV after this rebalance's costs (solved by a short fixed-point iteration), so after a
   rebalance the holdings weights equal the target weights and a fully invested long-only book
@@ -58,11 +60,19 @@ Accounting convention
   the next run the anchor is re-read; if the provider's history has been re-adjusted since, the
   position is scaled by the adjustment factor (and its mark divided by it, so its value is
   unchanged) - splits do not show up as fake losses and dividends are reinvested (cash in lieu
-  for whole-share accounts), matching the total-return convention of the backtest.
+  for whole-share accounts), matching the total-return convention of the backtest. The current
+  prices, the new anchors and the re-read anchors come from ONE price download
+  (``runner.prices_at``, when the runner has it), so they share one adjustment vintage: a past
+  window served from the provider's cache would still show the pre-split history.
 
 Paper results differ from the backtest because the backtest trades at the next session's close
 (``execution_lag=1``) while paper fills use the ``as_of`` close, because of whole shares, skipped
-small orders, late runs and data revisions. :meth:`PaperAccount.summary` puts both side by side.
+small orders, late runs and data revisions - and because idle cash earns the T-bill rate in the
+backtest (2x for a -1 short: capital plus proceeds) but 0% here, so a book that sits in cash or is
+net short lags its backtest by about RF x its cash share (e.g. ~1.1% over a quarter in cash at a
+4.5% RF). Long-short cross-sectional and factor-model backtests get no cash credit.
+:meth:`PaperAccount.summary` puts both side by side and lists the applicable differences in
+``backtest_comparison_notes``.
 """
 
 from __future__ import annotations
@@ -111,6 +121,7 @@ __all__ = [
     "scheduled_rebalance_on_or_before",
     "next_rebalance_date",
     "backtest_return_over_window",
+    "backtest_credits_cash_interest",
 ]
 
 log = logging.getLogger(__name__)
@@ -294,6 +305,18 @@ def is_rebalance_day(as_of: date, frequency: str) -> bool:
 # ------------------------------------------------------------------------------------------------
 # Backtest comparison
 # ------------------------------------------------------------------------------------------------
+
+
+def backtest_credits_cash_interest(backtest: BacktestResult) -> bool:
+    """True when ``backtest``'s strategy series includes risk-free interest on idle cash (and on
+    short-sale proceeds), which the paper account does not earn: every strategy except long-short
+    cross-sectional and factor-model ones, when an official RF series was available."""
+    spec = backtest.spec if isinstance(backtest.spec, dict) else {}
+    kind = spec.get("kind")
+    style = (spec.get("portfolio") or {}).get("style") if isinstance(spec.get("portfolio"), dict) else None
+    if kind == "factor_model" or (kind == "cross_sectional" and style == "long_short"):
+        return False
+    return any(u.dataset == "risk_free" and u.source != "none" for u in backtest.data_usage)
 
 
 def backtest_return_over_window(
@@ -534,17 +557,43 @@ class PaperAccount:
             )
 
     @staticmethod
-    def _fetch_prices(runner: BacktestRunner, tickers: list[str], as_of: date) -> pd.Series:
-        """Prices of ``tickers`` as a float Series in that order; NaN where missing / invalid."""
-        tickers = list(dict.fromkeys(tickers))
-        if not tickers:
-            return pd.Series(dtype=float)
-        raw = runner.latest_prices(tickers, as_of)
+    def _clean_prices(raw: Any, tickers: list[str]) -> pd.Series:
+        """``raw`` prices as a float Series over ``tickers`` in that order; NaN where missing / invalid."""
         s = raw if isinstance(raw, pd.Series) else pd.Series(raw, dtype=object)
         s = pd.to_numeric(s, errors="coerce").astype(float)
         s.index = [str(i) for i in s.index]
         s = s[~s.index.duplicated(keep="last")].reindex(tickers)
         return s.where(np.isfinite(s) & (s > 0))
+
+    @staticmethod
+    def _fetch_prices(runner: BacktestRunner, tickers: list[str], as_of: date) -> pd.Series:
+        """Prices of ``tickers`` as a float Series in that order; NaN where missing / invalid."""
+        tickers = list(dict.fromkeys(tickers))
+        if not tickers:
+            return pd.Series(dtype=float)
+        return PaperAccount._clean_prices(runner.latest_prices(tickers, as_of), tickers)
+
+    @staticmethod
+    def _price_table(runner: BacktestRunner, tickers: list[str], dates: list[date]) -> dict[date, pd.Series]:
+        """Prices of ``tickers`` on or before each of ``dates`` (as :meth:`_fetch_prices`).
+
+        A runner with ``prices_at(tickers, dates)`` (``StrategyRunner``) serves every date from ONE
+        price download, so the current price and the re-read anchor prices share one adjustment
+        vintage. Separate ``latest_prices`` calls per date would let a provider's cache of a past
+        window (adjusted before a split or dividend) hide the re-adjustment, booking the split as a
+        loss; they are only the fallback for runners without ``prices_at``.
+        """
+        tickers = list(dict.fromkeys(tickers))
+        days = sorted(set(dates))
+        if not tickers:
+            return {d: pd.Series(dtype=float) for d in days}
+        prices_at = getattr(runner, "prices_at", None)
+        if not callable(prices_at):
+            return {d: PaperAccount._fetch_prices(runner, tickers, d) for d in days}
+        raw = prices_at(tickers, days)
+        frame = raw if isinstance(raw, pd.DataFrame) else pd.DataFrame(raw)
+        rows = {_as_date(i): frame.iloc[k] for k, i in enumerate(frame.index)}
+        return {d: PaperAccount._clean_prices(rows.get(d, pd.Series(dtype=float)), tickers) for d in days}
 
     @staticmethod
     def _clean_target(raw: Any, warnings: list[str]) -> pd.Series:
@@ -563,17 +612,29 @@ class PaperAccount:
             s = s[~bad]
         return s[s != 0.0].sort_index()
 
+    @staticmethod
+    def _anchors_to_reread(led: PaperLedger, as_of: date) -> list[date]:
+        """Anchor dates of held marks from earlier runs (re-read to detect corporate actions)."""
+        return sorted(
+            {
+                m.anchor_date
+                for t, m in led.last_prices.items()
+                if t in led.positions and m.as_of < as_of and m.anchor_date is not None and m.anchor_price is not None
+            }
+        )
+
     def _apply_corporate_actions(
         self,
         led: PaperLedger,
-        runner: BacktestRunner,
         as_of: date,
-        prices: pd.Series,
+        table: dict[date, pd.Series],
         warnings: list[str],
         notes: list[str],
     ) -> None:
         """Scale held positions whose adjusted price history changed since their last mark
-        (detected by re-reading the mark's anchor price, see the module docstring)."""
+        (detected by re-reading the mark's anchor price, see the module docstring). ``table`` holds
+        the ``as_of`` prices and the re-read anchor prices, from one download (:meth:`_price_table`)."""
+        prices = table[as_of]
         groups: dict[date, list[str]] = {}
         for t in sorted(led.positions):
             mark = led.last_prices[t]
@@ -585,7 +646,7 @@ class PaperAccount:
             ):
                 groups.setdefault(mark.anchor_date, []).append(t)
         for anchor_date, names in sorted(groups.items()):
-            reread = self._fetch_prices(runner, names, anchor_date)
+            reread = table.get(anchor_date, pd.Series(dtype=float))
             for t in names:
                 pv = reread.get(t)
                 if not _valid_price(pv):
@@ -631,11 +692,14 @@ class PaperAccount:
         """Fetch prices for held + ``extra_tickers``, adjust for corporate actions, update marks,
         close long-stale positions as delisted. Returns ``(prices, delisting orders)``."""
         tickers = sorted(set(led.positions) | set(extra_tickers))
-        prices = self._fetch_prices(runner, tickers, as_of)
-        self._apply_corporate_actions(led, runner, as_of, prices, warnings, notes)
-        valid = [t for t, p in prices.items() if _valid_price(p)]
         anchor_d = _anchor_date(as_of)
-        anchors = self._fetch_prices(runner, valid, anchor_d)
+        # One download for the current prices, the new anchors and the re-read old anchors: they must
+        # share one adjustment vintage, or a cached pre-split anchor would hide the split.
+        table = self._price_table(runner, tickers, [as_of, anchor_d, *self._anchors_to_reread(led, as_of)])
+        prices = table[as_of]
+        self._apply_corporate_actions(led, as_of, table, warnings, notes)
+        valid = [t for t, p in prices.items() if _valid_price(p)]
+        anchors = table[anchor_d]
         for t in valid:
             a = anchors.get(t)
             ok = _valid_price(a)
@@ -1000,6 +1064,9 @@ class PaperAccount:
         without a price while the name is carried at a stale mark, else None),
         trades [{date, ticker, side, shares, price, notional, cost, reason}] latest first,
         runs [(date_iso, rebalanced)], warnings (of the last run),
+        backtest_comparison_notes (conventions that make the paper return differ from
+        backtest_expected_return_pct even with identical holdings, e.g. the backtest's interest on
+        idle cash; empty without a backtest),
         costs_bps (configured, else the saved spec's), allow_fractional, ledger_path.
         """
         led = self._reload()
@@ -1027,6 +1094,13 @@ class PaperAccount:
                     backtest = None
             if backtest is not None:
                 window = backtest_return_over_window(backtest, started, last_run)
+        comparison_notes: list[str] = []
+        if backtest is not None and backtest_credits_cash_interest(backtest):
+            comparison_notes.append(
+                "The backtest credits the 1-month T-bill rate on idle cash and on short-sale proceeds (2x for a -1 "
+                "short); paper cash earns 0%, so while the book holds cash or is net short the paper return lags the "
+                "backtest by about RF x the cash share."
+            )
 
         # The next scheduled rebalance after the last one actually made. When a run on or after that
         # date only marked to market (mark_to_market, or an outage), it is still pending: the next
@@ -1084,6 +1158,7 @@ class PaperAccount:
             ],
             "runs": [(d.isoformat(), bool(r)) for d, r in led.runs],
             "warnings": list(led.last_warnings),
+            "backtest_comparison_notes": comparison_notes,
             "costs_bps": self._effective_costs_bps(),
             "allow_fractional": self.allow_fractional,
             "ledger_path": str(self.ledger_path),

@@ -779,6 +779,30 @@ def test_llm_finance_paper_is_not_treated_as_prompt_injection():
     assert cand.notes == [] and not is_security_flagged(cand)
 
 
+@pytest.mark.parametrize(
+    "text, reported, kept, monthly_note",
+    [
+        # Regression: any number near 'Sharpe' x sqrt(12) used to pass, so a figure the model converted (or
+        # mis-scaled) from an ANNUAL Sharpe became the claimed Sharpe and the replication "failed".
+        ("The long-short portfolio has an annualized Sharpe ratio of 0.35.", 1.21, False, False),
+        ("The long-short portfolio has an annualized Sharpe ratio of 0.35.", 0.35, True, False),
+        ("The strategy earns 1.2% per month with monthly rebalancing. Its Sharpe ratio is 0.35.", 1.21, False, False),
+        # a monthly Sharpe stated as such may be annualised
+        ("The strategy has a monthly Sharpe ratio of 0.25 over 1990-2020.", 0.866, True, True),
+        ("The strategy earns a Sharpe ratio of 0.25 per month.", 0.866, True, True),
+        ("The strategy has a monthly Sharpe ratio of 0.25 over 1990-2020.", 0.25, True, False),
+    ],
+)
+def test_reported_sharpe_is_annualised_only_from_a_stated_monthly_figure(text, reported, kept, monthly_note):
+    llm = scripted(reported_sharpe=reported, reported_t_stat=None, reported_annual_return_pct=None, sample_period=None,
+                   evidence_quotes=[])
+    cand = IdeaExtractor(llm, templates=TEMPLATES, clock=clock).extract(make_doc("Momentum paper", text))
+    assert cand.extraction.reported_sharpe == (reported if kept else None)
+    assert any("monthly Sharpe ratio 0.25 annualised x sqrt(12)" in n for n in cand.notes) is monthly_note
+    if not kept:
+        assert any("Sharpe ratio" in n and "cleared" in n for n in cand.notes)
+
+
 LATEX_ABSTRACT = (
     r"We document a new momentum signal in U.S.\ stocks. A long-short portfolio sorted on the signal earns 1.2\% per month "
     r"(annualized 14.4\%) with a $t$-statistic of 4.1 over 1990--2020. The \textit{alpha} survives the Fama--French "

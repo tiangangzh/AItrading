@@ -764,6 +764,27 @@ def test_llm_translator_structural_errors_are_repaired():
     assert tr.attempts == 2 and tr.template == "dislocation_screen"
 
 
+def test_llm_translator_repairs_a_reply_that_breaks_the_schema():
+    # An out-of-bounds field (n_quantiles=50 > 20) is a schema failure (LLMOutputError), not a crash
+    # or an immediate heuristic fallback: it gets a repair round with the pydantic errors.
+    bad = TEMPLATES["momentum_12_1"].spec().model_dump(mode="json")
+    bad["portfolio"]["n_quantiles"] = 50
+    good = TEMPLATES["momentum_12_1"].spec()
+    llm = ScriptedLLM({"strategy_spec": _respond_with(bad, good)})
+    tr = StrategyTranslator(llm).translate("12-1 momentum")
+    assert tr.attempts == 2 and tr.errors_by_round[1] == []
+    assert [c.purpose for c in llm.calls] == ["strategy_spec", "strategy_spec:repair"]
+    assert any("portfolio.n_quantiles" in e for e in tr.errors_by_round[0])
+    repair_user = llm.prompts[1]["user"]
+    assert "not a valid StrategySpec" in repair_user and "portfolio.n_quantiles" in repair_user
+    assert "<previous_spec>" not in repair_user
+
+    llm = ScriptedLLM({"strategy_spec": _respond_with(bad)})
+    with pytest.raises(StrategyTranslationError) as ei:
+        StrategyTranslator(llm, max_repair_rounds=1).translate("12-1 momentum")
+    assert len(llm.calls) == 2 and any("n_quantiles" in e for e in ei.value.errors)
+
+
 def test_llm_errors_propagate():
     def boom(*a):
         raise LLMError("down")

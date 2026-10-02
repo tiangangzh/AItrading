@@ -37,7 +37,15 @@ source .venv/bin/activate
 pip install -e ".[free]"
 ```
 
-Or run `scripts\install.ps1` (Windows) / `./scripts/install.sh` (macOS/Linux), which do the same.
+Or run the install script, which does the same:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1     # Windows (a plain scripts\install.ps1 is blocked by the default policy)
+```
+
+```bash
+./scripts/install.sh                                            # macOS / Linux
+```
 
 ## 2. Set your keys (each new terminal, or add them to your user environment variables)
 
@@ -62,8 +70,13 @@ On macOS/Linux add the two `export` lines to `~/.zshrc` or `~/.bashrc`.
 ## 3. Run
 
 ```bash
-aitrading run "Find US mid-caps (\$2-20B) that were in established uptrends (50-day above 200-day, positive 12-1 momentum) but have pulled back 15-40% from their 52-week highs on heavy volume, now oversold (RSI under 40), still generating strong free cash flow (FCF yield above 4%) with revenue growth above 8%, and where short interest is elevated (above 6% of float). Rank by FCF yield, growth and the size of the drawdown, then read the latest earnings releases and explain the dislocation."
+aitrading run "Find US mid-caps (2-20bn market cap) that were in established uptrends (50-day above 200-day, positive 12-1 momentum) but have pulled back 15-40% from their 52-week highs on heavy volume, now oversold (RSI under 40), still generating strong free cash flow (FCF yield above 4%) with revenue growth above 8%, and where short interest is elevated (above 6% of float). Rank by FCF yield, growth and the size of the drawdown, then read the latest earnings releases and explain the dislocation."
 ```
+
+The same line works in Windows PowerShell, cmd and bash. If you write your own observation, avoid
+`$` followed by a digit or a name inside double quotes (`"$2-20B"`): bash and PowerShell both treat
+it as a variable and silently drop it. Write `2-20bn` instead, use single quotes (bash, PowerShell),
+or put the text in a file and run `aitrading run -f observation.txt`.
 
 What happens:
 
@@ -73,8 +86,9 @@ What happens:
    ranks the survivors. (Claude never computes these numbers.)
 3. For the top names it reads the latest SEC earnings press releases and 10-Q/10-K MD&A, and Claude
    explains why each dislocation exists - or says it looks like a value trap.
-4. Every quote is checked verbatim against the source filing and every number against the feature
-   table; the report marks each one ✓ / ✗.
+4. Every quote is checked verbatim against the source filing and every number cited as evidence
+   against the feature table; the report marks each one ✓ / ✗ (numbers in the narrative text are
+   not individually checked, and the report says so).
 5. The report is written to `./aitrading_output/` (Markdown + HTML) and opened in your browser.
 
 The first run downloads and caches data in `~/.aitrading/cache` (a few minutes for ~150 tickers);
@@ -86,6 +100,10 @@ reruns are fast.
 aitrading run --tickers CROX,DECK,ELF,ONON,SKX "..."
 aitrading run --universe-file my_watchlist.txt "..."     # one ticker per line, or a CSV with a 'ticker' column
 ```
+
+Ticker and observation files may be UTF-8, UTF-16 (what Windows PowerShell 5.1 writes with `>`) or
+Windows-1252 (Excel's "CSV"). In a CSV only the `ticker` (or `symbol`) column is used, so company
+names and sectors can stay in the file.
 
 ### Without an Anthropic key
 
@@ -119,6 +137,9 @@ Use `--explain 2` while experimenting and `--effort medium` for cheaper, faster 
   date).
 * **Universe size.** It screens the tickers you give it (default: the bundled ~150), not the whole
   market. Pass a bigger list for a wider net; download time grows with it.
+* **Survivorship bias at past dates.** A historical `--as-of` still screens *today's* ticker list
+  (yours, or the bundled one), so companies delisted, acquired or bankrupt since then are missing.
+  The report says so in its warnings. Backtests have the same limitation and say so too.
 * Yahoo data via `yfinance` is unofficial and for personal research use; respect Yahoo's terms.
 
 ## Troubleshooting
@@ -129,3 +150,6 @@ Use `--explain 2` while experimenting and `--effort medium` for cheaper, faster 
   private issuer (20-F/6-K instead of 10-Q/8-K), or use uncommon XBRL tags. The report lists
   data-coverage warnings.
 * Behind a corporate proxy: `pip`, `yfinance` and the SEC client honour `HTTPS_PROXY`.
+* `Cannot reach Yahoo Finance: all ... quote requests failed with a network error` - the PC has no
+  internet access or a proxy is blocking it (see the line above). `aitrading demo` and
+  `--provider synthetic` work without a connection.

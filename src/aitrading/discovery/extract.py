@@ -843,6 +843,41 @@ def _appears(value: float, numbers: list[float], transforms: Iterable[Callable[[
     return any(_close(fn(n), value) for n in numbers for fn in fns)
 
 
+_MONTHLY_UNIT = _RETURN_UNITS[0][1]  # "per month", "monthly", "p.m."
+
+
+def _sharpe_support(value: float, text: str, before: int = 40, after: int = 120) -> tuple[str, float | None]:
+    """Is a reported (annual) Sharpe ratio stated next to a 'Sharpe' / 'SR' label?
+
+    ``("near", n)`` - as stated; ``("monthly", n)`` - a MONTHLY Sharpe ``n`` with the unit stated next
+    to the label or the number ("monthly Sharpe ratio of 0.25", "a Sharpe ratio of 0.25 per month"),
+    annualised x sqrt(12); else ``("anywhere", None)`` (the figure appears only away from a label) or
+    ``("absent", None)``. Any number near the label times sqrt(12) is NOT enough: that would let a
+    figure the model converted (or mis-scaled) from an annual Sharpe pass as the claim.
+    """
+    monthly: float | None = None
+    for m in _SHARPE_ANCHOR.finditer(text):
+        lo = max(0, m.start() - before)
+        ends = list(_WINDOW_SENT_END.finditer(text, lo, m.start()))
+        if ends:
+            lo = ends[-1].end()
+        hi = min(len(text), m.end() + after)
+        cut = _WINDOW_SENT_END.search(text, m.end(), hi)
+        if cut:
+            hi = cut.start() + 1
+        for tok in _NUM_TOKEN.finditer(text, lo, hi):
+            n = float(tok.group())
+            if _close(n, value):
+                return "near", n
+            if monthly is None and _close(n * math.sqrt(12), value):
+                zone = text[max(lo, min(m.start(), tok.start()) - 30): min(hi, max(m.end(), tok.end()) + 30)]
+                if _MONTHLY_UNIT.search(zone):
+                    monthly = n
+    if monthly is not None:
+        return "monthly", monthly
+    return _check_number(value, text, None, (lambda n: n,)), None
+
+
 def _check_number(value: float, text: str, anchor: re.Pattern[str] | None, transforms: Iterable[Callable[[float], float]],
                   *, use_abs: bool = False) -> str:
     """'near' (next to its anchor word), 'anywhere' (a non-integer found elsewhere in the text) or 'absent'."""
@@ -1006,8 +1041,13 @@ class IdeaExtractor:
             # A Sharpe / t-stat counts only next to its label: a matching decimal elsewhere ("0.85 billion")
             # is not evidence, and the value would otherwise become the replication's claimed_sharpe.
             if ext.reported_sharpe is not None:
-                where = _check_number(ext.reported_sharpe, text, _SHARPE_ANCHOR, (*ident, lambda n: n * math.sqrt(12)))
-                if where != "near":
+                where, stated = _sharpe_support(ext.reported_sharpe, text)
+                if where == "monthly":
+                    notes.append(
+                        f"Sharpe ratio {ext.reported_sharpe:g} is the source's monthly Sharpe ratio {stated:g} annualised "
+                        "x sqrt(12)."
+                    )
+                elif where != "near":
                     update["reported_sharpe"] = None
                     notes.append(
                         f"Model-reported Sharpe ratio {ext.reported_sharpe:g} does not appear in the source text; cleared."

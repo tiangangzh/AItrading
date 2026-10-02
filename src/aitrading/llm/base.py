@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Protocol, TypeVar, runtime_checkable
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from aitrading.core.models import LLMCallRecord
 
@@ -30,6 +30,28 @@ class LLMRefusalError(LLMError):
         self.category = category
 
 
+class LLMOutputError(LLMError):
+    """The reply is not a valid instance of the requested output model (JSON that breaks the schema,
+    e.g. a numeric bound the API's schema cannot enforce). ``validation_error`` is the pydantic
+    error; ``errors()`` lists its entries so callers can run a repair round."""
+
+    def __init__(self, message: str, validation_error: ValidationError | None = None):
+        super().__init__(message)
+        self.validation_error = validation_error
+
+    def errors(self) -> list[dict[str, Any]]:
+        return list(self.validation_error.errors()) if self.validation_error is not None else []
+
+
+def output_error(purpose: str, output_model: type, err: ValidationError) -> LLMOutputError:
+    """``LLMOutputError`` for a reply that failed ``output_model`` validation (first 3 problems listed)."""
+    problems = "; ".join(
+        f"{'.'.join(str(p) for p in e.get('loc', ())) or '<root>'}: {e.get('msg', 'invalid')}" for e in err.errors()[:3]
+    )
+    more = f" (+{err.error_count() - 3} more)" if err.error_count() > 3 else ""
+    return LLMOutputError(f"[{purpose}] structured output does not validate as {output_model.__name__}: {problems}{more}", err)
+
+
 @runtime_checkable
 class StructuredLLM(Protocol):
     name: str
@@ -45,7 +67,8 @@ class StructuredLLM(Protocol):
         effort: Effort | None = None,
         max_tokens: int = 16_000,
     ) -> T:
-        """Return an instance of ``output_model``; raise LLMError / LLMRefusalError on failure."""
+        """Return an instance of ``output_model``; raise LLMError / LLMRefusalError on failure
+        (``LLMOutputError`` when the reply does not validate as ``output_model``)."""
         ...
 
 
@@ -57,7 +80,8 @@ class ScriptedLLM:
 
     ``responders`` maps a purpose prefix (e.g. "nl_screen", "explain") to a function
     ``(purpose, system, user, output_model) -> output_model instance``. The longest matching
-    prefix wins. Every call is recorded like a real one.
+    prefix wins. Every call is recorded like a real one. A response that does not validate as
+    ``output_model`` raises ``LLMOutputError`` (as ``AnthropicLLM`` does).
     """
 
     name = "scripted"
@@ -75,6 +99,11 @@ class ScriptedLLM:
             raise LLMError(f"ScriptedLLM has no responder for purpose '{purpose}'")
         out = self.responders[match](purpose, system, user, output_model)
         if not isinstance(out, output_model):
-            out = output_model.model_validate(out)
+            try:
+                out = output_model.model_validate(out)
+            except ValidationError as e:
+                self.calls.append(LLMCallRecord(purpose=purpose, model=self.name, stop_reason="end_turn",
+                                                error=f"invalid_output: {e.error_count()} error(s)"))
+                raise output_error(purpose, output_model, e) from e
         self.calls.append(LLMCallRecord(purpose=purpose, model=self.name, stop_reason="end_turn"))
         return out

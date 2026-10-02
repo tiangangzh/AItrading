@@ -362,6 +362,39 @@ def test_interpreter_respects_max_repair_rounds():
     assert interp == good
 
 
+@pytest.mark.parametrize("error", [LLMError("529 overloaded"), "validation"])
+def test_failed_repair_call_keeps_the_first_round_interpretation(error):
+    """Regression: an exception from the repair call (overload, refusal, truncated output) made the
+    whole interpret() fail, so the idea lab replaced a paid, mostly verified review with the heuristic one."""
+    from pydantic import ValidationError
+
+    r = make_result()
+    first = _interp(("stats.strategy.sharpe", 0.9), ("regression.alpha_t_stat", 9.9))  # 1 of 2 verified
+    calls: list[str] = []
+
+    def responder(purpose, system, user, output_model):
+        calls.append(purpose)
+        if purpose == "interpret":
+            return first
+        if error == "validation":
+            BacktestInterpretation.model_validate({"summary": "cut off"})  # raises ValidationError
+        raise error
+
+    llm = ScriptedLLM({"interpret": responder})
+    interpreter = BacktestInterpreter(llm)
+    interp, checks = interpreter.interpret(r)
+    assert calls == ["interpret", "interpret:repair"]
+    assert interp.summary == first.summary and [c.status for c in checks] == ["verified", "mismatch"]
+    expected = "LLMError" if error != "validation" else ValidationError.__name__
+    assert interpreter.last_repair_error.startswith(expected)
+    assert any("citation-repair call failed" in w and "1 of 2 cited metrics verified" in w for w in r.warnings)
+    # a later successful run clears the error
+    good = _interp(("stats.strategy.sharpe", 0.9))
+    interpreter.llm = ScriptedLLM({"interpret": _seq_responder(good)})
+    interpreter.interpret(make_result())
+    assert interpreter.last_repair_error is None
+
+
 def test_interpreter_repairs_when_nothing_is_cited():
     r = make_result()
     empty = _interp()
@@ -507,6 +540,16 @@ def test_cost_drag_helpers():
     assert rebalances_per_year(r.model_copy(update={"rebalance": "?"})) == 12
     assert rebalances_per_year(r.model_copy(update={"rebalance": "?", "spec": {**r.spec, "rebalance": "weekly"}})) == 52
     assert rebalances_per_year(r.model_copy(update={"rebalance": "?", "spec": {}})) is None
+
+
+def test_factor_model_cost_drag_counts_twelve_monthly_trades():
+    """Regression: a factor model re-weights its factor-mimicking portfolios every month (its
+    avg_turnover_pct is monthly) whatever spec.rebalance says; an 'annual' spec understated the
+    cost drag 12x."""
+    r = make_result(kind="factor_model", spec_extra={"rebalance": "annual", "factor_model": "ff3"})
+    assert rebalances_per_year(r) == 12
+    assert rebalances_per_year(r.model_copy(update={"rebalance": "annual"})) == 12
+    assert rebalances_per_year(r.model_copy(update={"rebalance": "?", "spec": {**r.spec, "rebalance": "quarterly"}})) == 12
 
 
 def test_cost_drag_uses_rebalance_frequency_not_return_frequency():

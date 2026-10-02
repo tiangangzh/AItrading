@@ -43,7 +43,9 @@ Most blogs publish their feed at a URL shown by the browser as "RSS" / "Atom" or
 page head (``<link rel="alternate" type="application/rss+xml" href=...>``). ``kind`` may be
 ``"rss"`` (RSS 2.0 or RSS 1.0/RDF), ``"atom"`` or ``"auto"`` (detected from the document). Only the
 ``feeds`` key is used by ``FeedSource``; the other keys are optional settings for the arXiv and web
-search sources (see ``SourcesConfig``).
+search sources (see ``SourcesConfig``). ``web_allowed_domains`` (or ``web_blocked_domains`` - not
+both) restricts Claude's web search and web fetch: ``ClaudeWebSearchSource`` reads them when it is
+not given domains explicitly.
 
 Untrusted input: feed items and web pages are only parsed into plain text fields; nothing in them is
 executed or followed, and XML with entity declarations is rejected (in any encoding).

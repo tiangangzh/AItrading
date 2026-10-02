@@ -62,7 +62,7 @@ import re
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from aitrading.backtest.models import BacktestInterpretation, BacktestResult, CitedMetric
 from aitrading.core.models import EvidenceCheck
@@ -351,10 +351,20 @@ def _round_floats(x: Any, nd: int = 4) -> Any:
 
 
 def _years(result: BacktestResult) -> float:
+    """Years of return observations (periods / periods per year), else the calendar span."""
     st = result.stats.get("strategy")
     if st is not None and st.periods_per_year > 0:
         return st.n_periods / st.periods_per_year
-    return max(0.0, (result.end - result.start).days / 365.25)
+    return _calendar_years(result)
+
+
+def _calendar_years(result: BacktestResult) -> float:
+    """``end - start`` in years: the span quoted next to the dates (``_years`` counts trading days at
+    252 a year, which overstates it on a calendar without holidays, e.g. the synthetic market)."""
+    try:
+        return max(0.0, (result.end - result.start).days / 365.25)
+    except (TypeError, AttributeError):
+        return 0.0
 
 
 _REBALANCES_PER_YEAR: dict[str, float] = {
@@ -367,7 +377,11 @@ def rebalances_per_year(result: BacktestResult) -> float | None:
 
     daily 252, weekly 52, monthly 12, quarterly 4, annual 1. This - not the return series'
     ``periods_per_year`` (252 for daily returns) - is what one-way turnover per rebalance scales by.
+    A factor model always trades its factor-mimicking portfolios monthly (its ``avg_turnover_pct``
+    is a monthly figure), whatever its spec's ``rebalance`` says: 12.
     """
+    if (result.spec or {}).get("kind") == "factor_model":
+        return 12.0
     for r in (result.rebalance, (result.spec or {}).get("rebalance")):
         if isinstance(r, str) and r.strip().lower() in _REBALANCES_PER_YEAR:
             return _REBALANCES_PER_YEAR[r.strip().lower()]
@@ -585,7 +599,12 @@ attribution model, a point-in-time universe with delisted names, ...).
 
 
 class BacktestInterpreter:
-    """Claude reads the result as a skeptical reviewer; cited numbers are verified, with a repair round."""
+    """Claude reads the result as a skeptical reviewer; cited numbers are verified, with a repair round.
+
+    A failing repair call (``LLMError`` / ``ValidationError``) keeps the best interpretation so far:
+    the error is stored in ``last_repair_error`` and added to ``result.warnings``. Only a failing
+    first call raises.
+    """
 
     def __init__(
         self,
@@ -603,6 +622,7 @@ class BacktestInterpreter:
         self.max_repair_rounds = max_repair_rounds
         self.rel_tol = rel_tol
         self.abs_tol = abs_tol
+        self.last_repair_error: str | None = None  # "<ErrorType>: message" if the last repair call failed
 
     system_prompt = INTERPRET_SYSTEM_PROMPT
 
@@ -636,15 +656,25 @@ class BacktestInterpreter:
         )
         checks = self._verify(interp, result)
         best = (interp, checks)
+        self.last_repair_error = None
         for _ in range(self.max_repair_rounds):
             cur_interp, cur_checks = best
             if cur_checks and all(c.status == "verified" for c in cur_checks):
                 break
-            fixed = self.llm.structured(
-                purpose="interpret:repair", system=self.system_prompt,
-                user=self.repair_prompt(result, cur_interp, cur_checks),
-                output_model=BacktestInterpretation, effort=self.effort,
-            )
+            try:
+                fixed = self.llm.structured(
+                    purpose="interpret:repair", system=self.system_prompt,
+                    user=self.repair_prompt(result, cur_interp, cur_checks),
+                    output_model=BacktestInterpretation, effort=self.effort,
+                )
+            except (LLMError, ValidationError) as e:  # keep the first-round interpretation whatever the repair did
+                self.last_repair_error = f"{type(e).__name__}: {e}"
+                n_ok = sum(c.status == "verified" for c in cur_checks)
+                result.warnings.append(
+                    f"the interpretation's citation-repair call failed ({self.last_repair_error[:200]}); the first-round "
+                    f"interpretation is kept ({n_ok} of {len(cur_checks)} cited metrics verified)"
+                )
+                break
             fixed_checks = self._verify(fixed, result)
             if _score(fixed_checks) > _score(cur_checks):
                 best = (fixed, fixed_checks)
@@ -790,7 +820,7 @@ class HeuristicInterpreter:
             mdd = c("stats.strategy.max_drawdown_pct", "strategy maximum drawdown, %")
             tm = c("stats.strategy.mean_return_t_stat", "Newey-West t-stat of the mean periodic return")
             findings.append(
-                f"Over {years:.1f} years ({result.start} to {result.end}) the strategy returned {_fmt(cagr)}% a year with "
+                f"Over {_calendar_years(result):.1f} years ({result.start} to {result.end}) the strategy returned {_fmt(cagr)}% a year with "
                 f"{_fmt(vol)}% volatility (Sharpe {_fmt(sr)}, max drawdown {_fmt(mdd)}%, mean-return t-stat {_fmt(tm)})."
             )
             if "benchmark" in result.stats:

@@ -14,14 +14,16 @@ Simulated trading only: nothing here places orders with a broker.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from aitrading.cli import (
     EXIT_ERROR,
     EXIT_OK,
+    PROVIDERS,
     CLIError,
     UsageError,
     _emit,
@@ -29,8 +31,12 @@ from aitrading.cli import (
     _note,
     _provider_from_args,
     _should_open,
+    data_options,
     default_as_of,
+    default_provider_name,
+    explicit_tickers,
     make_llm,
+    read_text_file,
     resolve_engine,
 )
 
@@ -122,6 +128,12 @@ def _summary_lines(result: Any) -> list[str]:
         if summary.lower().startswith("verdict:"):
             summary = summary.split("-", 1)[-1].strip() if " - " in summary else summary[8:].strip()
         lines.append(f"Verdict: {interp.verdict.upper()} - {summary}")
+        from aitrading.report.prose import interpretation_unverified_numbers
+
+        unverified = interpretation_unverified_numbers(result)
+        if unverified:
+            lines.append(f"UNVERIFIED: the verdict text states {', '.join(unverified)}, which are not in the backtest results;"
+                         " rely on the statistics above.")
     if result.warnings:
         lines.append(f"{len(result.warnings)} warning(s) in the report (survivorship, data coverage, costs ...).")
     return lines
@@ -163,7 +175,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
     spec = None
     if args.spec_file:
         try:
-            spec = StrategySpec.model_validate_json(Path(args.spec_file).read_text(encoding="utf-8-sig"))
+            spec = StrategySpec.model_validate_json(read_text_file(args.spec_file))
         except (OSError, ValueError) as exc:
             raise UsageError(f"cannot read --spec-file: {exc}") from exc
     elif any(getattr(args, k, None) not in (None, False) for k in ("start", "end", "rebalance", "costs_bps")):
@@ -179,10 +191,12 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
     if args.save:
         from aitrading.strategy.library import TEMPLATES
 
-        path = _store().save(
+        store = _store()
+        path = store.save(
             args.save, out.spec, result, overwrite=args.overwrite, idea=idea or out.spec.idea,
             template=out.spec.name if out.spec.name in TEMPLATES else None,
         )
+        _record_backtest_data(store, args.save, args.provider, explicit_tickers(args))
         _note(f"saved strategy '{args.save}' to {path}; simulate it with: aitrading strategy run {args.save}")
     _open(out.html_path, args)
     return EXIT_OK
@@ -210,6 +224,84 @@ def _runner(provider: Any) -> Any:
     from aitrading.backtest.runner import StrategyRunner
 
     return StrategyRunner(provider)
+
+
+# The data a saved strategy was backtested on, and the data its paper account trades on, kept next to
+# the strategy (``<strategy dir>/run_settings.json``) so `strategy run` uses the same market:
+# {"backtest": {"provider", "tickers"}, "paper": {"provider", "tickers", "started"}}.
+RUN_SETTINGS_FILE = "run_settings.json"
+
+
+def _load_run_settings(store: Any, name: str) -> dict[str, Any]:
+    try:
+        data = json.loads((store.path(name) / RUN_SETTINGS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_run_settings(store: Any, name: str, settings: dict[str, Any]) -> None:
+    from aitrading.trading.store import write_json_atomic
+
+    write_json_atomic(store.path(name) / RUN_SETTINGS_FILE, settings)
+
+
+def _record_backtest_data(store: Any, name: str, provider: str | None, tickers: list[str] | None) -> None:
+    settings = _load_run_settings(store, name)
+    settings["backtest"] = {"provider": provider, "tickers": tickers}
+    _save_run_settings(store, name, settings)
+
+
+def _data_label(provider: str | None, tickers: list[str] | None) -> str:
+    if not tickers:
+        return f"provider '{provider}' (its default universe)"
+    shown = ",".join(tickers[:8]) + (f",... ({len(tickers)} tickers)" if len(tickers) > 8 else "")
+    return f"provider '{provider}' with --tickers {shown}"
+
+
+def _same_universe(a: list[str] | None, b: list[str] | None) -> bool:
+    return sorted(a or []) == sorted(b or [])
+
+
+def _strategy_run_data(store: Any, name: str, meta: dict[str, Any], args: argparse.Namespace, started: date | None) -> tuple[str, list[str] | None, bool]:
+    """(provider, explicit tickers or None, whether the account's recorded data applies) for `strategy run`.
+
+    Without --provider / --tickers the run uses the data the paper account has been trading on, else
+    the data the strategy was backtested on. Once the account has started, a different provider or
+    universe is refused: one ledger must not mix markets.
+    """
+    settings = _load_run_settings(store, name)
+    paper = settings.get("paper") if isinstance(settings.get("paper"), dict) else None
+    if paper is not None and (started is None or paper.get("started") != started.isoformat()):
+        paper = None  # the account was reset since
+    backtest = settings.get("backtest") if isinstance(settings.get("backtest"), dict) else {}
+    saved = paper or backtest
+    saved_provider = saved.get("provider") or (meta.get("backtest") or {}).get("provider")
+    if saved_provider not in PROVIDERS:
+        saved_provider = None
+    requested_tickers = explicit_tickers(args)
+    provider = args.provider or saved_provider or default_provider_name()
+    if requested_tickers is not None:
+        tickers = requested_tickers
+    else:
+        tickers = (saved.get("tickers") or None) if provider == saved_provider else None
+    if paper is not None:
+        if provider != paper.get("provider") or not _same_universe(tickers, paper.get("tickers")):
+            raise CLIError(
+                f"strategy '{name}' has been paper-trading on {_data_label(paper.get('provider'), paper.get('tickers'))} "
+                f"since {paper.get('started')}; this run would use {_data_label(provider, tickers)}, which would mix "
+                f"markets in one ledger. Run it without --provider / --tickers, or start the account over with: "
+                f"aitrading strategy reset {name}"
+            )
+    elif saved_provider and (provider != saved_provider or (requested_tickers is not None and not _same_universe(tickers, saved.get("tickers")))):
+        _note(f"warning: '{name}' was backtested on {_data_label(saved_provider, saved.get('tickers'))}; simulating it on "
+              f"{_data_label(provider, tickers)} means 'strategy status' compares it with a backtest of other data")
+    if args.provider is None and saved_provider and provider != default_provider_name():
+        _note(f"data: {_data_label(provider, tickers)}, as {'paper-traded' if paper else 'backtested'} so far")
+    if started is not None and paper is None:
+        _note(f"note: the data the paper account of '{name}' started on was not recorded (older version); "
+              f"it is recorded as {_data_label(provider, tickers)} from this run on")
+    return provider, tickers, paper is not None
 
 
 def _strategy_page(store: Any, name: str, out_root: Path) -> Path:
@@ -259,11 +351,20 @@ def _cmd_strategy(args: argparse.Namespace) -> int:
         _emit(f"reset the simulated account of '{name}'" + (f" (old ledger archived at {archived})" if archived else "") + "\n")
         return EXIT_OK
     if action == "run":
-        spec, backtest, _meta = store.load(name)
-        provider = _lab_provider(args)
-        as_of = args.as_of or default_as_of(args.provider, provider)
+        spec, backtest, meta = store.load(name)
         account = PaperAccount(store, name, initial_capital=args.capital) if args.capital else PaperAccount(store, name)
+        started = _account_started(account)
+        provider_name, tickers, recorded = _strategy_run_data(store, name, meta, args, started)
+        run_args = argparse.Namespace(**{**vars(args), "provider": provider_name, "universe_file": None,
+                                         "tickers": ",".join(tickers) if tickers else None})
+        provider = _lab_provider(run_args)
+        as_of = args.as_of or default_as_of(provider_name, provider)
         report = account.rebalance(_runner(provider), spec, as_of, force=args.force)
+        now_started = _account_started(account)
+        if not recorded and now_started is not None:
+            settings = _load_run_settings(store, name)
+            settings["paper"] = {"provider": provider_name, "tickers": tickers, "started": now_started.isoformat()}
+            _save_run_settings(store, name, settings)
         if report.skipped_reason:
             _emit(f"{name} {as_of}: no trades ({report.skipped_reason}); NAV {report.nav_after:,.2f}\n")
         else:
@@ -275,7 +376,7 @@ def _cmd_strategy(args: argparse.Namespace) -> int:
             _emit("\n".join(lines) + "\n")
         for w in report.warnings:
             _note(f"warning: {w}")
-    page = _strategy_page(store, name, _out_dir(args))
+    page = _write_strategy_page(store, name, args)
     if action == "status":
         account = PaperAccount(store, name)
         try:
@@ -284,11 +385,43 @@ def _cmd_strategy(args: argparse.Namespace) -> int:
                 f"{name}: NAV {s.get('nav', 0):,.2f}, since start {_fmt(s.get('since_start_return_pct'), '%')}"
                 f" (backtest expected {_fmt(s.get('backtest_expected_return_pct'), '%')}), last run {s.get('last_run')}\n"
             )
+            for n in s.get("backtest_comparison_notes") or []:
+                _emit(f"  note: {n}\n")
         except Exception as exc:  # noqa: BLE001
             _emit(f"{name}: not started yet ({exc}). Start it with: aitrading strategy run {name}\n")
-    _note(f"strategy page: {page}")
-    _open(page, args)
+    if page is not None:
+        _note(f"strategy page: {page}")
+        _open(page, args)
     return EXIT_OK
+
+
+def _account_started(account: Any) -> date | None:
+    try:
+        return account.started
+    except Exception:  # noqa: BLE001 - no ledger yet, or unreadable: rebalance reports the latter
+        return None
+
+
+def _write_strategy_page(store: Any, name: str, args: argparse.Namespace) -> Path | None:
+    """The strategy page under --out; a failure to write it is a warning, not an error, because the
+    simulated trades are already recorded (e.g. Task Scheduler starts in C:\\Windows\\System32,
+    where the default relative ./aitrading_output cannot be created)."""
+    out = _out_dir(args)
+    try:
+        return _strategy_page(store, name, out)
+    except OSError as exc:
+        if out.is_absolute() or getattr(args, "out", None) not in (None, "aitrading_output"):
+            _note(f"warning: could not write the strategy page under {out} ({exc}); the ledger is up to date")
+            return None
+        fallback = Path.home() / "aitrading_output"
+        try:
+            page = _strategy_page(store, name, fallback)
+        except OSError as exc2:
+            _note(f"warning: could not write the strategy page ({exc}; {exc2}); the ledger is up to date")
+            return None
+        _note(f"warning: cannot write to {Path.cwd() / out} ({type(exc).__name__}); wrote the page under {fallback} instead "
+              "(pass --out FOLDER, or set the scheduled task's 'Start in' folder)")
+        return page
 
 
 # --------------------------------------------------------------------------------------------
@@ -339,6 +472,15 @@ def _idea_card(c: Any) -> str:
     return "\n".join(lines)
 
 
+def _sources_config() -> Any:
+    from aitrading.discovery.sources import load_sources_config
+
+    try:
+        return load_sources_config()
+    except (OSError, ValueError) as exc:
+        raise UsageError(f"cannot use the sources config (~/.aitrading/sources.json or $AITRADING_SOURCES): {exc}") from exc
+
+
 def _gather_documents(args: argparse.Namespace, llm: Any) -> list[Any]:
     from aitrading.discovery.sources import ArxivSource, FeedSource, fetch_url, load_pdf
 
@@ -353,9 +495,23 @@ def _gather_documents(args: argparse.Namespace, llm: Any) -> list[Any]:
     if args.url or args.pdf:
         return docs
     sources = {s.strip().lower() for s in args.sources.split(",") if s.strip()}
+    cfg = _sources_config()
+    web = None
+    if "web" in sources and llm is not None:
+        # built first so a domain-list mistake in sources.json stops the run before anything is fetched
+        from aitrading.discovery.websearch import ClaudeWebSearchSource
+
+        try:
+            web = ClaudeWebSearchSource(model=getattr(llm, "model", None) or "claude-opus-5-5", effort=args.effort,
+                                        allowed_domains=cfg.web_allowed_domains, blocked_domains=cfg.web_blocked_domains)
+        except ValueError as exc:
+            raise UsageError(f"sources config: {exc}") from exc
     if "arxiv" in sources:
-        arxiv = ArxivSource()
-        queries = args.query or None
+        try:
+            arxiv = ArxivSource(categories=cfg.arxiv_categories) if cfg.arxiv_categories else ArxivSource()
+        except ValueError as exc:
+            raise UsageError(f"sources config arxiv_categories: {exc}") from exc
+        queries = args.query or cfg.arxiv_queries or None
         found = arxiv.search_many(queries, max_results_per_query=args.max, since=since) if queries else arxiv.search_many(max_results_per_query=args.max, since=since)
         docs += found
         for w in arxiv.warnings:
@@ -366,17 +522,118 @@ def _gather_documents(args: argparse.Namespace, llm: Any) -> list[Any]:
         for w in feeds.warnings:
             _note(f"feeds: {w}")
     if "web" in sources:
-        if llm is None:
+        if web is None:
             _note("web search needs Claude (set ANTHROPIC_API_KEY); skipping the 'web' source")
         else:
-            from aitrading.discovery.websearch import ClaudeWebSearchSource
-
             brief = " ".join(args.query) if args.query else "recent systematic US equity strategies and anomalies"
-            web = ClaudeWebSearchSource(model=getattr(llm, "model", None) or "claude-opus-5-5", effort=args.effort)
-            docs += web.discover(brief, max_ideas=args.max)
+            if web.allowed_domains or web.blocked_domains:
+                which = "only " + ", ".join(web.allowed_domains) if web.allowed_domains else "not " + ", ".join(web.blocked_domains)
+                _note(f"web: searching {which} (sources.json)")
+            try:
+                docs += web.discover(brief, max_ideas=args.max)
+            except Exception as exc:  # noqa: BLE001 - e.g. web search not enabled, rate limit, refusal: keep the other sources
+                _note(f"web: skipped ({type(exc).__name__}: {exc}); continuing with the other sources")
             for w in web.warnings:
                 _note(f"web: {w}")
     return docs
+
+
+# Documents Claude read in an earlier run that were not trading ideas (they never reach the inbox), so a
+# daily `discover` does not pay to read them again: {"documents": {doc_key: {"url", "title", "seen_at"}}}.
+SEEN_FILE = "seen_documents.json"
+MAX_SEEN = 5000
+
+
+def _seen_path(inbox: Any) -> Path:
+    from aitrading.discovery.inbox import default_inbox_path
+
+    base = getattr(inbox, "path", None)
+    return Path(base if base is not None else default_inbox_path()).with_name(SEEN_FILE)
+
+
+def _load_seen(inbox: Any) -> dict[str, Any]:
+    try:
+        data = json.loads(_seen_path(inbox).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    docs = data.get("documents") if isinstance(data, dict) else None
+    return docs if isinstance(docs, dict) else {}
+
+
+def _save_seen(inbox: Any, seen: dict[str, Any]) -> None:
+    from aitrading.trading.store import write_json_atomic
+
+    items = sorted(seen.items(), key=lambda kv: str((kv[1] or {}).get("seen_at") or ""))[-MAX_SEEN:]
+    try:
+        write_json_atomic(_seen_path(inbox), {"schema_version": 1, "documents": dict(items)})
+    except OSError as exc:  # a cache: never fail the run over it
+        _note(f"could not update {_seen_path(inbox)}: {exc}")
+
+
+def _known_documents(inbox: Any) -> tuple[dict[str, str], dict[str, str]]:
+    """(doc_key -> idea id, canonical URL -> idea id) of every idea in the inbox and every pruned one."""
+    from aitrading.discovery.rank import canonical_url
+
+    keys: dict[str, str] = {}
+    urls: dict[str, str] = {}
+    for c in (inbox.all() if hasattr(inbox, "all") else []):
+        keys[c.idea_id] = c.idea_id
+        u = canonical_url(c.source.url)
+        if u:
+            urls.setdefault(u, c.idea_id)
+    try:  # pruned ideas leave tombstones; inbox.add would drop them again after paying for the extraction
+        tombstones = inbox._load().get("pruned") or []
+    except Exception:  # noqa: BLE001 - a fake / older inbox: in-inbox ideas are still skipped
+        tombstones = []
+    for t in tombstones:
+        if isinstance(t, dict) and t.get("idea_id"):
+            keys.setdefault(str(t["idea_id"]), f"{t['idea_id']} (pruned)")
+            u = canonical_url(str(t.get("url") or ""))
+            if u:
+                urls.setdefault(u, f"{t['idea_id']} (pruned)")
+    return keys, urls
+
+
+def _new_documents(docs: list[Any], inbox: Any, seen: dict[str, Any], *, explicit: bool) -> list[Any]:
+    """The documents not read before: not in the inbox (by key or canonical URL), not pruned from it
+    and not already judged 'not a trading idea' by Claude. Notes what was skipped."""
+    from aitrading.discovery.rank import canonical_url
+
+    keys, urls = _known_documents(inbox)
+    fresh, skipped = [], 0
+    for d in docs:
+        hit = keys.get(d.doc_key) or urls.get(canonical_url(d.url) or "")
+        if hit is None and d.doc_key in seen:
+            hit = "not a trading idea"
+        if hit is None:
+            fresh.append(d)
+            continue
+        skipped += 1
+        if explicit:
+            _note(f"already read: {d.url} -> {hit} (see: aitrading ideas show ID; --reextract reads it again)")
+    if skipped and not explicit:
+        _note(f"{skipped} document(s) were read in an earlier run and are skipped (--reextract reads them again)")
+    return fresh
+
+
+def _save_idea(c: Any, spec: Any, result: Any, args: argparse.Namespace) -> str:
+    """Save an accepted idea as a strategy without replacing one that exists: the spec's name (often
+    a library template key), else that name plus the idea id. Returns the name used."""
+    from aitrading.trading.store import StrategyExistsError
+
+    store = _store()
+    base = (spec.name or c.idea_id)[:40]
+    names = [base, f"{base[:27]}-{c.idea_id}"] + [f"{base[:24]}-{c.idea_id}-{i}" for i in range(2, 100)]
+    for name in names:
+        try:
+            store.save(name, spec, result, overwrite=False, idea=c.extraction.title, notes=f"from idea {c.idea_id}: {c.source.url}")
+        except StrategyExistsError:
+            continue
+        _record_backtest_data(store, name, getattr(args, "provider", None), explicit_tickers(args))
+        if name != base:
+            _emit(f"  A strategy named '{base}' already exists; this idea is saved as '{name}' instead.\n")
+        return name
+    raise CLIError(f"could not find a free strategy name for idea {c.idea_id}; delete old ones with: aitrading strategy delete NAME")
 
 
 def _try_idea(c: Any, args: argparse.Namespace, *, lab: Any, inbox: Any, ask: Prompt) -> None:
@@ -397,32 +654,32 @@ def _try_idea(c: Any, args: argparse.Namespace, *, lab: Any, inbox: Any, ask: Pr
         translation = lab.translator.translate(text)
         spec = translation.spec
         inbox.attach_spec(c.idea_id, spec)
-        print(f"  Testing: {spec.name} ({spec.kind}, {spec.rebalance}) ...", file=sys.stderr)
+        _note(f"  Testing: {spec.name} ({spec.kind}, {spec.rebalance}) ...")
         result, replication, html_path = lab.replicate_idea(c, spec)
     except Exception as exc:  # noqa: BLE001 - one failed idea must not stop the session
         inbox.set_status(c.idea_id, "failed", note=f"{type(exc).__name__}: {exc}")
         _note(f"  could not test this idea: {type(exc).__name__}: {exc}")
         return
     inbox.attach_result(c.idea_id, result.run_id, replication)
-    print("\n".join("  " + line for line in _summary_lines(result)))
-    print(f"  Replication: {replication.verdict.replace('_', ' ').upper()} - {replication.summary}")
+    lines = ["  " + line for line in _summary_lines(result)]
+    lines.append(f"  Replication: {replication.verdict.replace('_', ' ').upper()} - {replication.summary}")
     for chk in replication.checks:
         mark = {True: "pass", False: "FAIL", None: "n/a "}[chk.passed]
-        print(f"    [{mark}] {chk.name}: Sharpe {_fmt(chk.sharpe)}  {chk.note}")
+        lines.append(f"    [{mark}] {chk.name}: Sharpe {_fmt(chk.sharpe)}  {chk.note}")
     if html_path is not None:
-        print(f"  Report: {html_path}")
+        lines.append(f"  Report: {html_path}")
+    _emit("\n".join(lines) + "\n")
     if _ask("  Save it as a strategy for simulated trading? [y/N] ", "yn", "n", ask) == "y":
-        name = (spec.name or c.idea_id)[:40]
-        _store().save(name, spec, result, overwrite=True, idea=c.extraction.title, notes=f"from idea {c.idea_id}: {c.source.url}")
+        name = _save_idea(c, spec, result, args)
         inbox.set_status(c.idea_id, "saved")
-        print(f"  Saved as '{name}'. Simulate it with: aitrading strategy run {name}")
+        _emit(f"  Saved as '{name}'. Simulate it with: aitrading strategy run {name}\n")
 
 
 def _review_loop(cands: list[Any], args: argparse.Namespace, *, lab: Any, inbox: Any, ask: Prompt) -> None:
     for c in cands:
-        print(_idea_card(c))
+        _emit(_idea_card(c) + "\n")
         if c.extraction.testability == "not_testable":
-            print("  (not testable with the data this platform has; kept in the inbox for reference)")
+            _emit("  (not testable with the data this platform has; kept in the inbox for reference)\n")
             continue
         choice = _ask("Try this strategy? [y]es / [n]o / [l]ater / [q]uit: ", "ynlq", "l", ask)
         if choice == "q":
@@ -443,9 +700,13 @@ def _cmd_discover(args: argparse.Namespace, ask: Prompt = input) -> int:
     if not docs:
         _emit("No documents found. Try --query, --days, --sources arxiv,feeds,web, --url or --pdf.\n")
         return EXIT_OK
+    inbox = _inbox()
+    seen = _load_seen(inbox)
+    todo = docs if args.reextract else _new_documents(docs, inbox, seen, explicit=bool(args.url or args.pdf))
     extractor = IdeaExtractor(llm, effort=args.effort) if llm is not None else HeuristicIdeaExtractor()
     candidates = []
-    for d in docs:
+    seen_changed = False
+    for d in todo:
         try:
             c = extractor.extract(d)
         except Exception as exc:  # noqa: BLE001
@@ -453,9 +714,14 @@ def _cmd_discover(args: argparse.Namespace, ask: Prompt = input) -> int:
             continue
         if c.extraction.is_trading_idea:
             candidates.append(c)
-    inbox = _inbox()
+            seen_changed |= seen.pop(d.doc_key, None) is not None
+        elif llm is not None:  # only Claude's verdict is remembered: the offline extractor costs nothing to rerun
+            seen[d.doc_key] = {"url": d.url, "title": d.title[:200], "seen_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+            seen_changed = True
+    if seen_changed:
+        _save_seen(inbox, seen)
     added = inbox.add(candidates)
-    _note(f"{len(docs)} document(s) read, {len(candidates)} trading idea(s), {len(added)} new in the inbox")
+    _note(f"{len(docs)} document(s) found, {len(todo)} read, {len(candidates)} trading idea(s), {len(added)} new in the inbox")
     new = [c for c in inbox.list(status="new")][: args.review]
     if not new:
         _emit("No new ideas to review. See them all with: aitrading ideas list\n")
@@ -504,7 +770,7 @@ def _cmd_ideas(args: argparse.Namespace, ask: Prompt = input) -> int:
     # try
     llm = _llm_or_none(args)
     provider = _lab_provider(args)
-    print(_idea_card(c))
+    _emit(_idea_card(c) + "\n")
     _try_idea(c, args, lab=_lab(args, provider, llm), inbox=inbox, ask=ask)
     return EXIT_OK
 
@@ -553,8 +819,10 @@ def register(sub: Any, *, base: argparse.ArgumentParser, engine: argparse.Argume
     lib = sub.add_parser("library", parents=[base], help="list the built-in idea library")
     lib.set_defaults(func=_cmd_library)
 
-    st = sub.add_parser("strategy", parents=[base, data, out], help="saved strategies and simulated trading",
-                        description="Simulated (paper) trading of saved strategies. No broker is involved.")
+    st = sub.add_parser("strategy", parents=[base, data_options(None), out], help="saved strategies and simulated trading",
+                        description="Simulated (paper) trading of saved strategies. No broker is involved. 'run' uses the "
+                                    "data (provider and universe) the strategy was backtested and is paper-trading on, "
+                                    "unless --provider / --tickers say otherwise.")
     st.add_argument("action", choices=("list", "run", "status", "reset", "delete"))
     st.add_argument("name", nargs="?", default=None)
     st.add_argument("--force", action="store_true", help="rebalance even if today is not a scheduled rebalance day")
@@ -573,6 +841,8 @@ def register(sub: Any, *, base: argparse.ArgumentParser, engine: argparse.Argume
     disc.add_argument("--max", type=int, default=15, help="max documents per query / feed (default 15)")
     disc.add_argument("--review", type=int, default=10, help="max new ideas to review in this session (default 10)")
     disc.add_argument("--no-interactive", action="store_true", help="only list new ideas; do not prompt")
+    disc.add_argument("--reextract", action="store_true",
+                      help="read documents an earlier run already read again (by default they are skipped, which saves Claude calls)")
     disc.set_defaults(func=_cmd_discover)
 
     ideas = sub.add_parser("ideas", parents=[base, engine, data, out], help="the idea inbox",

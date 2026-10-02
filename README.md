@@ -17,7 +17,9 @@ and research ideas into **tested** strategies:
 Claude (`claude-opus-5-5`) does the reasoning: translating intent, explaining, interpreting, reading
 papers. **It never computes the numbers that select stocks or score a backtest.** Those come from a
 deterministic engine. Every quote Claude cites is checked verbatim against its source, and every
-number against the data, before it reaches a report.
+number it cites as evidence against the data, before it reaches a report. Numbers in a backtest
+verdict's text that do not appear in the results are flagged as unverified; numbers in a thesis's
+narrative text are marked as not individually checked.
 
 > Research tool. Results are simulated and not investment advice.
 
@@ -52,7 +54,7 @@ Without an Anthropic key everything still runs, using built-in rule-based engine
 ### 1. Screen the market and explain the dislocations: `aitrading run`
 
 ```bash
-aitrading run "Find US mid-caps ($2-20B) in established uptrends (50-day above 200-day, positive 12-1 momentum) \
+aitrading run "Find US mid-caps (2-20bn market cap) in established uptrends (50-day above 200-day, positive 12-1 momentum) \
 that pulled back 15-40% from their 52-week highs on heavy volume, RSI under 40, FCF yield above 4%, revenue growth \
 above 8%, short interest above 6% of float. Rank by FCF yield, growth and drawdown, then explain the dislocation."
 ```
@@ -111,8 +113,13 @@ aitrading strategy status momentum     # paper NAV vs what the backtest predicte
 ```
 
 Schedule `aitrading strategy run <name>` daily (Task Scheduler / cron). It only trades on the
-strategy's rebalance days and is idempotent. Each strategy gets a page showing the idea, holdings,
-trade blotter and simulated-vs-backtest performance.
+strategy's rebalance days and is idempotent. It uses the data the strategy was backtested on (the
+`--provider` and `--tickers` / `--universe-file` given to `backtest --save`), and refuses to switch
+an account that has started trading to other data (`aitrading strategy reset <name>` starts over).
+In the scheduled task, set "Start in" to a folder you can write to, or pass `--out <folder>`: the
+page is written under `./aitrading_output` by default (under your home folder when the working
+folder is not writable). Each strategy gets a page showing the idea, holdings, trade blotter and
+simulated-vs-backtest performance.
 
 ### 4. Let it find ideas for you: `aitrading discover`
 
@@ -141,7 +148,11 @@ The verdict is one of: replicates, partially replicates, fails to replicate, or 
 then save the strategy for simulated trading.
 
 Web and paper text is treated as untrusted data: instruction-like passages are flagged and need your
-confirmation, and URLs Claude "finds" must appear in actual search results.
+confirmation, URLs Claude "finds" must appear in actual search results, and control characters are
+neutralised before anything is printed to your terminal. `web_allowed_domains` /
+`web_blocked_domains`, `arxiv_categories` and `arxiv_queries` in `~/.aitrading/sources.json` restrict
+the web search and the arXiv search. Documents read in an earlier run are not sent to Claude again
+(`--reextract` reads them anyway), so a daily `discover` only pays for new papers.
 
 ### 5. Everything in one place: `aitrading dashboard`
 

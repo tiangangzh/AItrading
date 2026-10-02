@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -809,6 +810,106 @@ def test_intraday_run_is_not_mistaken_for_a_corporate_action(store, runner):
     assert rep.nav_after == pytest.approx(nav0 + aaa * 4.0)  # fill at 100 -> mark at 104
 
 
+class _LiveRunner:
+    """Fixed target weights; prices from a real ``StrategyRunner`` on the real free provider."""
+
+    provider_name = "free"
+
+    def __init__(self, inner, weights: dict[str, float]):
+        self.inner = inner
+        self.weights = weights
+
+    def backtest(self, spec, *, label=None):  # pragma: no cover - not used by paper trading
+        raise AssertionError("paper trading must not run a full backtest")
+
+    def target_portfolio(self, spec, as_of):
+        return pd.Series(self.weights, dtype=float)
+
+    def latest_prices(self, tickers, as_of):
+        return self.inner.latest_prices(tickers, as_of)
+
+    def prices_at(self, tickers, dates):
+        return self.inner.prices_at(tickers, dates)
+
+
+def _free_runner(tmp_path: Path, cache, today: date, close: np.ndarray, adj: np.ndarray | None = None) -> _LiveRunner:
+    """A real FreeDataProvider (fake Yahoo serving ``close`` / ``adj`` as XYZ's history from
+    2026-07-01) sharing the on-disk ``cache`` across runs, like CLI runs on one PC."""
+    from test_free_provider import FakeYF, make_sec
+
+    from aitrading.backtest.runner import StrategyRunner
+    from aitrading.data.free import FreeDataProvider
+
+    idx = pd.bdate_range("2026-07-01", periods=len(close), name="Date")
+    frame = pd.DataFrame({"Open": close, "High": close, "Low": close, "Close": close,
+                          "Adj Close": close if adj is None else adj, "Volume": 1e6}, index=idx)
+    sec, _ = make_sec(tmp_path, cache=cache)
+    prov = FreeDataProvider(["XYZ"], cache=cache, sec=sec, yf_module=FakeYF(frames={"XYZ": frame}),
+                            today=lambda: today, max_workers=1, sleep=lambda _s: None)
+    return _LiveRunner(StrategyRunner(prov, factor_loader=None, today=today), {"XYZ": 1.0})
+
+
+@pytest.mark.parametrize("second_run", [D(2026, 9, 15), D(2026, 9, 18)])
+def test_split_is_detected_through_the_free_providers_disk_cache(tmp_path, store, second_run):
+    """Regression: the anchor re-read went through the same (ticker, start, end) window as when it
+    was recorded, which the free provider caches on disk for 7 days once it is in the past - so a
+    run within a week of a 2:1 split re-read the pre-split anchor (factor 1) while today's price
+    was post-split: a fake -50% loss and no warning."""
+    from aitrading.data.cache import DiskCache
+
+    cache = DiskCache(tmp_path / "cache")  # enabled, shared by both runs
+    n = len(pd.bdate_range("2026-07-01", "2026-10-01"))
+    acct = PaperAccount(store, "split cache", costs_bps=0.0)
+    spec = make_spec()
+    rep = acct.rebalance(_free_runner(tmp_path, cache, D(2026, 9, 14), np.full(n, 100.0)), spec, D(2026, 9, 14))
+    assert rep.rebalanced and acct.positions == {"XYZ": pytest.approx(1000.0)}
+    assert acct.ledger.last_prices["XYZ"].anchor_price == 100.0
+
+    # XYZ splits 2:1 before the second run: Yahoo restates the whole history at 50
+    nav = acct.mark_to_market(_free_runner(tmp_path, cache, second_run, np.full(n, 50.0)), second_run, spec=spec)
+    assert acct.positions["XYZ"] == pytest.approx(2000.0)
+    assert nav == pytest.approx(100_000.0)
+    assert any("XYZ" in w and "factor 2.0000" in w for w in acct.summary()["warnings"])
+    assert_nav_identity(acct, nav)
+
+
+def test_dividend_is_booked_by_daily_runs_through_the_disk_cache(tmp_path, store):
+    """Regression: with daily runs every ex-dividend date fell between two runs less than 7 days
+    apart, so the cached anchor hid every dividend and the paper NAV drifted below the backtest."""
+    from aitrading.data.cache import DiskCache
+
+    cache = DiskCache(tmp_path / "cache")
+    idx = pd.bdate_range("2026-07-01", "2026-10-01")
+    acct = PaperAccount(store, "dividend cache", costs_bps=0.0)
+    spec = make_spec()
+    acct.rebalance(_free_runner(tmp_path, cache, D(2026, 9, 14), np.full(len(idx), 100.0)), spec, D(2026, 9, 14))
+    # 1% dividend, ex-date 2026-09-15: the close drops to 99 and Yahoo scales the earlier Adj Close by 0.99
+    close = np.where(idx >= pd.Timestamp("2026-09-15"), 99.0, 100.0)
+    adj = np.where(idx >= pd.Timestamp("2026-09-15"), 99.0, 99.0)
+    rep = acct.rebalance(_free_runner(tmp_path, cache, D(2026, 9, 15), close, adj), spec, D(2026, 9, 15))
+    assert acct.positions["XYZ"] == pytest.approx(1000.0 / 0.99, rel=1e-6)
+    assert any("XYZ" in x for x in rep.notes) and not rep.warnings
+    assert ledger_nav(acct) == pytest.approx(100_000.0, rel=1e-9)
+
+
+def test_price_table_uses_one_download_and_falls_back_per_date(runner):
+    calls: list[tuple[tuple[str, ...], tuple[date, ...]]] = []
+
+    class WithPricesAt(FakeRunner):
+        def prices_at(self, tickers, dates):
+            calls.append((tuple(tickers), tuple(dates)))
+            return pd.DataFrame({t: [self.latest_prices([t], d)[t] for d in dates] for t in tickers},
+                                index=pd.DatetimeIndex(dates))
+
+    r = WithPricesAt(prices=runner.prices)
+    table = PaperAccount._price_table(r, ["AAA", "BBB", "AAA"], [START, HIST, START])
+    assert calls == [(("AAA", "BBB"), (HIST, START))]
+    assert table[START].to_dict() == {"AAA": 100.0, "BBB": 50.0} and list(table) == [HIST, START]
+    fallback = PaperAccount._price_table(runner, ["AAA", "ZZZ"], [START, HIST])
+    assert fallback[HIST]["AAA"] == 100.0 and math.isnan(fallback[START]["ZZZ"])
+    assert [c[1] for c in runner.price_calls] == [HIST, START]
+
+
 def test_whole_share_account_gets_cash_in_lieu(store, runner):
     acct = PaperAccount(store, "lieu", costs_bps=0.0, allow_fractional=False)
     spec = make_spec()
@@ -1082,7 +1183,7 @@ def test_summary_contents(store, runner):
         "initial_capital", "cash", "nav", "long_value", "short_value", "gross_exposure_pct",
         "net_exposure_pct", "since_start_return_pct", "backtest_expected_return_pct", "backtest_window",
         "max_drawdown_pct", "total_costs", "n_trades", "nav_history", "holdings", "trades", "runs",
-        "warnings", "costs_bps", "allow_fractional", "ledger_path",
+        "warnings", "backtest_comparison_notes", "costs_bps", "allow_fractional", "ledger_path",
     }  # fmt: skip
     assert expected_keys <= set(s)
     assert s["name"] == "Summary Strat" and s["slug"] == "summary-strat" and s["status"] == "active"
@@ -1135,6 +1236,31 @@ def test_summary_compares_with_a_covering_backtest(store, runner):
     # an explicitly passed backtest overrides the saved one
     other = make_backtest(month_ends, [0.0, 0.0, 0.10, 0.10], spec)
     assert acct.summary(backtest=other)["backtest_expected_return_pct"] == pytest.approx(21.0)
+
+
+def test_summary_notes_that_the_backtest_credits_interest_on_cash(store, runner):
+    """The paper ledger's cash earns 0% while the backtest of a long-only / timing strategy credits
+    RF on idle cash (2x on short proceeds): the summary must say so next to the comparison."""
+    from aitrading.backtest.models import DataUsage
+    from aitrading.trading import backtest_credits_cash_interest
+
+    spec = make_spec(portfolio={"style": "long_only"})
+    month_ends = [D(2026, 9, 30), D(2026, 10, 30)]
+    rf = DataUsage(dataset="risk_free", source="Kenneth French (daily 1-month T-bill)", coverage="x", point_in_time=True)
+    bt = make_backtest(month_ends, [0.0, 0.01], spec).model_copy(update={"data_usage": [rf]})
+    acct = PaperAccount(store, "cash note")
+    acct.rebalance(runner, spec, START)
+    assert acct.summary()["backtest_comparison_notes"] == []  # no backtest
+    notes = acct.summary(backtest=bt)["backtest_comparison_notes"]
+    assert len(notes) == 1 and "T-bill" in notes[0] and "0%" in notes[0]
+
+    assert backtest_credits_cash_interest(bt)
+    no_rf = bt.model_copy(update={"data_usage": [rf.model_copy(update={"source": "none"})]})
+    assert not backtest_credits_cash_interest(no_rf)
+    ls = make_spec(portfolio={"style": "long_short"})
+    assert not backtest_credits_cash_interest(bt.model_copy(update={"spec": ls.model_dump(mode="json")}))
+    assert not backtest_credits_cash_interest(bt.model_copy(update={"spec": {**bt.spec, "kind": "factor_model"}}))
+    assert acct.summary(backtest=no_rf)["backtest_comparison_notes"] == []
 
 
 def test_backtest_return_over_window_edge_cases():

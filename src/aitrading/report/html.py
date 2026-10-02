@@ -43,6 +43,7 @@ from aitrading.backtest.models import (
 from aitrading.core.models import EvidenceCheck, InvestmentIdea, LLMCallRecord, PipelineResult
 from aitrading.discovery.models import IdeaCandidate, ReplicationReport
 from aitrading.report import svg
+from aitrading.report.prose import interpretation_unverified_numbers
 from aitrading.screen.spec import Condition, ScreenSpec
 from aitrading.strategy.spec import StrategySpec
 
@@ -994,6 +995,18 @@ def _verdict_section(result: BacktestResult, metric_checks: Sequence[EvidenceChe
         parts.append("<h3>Biases and caveats</h3>" + _ul(interp.biases_and_caveats))
     if interp.next_experiments:
         parts.append("<h3>Next experiments</h3>" + _ul(interp.next_experiments))
+    try:
+        unverified = interpretation_unverified_numbers(result)
+    except Exception:  # noqa: BLE001 - the check is best effort in a renderer
+        unverified = []
+    if unverified:
+        marks = ", ".join(f"{_mark('unverified', 'not found in the backtest results')} {_e(n)}" for n in unverified)
+        parts.append('<div class="callout bad"><b>Unverified numbers in the text above.</b> '
+                     f"These numbers in the summary or key findings were not found in the backtest results: {marks}. "
+                     "They may be derived or wrong; rely on the statistics in the tables of this report.</div>")
+    if not interp.cited_metrics:
+        parts.append('<p class="small muted">The interpretation cited no numbers for verification, so its text was only '
+                     "checked for numbers that do not appear in the backtest results.</p>")
     if interp.cited_metrics:
         rows = []
         n_ok = 0
@@ -1270,7 +1283,9 @@ def _idea_card(idea: InvestmentIdea) -> str:
         parts.append('<dl class="kv">'
                      f"<dt>Market narrative</dt><dd>{_e(t.market_narrative)}</dd>"
                      f"<dt>Variant view</dt><dd>{_e(t.variant_view)}</dd>"
-                     f"<dt>Why the dislocation exists</dt><dd>{_e(t.why_dislocation_exists)}</dd></dl>")
+                     f"<dt>Why the dislocation exists</dt><dd>{_e(t.why_dislocation_exists)}</dd></dl>"
+                     '<p class="small muted">Only the evidence table and the quotes below are machine-checked; numbers '
+                     "in the thesis text above, the catalysts and the risks are not individually verified.</p>")
         if t.quant_evidence:
             rows = []
             for i, ev in enumerate(t.quant_evidence):
@@ -1337,7 +1352,8 @@ def render_pipeline_html(result: PipelineResult, *, home_href: str | None = None
                                                                    rows, num_cols=[0, 3]))))
         cards = "".join(_idea_card(i) for i in result.ideas)
         parts.append(("theses", "Theses", _section("theses", "Ideas and theses", cards,
-                                                    intro="✓ = the number or quote was found verbatim in the data / documents; ✗ = it was not.")))
+                                                    intro="✓ = the number or quote was found verbatim in the data / documents; ✗ = it was not. "
+                                                          "Numbers in the narrative text are not individually checked.")))
     parts.append(("llm-audit", "LLM audit", _llm_section(result.llm_calls)))
     body = "\n".join(h for _, _, h in parts if h)
     toc = [(a, label) for a, label, h in parts if h]
@@ -1492,6 +1508,9 @@ def _paper_section(paper: Mapping[str, Any] | None, backtest: BacktestResult | N
                          f"<b>{_e(_pct(expected, 2, signed=True))}</b> in the backtest over the same window "
                          f"(difference {gap:+,.2f} pp). Paper fills use the close of the run day, whole-share rounding and "
                          "skipped small orders, so small differences are expected.</p>")
+        comparison_notes = [str(n) for n in (paper.get("backtest_comparison_notes") or []) if n]
+        if comparison_notes and (gap is not None or path is not None):
+            parts.append('<p class="muted">' + " ".join(_e(n) for n in comparison_notes) + "</p>")
     # holdings
     if holdings:
         def value(h: Mapping[str, Any]) -> float | None:

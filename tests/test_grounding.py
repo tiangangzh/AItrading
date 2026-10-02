@@ -126,8 +126,10 @@ def test_quote_fragments():
         "revenue grew 11.2% year over year", "a one-time erp cut-over"]
     assert quote_fragments("Our contracted backlog [...] up 14.7% year over year") == [
         "our contracted backlog", "up 14.7% year over year"]
-    assert quote_fragments("short … also short … this fragment is long enough") == ["this fragment is long enough"]
-    assert quote_fragments("tiny") == [] and quote_fragments("") == [] and quote_fragments("... ...") == []
+    # short fragments are kept (and make the quote unverifiable), never silently dropped
+    assert quote_fragments("short … also short … this fragment is long enough") == [
+        "short", "also short", "this fragment is long enough"]
+    assert quote_fragments("tiny") == ["tiny"] and quote_fragments("") == [] and quote_fragments("... ...") == []
     assert MIN_FRAGMENT_CHARS == 12
 
 
@@ -156,16 +158,53 @@ class TestQuotes:
         assert check_quote(docs, "TR-1", "That’s a fair challenge.").status == "verified"
 
     def test_ellipsis_fragments_in_order(self, docs):
+        c = check_quote(docs, "TR-1", "Revenue of $2.30 billion grew 11.2% year over year ... a one-time ERP cut-over")
+        assert c.status == "verified" and "2 fragments" in c.detail and "one sentence" in c.detail
+        c = check_quote(docs, "TR-1", "Our contracted backlog [...] up 14.7% year over year")
+        assert c.status == "verified"
+
+    def test_ellipsis_stitching_sentences_is_a_mismatch(self, docs):
+        # the skipped text crosses into "What it is NOT is ... a loss of share": stitching inverts the meaning
         c = check_quote(docs, "TR-1", "Revenue of $2.30 billion grew 11.2% year over year ... a loss of share, or a pricing problem")
-        assert c.status == "verified" and "2 fragments" in c.detail
+        assert c.status == "mismatch" and "one sentence" in c.detail
 
     def test_ellipsis_fragments_out_of_order(self, docs):
         c = check_quote(docs, "TR-1", "a loss of share, or a pricing problem ... Revenue of $2.30 billion grew 11.2%")
         assert c.status == "not_found"
         assert "fragment 2/2" in c.detail
 
-    def test_short_fragments_ignored(self, docs):
-        assert check_quote(docs, "TR-1", "Revenue of $2.30 billion grew 11.2% ... xyz ... ERP").status == "verified"
+    def test_short_fragments_make_the_quote_unverifiable(self, docs):
+        c = check_quote(docs, "TR-1", "Revenue of $2.30 billion grew 11.2% ... xyz ... ERP")
+        assert c.status == "not_found" and "'xyz'" in c.detail and "too short" in c.detail
+
+    def test_ellipsis_cannot_invent_a_tail_or_drop_a_negation(self):
+        # review finding: short fragments were dropped unchecked, so these were 'found verbatim in n1'
+        d = make_doc("n1", "We do not expect gross margin to expand next year. Gross margin expanded in the third quarter.")
+        for quote in ("We do ... expect gross margin to expand next year",           # drops "not"
+                      "Gross margin expanded in the third quarter ... by 900 bps",    # invented number
+                      "Gross margin expanded in the third quarter... by 900 bps"):
+            c = check_quote([d], "n1", quote)
+            assert c.status == "not_found" and "too short" in c.detail, quote
+        # long fragments that skip the negation inside one sentence
+        c = check_quote([d], "n1", "We do not expect gross margin ... the third quarter")
+        assert c.status == "mismatch" and "one sentence" in c.detail
+        d2 = make_doc("n2", "Management said that they do not expect gross margin to expand meaningfully next year.")
+        c = check_quote([d2], "n2", "Management said that they ... expect gross margin to expand meaningfully next year")
+        assert c.status == "mismatch" and "negation" in c.detail
+        # a clean in-sentence abridgement still verifies
+        c = check_quote([d2], "n2", "Management said that they do not expect ... to expand meaningfully next year")
+        assert c.status == "verified"
+
+    def test_quote_with_an_ellipsis_from_the_source_verifies_verbatim(self):
+        d = make_doc("n1", 'The CEO said: "Well... we think demand is fine." Orders rose.')
+        assert check_quote([d], "n1", "Well... we think demand is fine.").status == "verified"
+        assert check_quote([d], "n1", "Well ... we think demand is fine").status == "verified"
+
+    def test_match_must_respect_word_boundaries(self):
+        d = make_doc("n1", "The segment was unprofitable in the third quarter, and revenue grew 11.2% year over year.")
+        assert check_quote([d], "n1", "profitable in the third quarter").status == "not_found"
+        assert check_quote([d], "n1", "1.2% year over year").status == "not_found"
+        assert check_quote([d], "n1", "revenue grew 11.2% year over year").status == "verified"
 
     def test_too_short_quote(self, docs):
         c = check_quote(docs, "NW-1", "healthy")

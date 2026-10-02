@@ -12,7 +12,8 @@
    screened). The local engine re-evaluates every condition on the narrowed set.
 4. ``provider.get_universe`` and a screen-pass ``FeatureEngine.build`` for the spec's features, the
    universe-filter features, ``price``, ``gics_sector``, ``market_cap_usd_bn`` and the
-   cross-sectional features; then ``run_screen`` and ``rank_candidates``.
+   cross-sectional features; then ``run_screen`` and ``rank_candidates``. At a past as_of on
+   adjusted prices the price floor is not applied (see "Adjusted prices at past dates").
 5. Enrichment: a full-catalog ``FeatureEngine.build`` for the ranked candidates only (cross-sectional
    features are taken from the screen pass, where they are relative to the whole universe).
 6. For the first ``explain_top_k`` candidates: point-in-time documents (``gather_documents``, which
@@ -36,8 +37,22 @@ Data boundary: only documents the provider's boundary permits are excerpted (re-
 ``boundary.allow_numeric_features`` is False an LLM-backed explainer (one with an ``llm``
 attribute) receives no feature values.
 
+Adjusted prices at past dates: providers serve split- and dividend-adjusted closes (the
+``PricePanel`` contract), restated for every split and dividend up to the provider's latest data
+date. When as_of is before that date (the provider's ``end``, else the last benchmark close in the
+two weeks before the ``clock`` date) and the provider does not declare ``prices_as_traded = True``
+(the synthetic market is as traded), ``UniverseSpec.min_price`` is NOT applied, locally or in the
+push-down: an adjusted close under the floor says nothing about the price the stock traded at then,
+and the floor would drop exactly the later winners that split afterwards. Its funnel step reads
+``price >= <floor> - NOT APPLIED (...)`` and a warning says why (as ``StrategyRunner`` does). Two
+caveats that cannot be corrected without as-traded prices are flagged as warnings instead: the
+liquidity floor's dollar volume (adjusted close x volume) understates later dividend payers by their
+cumulative later yield, and ratios of a per-share vendor value to the adjusted close (``pe_ntm``,
+``earnings_yield_ntm_pct``, ``target_price_upside_pct``) are biased by later dividends and splits.
+
 Determinism: everything except ``started_at`` / ``finished_at`` (wall clock, injectable via
-``clock``) is a function of the inputs.
+``clock``) is a function of the inputs and, at a past as_of on adjusted prices, of the provider's
+latest data date.
 """
 
 from __future__ import annotations
@@ -46,7 +61,7 @@ import hashlib
 import json
 import math
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -69,6 +84,8 @@ from aitrading.screen.spec import ScreenSpec, UniverseSpec
 __all__ = ["ResearchPipeline", "make_run_id", "NO_LLM"]
 
 NO_LLM = "none (offline heuristics)"
+# Ratios of a per-share vendor value (consensus EPS, target price) to the adjusted close.
+PER_SHARE_PRICE_RATIOS = ("pe_ntm", "earnings_yield_ntm_pct", "target_price_upside_pct")
 
 
 class _Translator(Protocol):
@@ -163,6 +180,38 @@ class ResearchPipeline:
         """The provider's boundary (the same object ``gather_documents`` applies), else the default."""
         b = getattr(self.provider, "boundary", None)
         return b if b is not None and hasattr(b, "permits") else DataBoundary(provider=self.provider_name)
+
+    def _prices_as_traded(self) -> bool:
+        """True when the provider's closes are the prices the stocks traded at (no later split /
+        dividend restatement): a provider declaring ``prices_as_traded = True``, or the synthetic
+        market. Every other provider serves adjusted prices (the ``PricePanel`` contract)."""
+        flag = getattr(self.provider, "prices_as_traded", None)
+        if flag is not None:
+            return bool(flag)
+        return self.provider_name == "synthetic"
+
+    def _latest_data_date(self) -> date:
+        """The provider's ``end`` if it has one, else the last benchmark close in the 14 days up to the
+        ``clock`` date (the clock date when that probe fails or is empty)."""
+        end = getattr(self.provider, "end", None)
+        if isinstance(end, (date, datetime)):
+            return _as_date(end)
+        today = _as_date(self.clock())
+        try:
+            probe = self.provider.get_benchmark_history(today - timedelta(days=14), today)
+            probe = probe.dropna() if probe is not None else None
+            if probe is not None and len(probe):
+                return min(today, pd.Timestamp(probe.index[-1]).date())
+        except Exception:  # noqa: BLE001 - the probe only dates the data; fall back to the clock
+            pass
+        return today
+
+    def _adjusted_past(self, as_of: date) -> date | None:
+        """The provider's latest data date when ``as_of`` is before it on adjusted prices, else None."""
+        if self._prices_as_traded() or as_of >= _as_date(self.clock()):
+            return None
+        latest = self._latest_data_date()
+        return latest if as_of < latest else None
 
     def _llms(self) -> list[Any]:
         """Distinct LLM objects (attribute ``llm`` with ``calls``) of the translator and explainer."""
@@ -278,19 +327,42 @@ class ResearchPipeline:
             raise ScreenValidationError(errors)
         warnings += [f"not screened (no catalog feature expresses it): {r}" for r in spec.unsupported_requests]
 
+        # adjusted prices at a past as_of (module docstring)
+        latest = self._adjusted_past(as_of)
+        floor_note: str | None = None
+        applied = spec  # the spec as actually applied (pushed down and described to the explainer)
+        if latest is not None:
+            u = spec.universe
+            if u.min_price is not None:
+                floor_note = "adjusted prices at a past date"
+                applied = spec.model_copy(update={"universe": u.model_copy(update={"min_price": None})})
+                warnings.append(
+                    f"price floor (universe min_price ${u.min_price:g}) not applied: as_of {as_of} is before the latest data "
+                    f"date {latest} and provider '{self.provider_name}' serves split- and dividend-adjusted prices, so an "
+                    f"adjusted close under ${u.min_price:g} does not mean the stock traded under ${u.min_price:g} then (later "
+                    "splits and dividends lower earlier adjusted prices) and the floor would drop later winners using splits "
+                    "that had not happened yet"
+                )
+            if u.min_avg_dollar_volume_usd_mn is not None or LIQUIDITY_COLUMN in set(spec.features()):
+                warnings.append(
+                    f"dollar volume at {as_of} is computed from dividend-adjusted closes (provider '{self.provider_name}'), so it "
+                    "understates the traded dollar volume of stocks that paid dividends after that date by their cumulative "
+                    "later yield; the liquidity floor may exclude borderline dividend payers"
+                )
+
         # 2. push-down
         pushdown_query: str | None = None
         pushed: list[str] | None = None
         if isinstance(self.provider, ScreenPushdown):
             try:
-                pr = self.provider.pushdown_screen(spec, as_of)
+                pr = self.provider.pushdown_screen(applied, as_of)
                 query, tickers = str(pr.query), _dedupe([str(t) for t in pr.tickers])
                 pushdown_query, pushed = query, tickers
             except Exception as exc:  # noqa: BLE001 - push-down is an optimisation; fall back to local
                 warnings.append(f"screen push-down failed ({type(exc).__name__}: {exc}); screening the full universe locally")
 
         # 3. universe + screen pass
-        universe = self.provider.get_universe(spec.universe, as_of)
+        universe = self.provider.get_universe(applied.universe, as_of)
         universe = universe[~universe.index.duplicated(keep="first")]
         universe_size = len(universe)
         head: list[FunnelStep] = []
@@ -305,7 +377,7 @@ class ResearchPipeline:
         screen = self.engine.build(universe, as_of, self._screen_features(spec))
         warnings += screen.warnings
         frame = screen.frame
-        outcome = run_screen(spec, frame, self.catalog)
+        outcome = run_screen(spec, frame, self.catalog, price_floor_suspended=floor_note)
         funnel = head + outcome.funnel
         if not outcome.survivors:
             warnings.append("no names passed the screen")
@@ -325,6 +397,15 @@ class ResearchPipeline:
                 warnings += rich.warnings
             except ProviderError as exc:
                 warnings.append(f"enrichment failed ({exc}); candidates explained with screen-pass features only")
+        if latest is not None:
+            biased = [f for f in PER_SHARE_PRICE_RATIOS
+                      if (f in frame.columns and frame[f].notna().any()) or (f in rich_frame.columns and rich_frame[f].notna().any())]
+            if biased:
+                warnings.append(
+                    f"{', '.join(biased)} at {as_of} divide per-share vendor values (consensus EPS / target price) by a close "
+                    f"that provider '{self.provider_name}' has adjusted for splits and dividends after that date, so they are "
+                    "not point-in-time (upside and earnings yield read high for later dividend payers and splitters)"
+                )
 
         # 5. explanations
         medians: pd.DataFrame | None = None
@@ -338,7 +419,7 @@ class ResearchPipeline:
             )
             explaining = False
         if explaining and pushed is None:
-            umask, _ = apply_universe(spec.universe, frame)
+            umask, _ = apply_universe(spec.universe, frame, price_floor_suspended=floor_note)
             medians = self._sector_medians(frame, umask)
         elif explaining:
             warnings.append("sector medians omitted: push-down narrowed the universe, so they would not be representative")
@@ -348,7 +429,7 @@ class ResearchPipeline:
             if not explaining or i >= self.explain_top_k or self.explainer is None:
                 ideas.append(InvestmentIdea(candidate=cand))
                 continue
-            idea, docs = self._explain(cand, rich_frame, medians, spec, as_of, warnings)
+            idea, docs = self._explain(cand, rich_frame, medians, applied, as_of, warnings)
             ideas.append(idea)
             documents_log.append(
                 {

@@ -678,6 +678,21 @@ def test_factor_model_charges_costs_on_the_factor_mimicking_turnover(runner):
     assert dear.run_id != gross.run_id
 
 
+def test_factor_model_result_reports_the_monthly_trading_it_simulates(runner):
+    """Regression: a factor model with rebalance='annual' (e.g. 'Fama-French 3-factor model, rebalanced
+    annually') traded monthly but stored rebalance='annual', so the cost drag (2 x monthly turnover x 1)
+    was understated 12x and the reports said 'Once a year'."""
+    from aitrading.strategy.interpret import rebalances_per_year
+
+    monthly = runner.backtest(_ff3_spec(start=date(2022, 1, 1)))
+    annual = runner.backtest(_ff3_spec(start=date(2022, 1, 1), rebalance="annual"))
+    assert monthly.rebalance == annual.rebalance == "monthly"
+    assert annual.spec["rebalance"] == "annual" and rebalances_per_year(annual) == 12
+    assert annual.returns["strategy"] == monthly.returns["strategy"]
+    assert any("does not apply to a factor model" in w for w in annual.warnings)
+    assert not any("does not apply to a factor model" in w for w in monthly.warnings)
+
+
 def test_factor_mimicking_weights_use_the_june_formation_session(provider, runner):
     """Regression: target_portfolio kept the PRIOR year's June formation until calendar June 30, while
     construct_factors forms on the last June session (Fri 2024-06-28; also 2019-06-28), so a paper account
@@ -880,6 +895,31 @@ def test_progress_and_latest_prices(provider, french):
     assert np.allclose(px[tk].to_numpy(), direct.to_numpy()) and math.isnan(px["NOPE"])
 
 
+def test_prices_at_reads_every_date_from_one_download(provider, french):
+    """Paper trading compares a re-read past price with today's price: both must come from one
+    download (one adjustment vintage), not from separately cached windows."""
+    calls: list[tuple[date, date]] = []
+
+    class Counting:
+        def __getattr__(self, item):
+            return getattr(provider, item)
+
+        def get_price_history(self, tickers, start, end):
+            calls.append((start, end))
+            return provider.get_price_history(tickers, start, end)
+
+    r = StrategyRunner(Counting(), factor_loader=french)
+    tk = provider.tickers[:2]
+    days = [date(2024, 6, 14), date(2024, 3, 1), date(2024, 6, 15)]
+    table = r.prices_at([*tk, "NOPE"], days)
+    assert calls == [(date(2024, 1, 30), date(2024, 6, 15))]
+    assert list(table.index) == [pd.Timestamp(d) for d in sorted(days)] and list(table.columns) == [*tk, "NOPE"]
+    for d in days:
+        assert np.allclose(table.loc[pd.Timestamp(d), tk].to_numpy(), r.latest_prices(tk, d).to_numpy())
+    assert table["NOPE"].isna().all()
+    assert r.prices_at([], days).empty and r.prices_at(tk, []).empty
+
+
 class StaleSnapshots:
     """A synthetic provider that behaves like the free edition: snapshot data is current-only."""
 
@@ -1052,6 +1092,69 @@ def test_market_caps_are_point_in_time_snapshots_rolled_forward(provider, french
     assert {pd.Timestamp(d) for d in plain.calls} == {pd.Timestamp(END)}
 
 
+class CurrentShares(Vendor):
+    """A vendor whose past snapshots price some names with today's share count (no point-in-time count:
+    foreign filers, several share classes, no SEC data) and say so through the snapshot's attrs."""
+
+    def __init__(self, base: SyntheticProvider, flag_every: int = 3) -> None:
+        super().__init__(base)
+        self.flag_every = flag_every
+
+    def get_universe(self, spec, as_of):
+        u = super().get_universe(spec, as_of)
+        if pd.Timestamp(as_of) < pd.Timestamp(END):
+            from aitrading.backtest.runner import MCAP_CURRENT_SHARES_ATTR
+
+            tickers = list(u.index) if u.index.name == F.TICKER else list(u[F.TICKER])
+            u = u.copy()
+            u.attrs[MCAP_CURRENT_SHARES_ATTR] = [str(t) for t in tickers[:: self.flag_every]]
+        return u
+
+
+def test_snapshot_caps_from_current_share_counts_are_not_point_in_time(provider, french):
+    """Regression: a snapshot whose caps used today's share count for some names was still reported as
+    'universe snapshots (point-in-time)', so the verdict was never capped for that look-ahead."""
+    from aitrading.strategy.interpret import verdict_caps
+
+    res = StrategyRunner(CurrentShares(provider), factor_loader=french).backtest(low_vol_spec(start=date(2022, 1, 1)))
+    mcap = {d.dataset: d for d in res.data_usage}["market_cap"]
+    assert mcap.point_in_time is False and "(point-in-time)" not in mcap.source
+    assert mcap.notes.startswith("NOT point-in-time for") and "current" in mcap.notes
+    assert any(w.startswith("MARKET CAPS NOT POINT-IN-TIME for") for w in res.warnings)
+    assert verdict_caps(res)[0][0] == "inconclusive"
+    # a strategy that uses no market cap takes no past snapshot, so nothing is flagged
+    plain = StrategyRunner(CurrentShares(provider), factor_loader=french).backtest(momentum_spec(start=date(2023, 1, 1)))
+    assert "market_cap" not in {d.dataset for d in plain.data_usage}
+    assert not any("MARKET CAPS NOT POINT-IN-TIME" in w for w in plain.warnings)
+    # the same vendor without the flag stays point-in-time
+    unflagged = StrategyRunner(Vendor(provider), factor_loader=french).backtest(low_vol_spec(start=date(2022, 1, 1)))
+    assert {d.dataset: d for d in unflagged.data_usage}["market_cap"].point_in_time is True
+
+
+def test_end_date_labels_are_flagged_when_they_drive_the_run(provider, french):
+    """Regression: sector / industry / exchange labels of the END snapshot are applied to every date
+    (sector exclusions, sector-neutral signals, NYSE breakpoints) without any note."""
+    from aitrading.strategy.interpret import verdict_caps
+
+    spec = momentum_spec(start=date(2023, 1, 1), universe=OPEN_UNIVERSE.model_copy(update={"exclude_sectors": ["Utilities"]}))
+    res = StrategyRunner(Vendor(provider), factor_loader=french).backtest(spec)
+    label_w = [w for w in res.warnings if w.startswith("END-DATE LABELS")]
+    assert len(label_w) == 1 and "gics_sector" in label_w[0] and "Communication Services" in label_w[0]
+    uni = {d.dataset: d for d in res.data_usage}["universe"]
+    assert "labels are the values as of" in uni.notes
+    assert "inconclusive" not in [c for c, _ in verdict_caps(res)]  # a caveat, not a look-ahead verdict cap
+    # sector-neutral components and factor models (NYSE breakpoints) count; plain momentum does not
+    neutral = momentum_spec(start=date(2023, 1, 1))
+    neutral = neutral.model_copy(update={"signal": [c.model_copy(update={"sector_neutral": True}) for c in neutral.signal]})
+    assert any(w.startswith("END-DATE LABELS") for w in StrategyRunner(Vendor(provider), factor_loader=french).backtest(neutral).warnings)
+    plain = StrategyRunner(Vendor(provider), factor_loader=french).backtest(momentum_spec(start=date(2023, 1, 1)))
+    assert not any(w.startswith("END-DATE LABELS") for w in plain.warnings)
+    # the synthetic market never reclassifies anything: no warning, no note
+    syn = StrategyRunner(provider, factor_loader=french).backtest(spec)
+    assert not any(w.startswith("END-DATE LABELS") for w in syn.warnings)
+    assert "labels are the values" not in {d.dataset: d for d in syn.data_usage}["universe"].notes
+
+
 def test_end_scaled_market_caps_are_reported_as_not_point_in_time(provider, french):
     from aitrading.strategy.interpret import verdict_caps
 
@@ -1098,6 +1201,26 @@ def test_price_floor_is_not_applied_to_adjusted_prices_at_past_dates(provider, f
     res_t = traded.backtest(spec)
     assert all(tk not in s.index for s in traded.last_run.signals.values())
     assert not any("price floor" in w for w in res_t.warnings)
+
+
+def test_per_share_price_ratios_on_adjusted_past_prices_are_flagged_not_point_in_time(provider, french):
+    """A ratio of a per-share vendor value (consensus EPS) to an adjusted close at a past date uses later
+    splits and dividends (the denominator is restated): flagged as not point-in-time, which caps the verdict."""
+    from aitrading.strategy.interpret import verdict_caps
+
+    spec = momentum_spec(start=date(2023, 1, 1))
+    spec = spec.model_copy(update={"signal": [SignalComponent(feature="earnings_yield_ntm_pct", direction="higher_is_better")]})
+    res = StrategyRunner(Vendor(provider, pit=True), factor_loader=french).backtest(spec)
+    flagged = [w for w in res.warnings if "per-share vendor values" in w]
+    assert len(flagged) == 1 and flagged[0].startswith("earnings_yield_ntm_pct at rebalance dates")
+    assert "pe_ntm" not in flagged[0]  # only the ratios the run uses
+    assert verdict_caps(res)[0][0] == "inconclusive"
+    # prices as traded (declared, or the synthetic market): nothing to flag
+    res_t = StrategyRunner(Vendor(provider, pit=True, as_traded=True), factor_loader=french).backtest(spec)
+    assert not any("per-share vendor values" in w for w in res_t.warnings)
+    # a run that does not use the ratios: nothing to flag
+    res_m = StrategyRunner(Vendor(provider, pit=True), factor_loader=french).backtest(momentum_spec(start=date(2023, 1, 1)))
+    assert not any("per-share vendor values" in w for w in res_m.warnings)
 
 
 def test_performance_300_names_ten_years_monthly_under_60s():

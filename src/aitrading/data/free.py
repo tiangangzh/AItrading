@@ -45,11 +45,16 @@ Approximations (documented, deliberate)
   small). Exceptions, each with a warning: 20-F/40-F filers (the cover page counts ordinary shares,
   not the ADSs that trade) and multi-class filers whose classes trade at different prices (BRK-A /
   BRK-B) use Yahoo's implied share count; without SEC data Yahoo's ``sharesOutstanding`` is used.
+  Yahoo's counts are today's: for a historical ``as_of`` those tickers are listed in the universe
+  frame's ``attrs[MCAP_CURRENT_SHARES_ATTR]``, so a backtest reports their caps as not point-in-time.
 * Snapshot fields for an ``as_of`` within ``snapshot_staleness_days`` of today are today's values (a
   warning says so); the last EPS surprise only uses quarters whose results were public on ``as_of``
   (SEC 8-K release date).
 * Consensus / target / trailing-EPS figures that Yahoo reports in a currency other than USD (ADRs and
   foreign filers) are left NaN with a warning: the canonical fields are USD and there is no FX here.
+* The universe is a fixed ticker list (the bundled starter list or yours), the same for every
+  ``as_of``. For an ``as_of`` more than ``snapshot_staleness_days`` before today ``get_universe`` adds a
+  SURVIVORSHIP BIAS warning: names delisted or acquired since then are not in the list.
 
 Yahoo data via ``yfinance`` is for personal research use; respect Yahoo's terms. SEC EDGAR is public.
 """
@@ -73,7 +78,7 @@ import pandas as pd
 from aitrading.core import fields as F
 from aitrading.core.models import Document, DocumentKind
 from aitrading.core.policy import DataBoundary
-from aitrading.data.base import Capability, PricePanel, ProviderError, ProviderUnavailable
+from aitrading.data.base import MCAP_CURRENT_SHARES_ATTR, Capability, PricePanel, ProviderError, ProviderUnavailable
 from aitrading.data.cache import DAY, HOUR, MINUTE, DiskCache
 from aitrading.data.sec_edgar import US_EXCHANGES, SecEdgarClient, SecNotFound, SecUnsupported, SharesInfo
 from aitrading.data.universes import load_starter_universe
@@ -576,6 +581,20 @@ def _row_from_json(d: dict[str, Any], date_cols: Iterable[str]) -> dict[str, Any
 # =============================================================================================
 
 
+#: Text of exceptions that mean the request never reached the server (no network, DNS failure, a proxy that
+#: refused the tunnel, connection timeout) - as opposed to an HTTP error or a rate limit from Yahoo itself.
+_NETWORK_ERROR_MARKERS = (
+    "connectionerror", "connecterror", "connecttimeout", "proxyerror", "curl: (5)", "curl: (6)", "curl: (7)",
+    "curl: (28)", "could not resolve", "name or service not known", "nodename nor servname", "getaddrinfo failed",
+    "network is unreachable", "connection refused", "failed to establish a new connection",
+)
+
+
+def _is_network_error(e: BaseException) -> bool:
+    text = f"{type(e).__name__}: {e}".lower()
+    return isinstance(e, (ConnectionError, TimeoutError)) or any(m in text for m in _NETWORK_ERROR_MARKERS)
+
+
 class FreeDataProvider:
     """``MarketDataProvider`` over free sources (Yahoo via yfinance + SEC EDGAR) for running on a PC."""
 
@@ -632,10 +651,13 @@ class FreeDataProvider:
                 if t and str(t).strip():
                     seen.setdefault(normalize_ticker(t), None)
             self._tickers = list(seen)
+            self._universe_source = "your ticker list"
         elif universe_file is not None:
             self._tickers = read_ticker_file(universe_file)
+            self._universe_source = f"the ticker file {Path(universe_file).name}"
         else:
             self._tickers = list(self._starter.index)
+            self._universe_source = "the bundled starter list, chosen in 2026"
         self._info_memo: dict[str, dict] = {}
         self._info_lock = threading.Lock()
         self._closes: dict[str, pd.Series] = {}
@@ -697,6 +719,16 @@ class FreeDataProvider:
             f"as_of {as_of} is more than {self.snapshot_staleness_days} days before today ({self._today()}): the free "
             f"provider cannot give point-in-time {what} for historical dates (Yahoo only serves current "
             "snapshots), so these fields are left blank (NaN)."
+        )
+
+    def _survivorship_warning(self) -> None:
+        # One message per provider (no as_of in it): a backtest asks for the universe at many past dates.
+        self._warn(
+            f"SURVIVORSHIP BIAS: for an as_of more than {self.snapshot_staleness_days} days before today "
+            f"({self._today()}) the free provider still uses today's universe - {self._universe_source} "
+            f"({len(self._tickers)} names) - not the companies listed on that date. Names delisted, acquired or "
+            "bankrupt since then are missing, which flatters a historical screen (point-in-time index membership "
+            "needs institutional data)."
         )
 
     def _snapshot_lag_warning(self, what: str, as_of: date) -> None:
@@ -780,9 +812,20 @@ class FreeDataProvider:
                        f"- sector, short interest, fiscal-year dates and analyst data are missing for {what}; not "
                        "cached for long, rerun later.")
 
-    def _infos(self, syms: list[str], what: str) -> dict[str, dict]:
+    def _infos(self, syms: list[str], what: str, *, fail_if_offline: bool = False) -> dict[str, dict]:
+        """Quote info per ticker (failures are NaN plus a warning). With ``fail_if_offline``, a run in which
+        EVERY request failed with a network-level error (no connection, DNS, refused proxy tunnel) raises
+        ``ProviderUnavailable`` at once: the price downloads that follow would only time out and retry for
+        minutes before failing the same way."""
         res = self._parallel(self._info, syms)
         errors = {s: e for s, (_, e) in res.items() if e is not None}
+        if fail_if_offline and syms and len(errors) == len(syms) and all(_is_network_error(e) for e in errors.values()):
+            first = errors[syms[0]] if syms[0] in errors else next(iter(errors.values()))
+            raise ProviderUnavailable(
+                f"Cannot reach Yahoo Finance: all {len(syms)} quote requests failed with a network error "
+                f"({type(first).__name__}: {str(first)[:160]}). Check the internet connection; behind a proxy, set "
+                "HTTPS_PROXY (pip, yfinance and the SEC client honour it). Then run again."
+            )
         if errors:
             self._summarise_errors(f"Yahoo quote info ({what})", errors)
         out = {s: (v or {}) for s, (v, e) in res.items() if e is None}
@@ -941,12 +984,15 @@ class FreeDataProvider:
                 if e is None and v is not None and math.isfinite(v.value) and v.value > 0}
 
     def _market_caps(self, syms: list[str], as_of: date, infos: dict[str, dict],
-                     sec_shares: dict[str, SharesInfo]) -> dict[str, float]:
+                     sec_shares: dict[str, SharesInfo], current_shares: list[str] | None = None) -> dict[str, float]:
         """market_cap = Yahoo split-adjusted (not dividend-adjusted) close on/before as_of x shares on the same basis.
 
         Yahoo's ``Close`` is restated for every split up to the download date (today), so the SEC
         cover-page count is multiplied by each split with an ex-date after its own date. Prices come
         from one download running from that date to today, which carries the splits.
+
+        ``current_shares`` (if given) receives the tickers whose cap uses one of Yahoo's share counts,
+        which are current (today's), not as of ``as_of``.
         """
         today = self._today()
         end = max(as_of, today)
@@ -996,6 +1042,8 @@ class FreeDataProvider:
                 if math.isfinite(shares) and shares > 0:
                     yahoo_used.append(s)
             out[s] = price * shares if math.isfinite(shares) and shares > 0 else math.nan
+            if current_shares is not None and math.isfinite(out[s]) and (s in yahoo_used or s in adr or s in multi_yahoo):
+                current_shares.append(s)
 
         if missing_close:
             self._warn(f"No close on/before {as_of} for {len(missing_close)} ticker(s) ({', '.join(missing_close[:20])}); "
@@ -1019,12 +1067,18 @@ class FreeDataProvider:
 
     def get_universe(self, spec: Any, as_of: date) -> pd.DataFrame:
         """Universe rows for ``self.tickers``, filtered by the spec's country / security types / excluded
-        sectors (unknown values are kept). Price and liquidity floors are left to the feature engine."""
+        sectors (unknown values are kept). Price and liquidity floors are left to the feature engine.
+
+        Membership is the same fixed list for every ``as_of``; for a historical ``as_of`` (stale by
+        ``snapshot_staleness_days``) a survivorship-bias warning says so."""
         syms = self.tickers
-        infos = self._infos(syms, "universe")
+        if self.is_stale(as_of):
+            self._survivorship_warning()
+        infos = self._infos(syms, "universe", fail_if_offline=True)
         refs = self._sec_refs(syms)
         sec_shares = self._sec_shares(syms, as_of) if refs else {}
-        mcaps = self._market_caps(syms, as_of, infos, sec_shares)
+        current_shares: list[str] = []
+        mcaps = self._market_caps(syms, as_of, infos, sec_shares, current_shares)
         assumed_common: list[str] = []
         rows: dict[str, dict] = {}
         for s in syms:
@@ -1064,7 +1118,11 @@ class FreeDataProvider:
             if c != F.MARKET_CAP:
                 df[c] = df[c].astype(object).where(df[c].notna(), np.nan)
         df.index = pd.Index(syms, name="ticker")
-        return self._apply_universe_spec(df, spec)
+        out = self._apply_universe_spec(df, spec)
+        if current_shares and self.is_stale(as_of):
+            # today's share count priced at a past date: not point-in-time (StrategyRunner reports it)
+            out.attrs[MCAP_CURRENT_SHARES_ATTR] = [t for t in current_shares if t in out.index]
+        return out
 
     @staticmethod
     def _apply_universe_spec(df: pd.DataFrame, spec: Any) -> pd.DataFrame:

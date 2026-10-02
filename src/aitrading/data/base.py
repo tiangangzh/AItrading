@@ -26,6 +26,12 @@ if TYPE_CHECKING:  # pragma: no cover
     from aitrading.screen.spec import ScreenSpec, UniverseSpec
 
 
+#: ``DataFrame.attrs`` key a provider may set on a ``get_universe`` frame: the tickers whose market cap
+#: in that snapshot uses a share count from AFTER its ``as_of`` (e.g. today's count, when no
+#: point-in-time count exists), i.e. caps that are NOT point-in-time. ``StrategyRunner`` reports them.
+MCAP_CURRENT_SHARES_ATTR = "market_cap_current_shares"
+
+
 class ProviderError(RuntimeError):
     """Raised for vendor connectivity / entitlement / query errors."""
 

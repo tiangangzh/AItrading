@@ -22,6 +22,11 @@ Conventions
 * days_since_52w_high counts bars since the most recent bar whose high equals high_52w (0 = today).
 * return_6m_percentile = (rank - 1) / (N - 1) x 100 over the tickers with a valid return_6m_pct
   (ties share the average rank; 50 when N == 1): 0 = weakest, 100 = strongest.
+* Adjustment basis: ``price`` and ``avg_dollar_volume_20d_usd_mn`` (close x volume) use the panel's
+  split- and dividend-adjusted closes. Split-adjusted volume cancels splits, but at a date before
+  the provider's latest data the dollar volume is still scaled down by the dividends paid since, and
+  ``price`` by later splits too; ``ResearchPipeline`` / ``StrategyRunner`` suspend the price floor
+  there and the pipeline flags the dollar-volume caveat (only as-traded prices would remove it).
 
 Bars needed (gap-free data): price 1; returns n + 1 (12-1 momentum 253); sma_n n; sma_200 slope
 221; golden cross 220; rsi_14 15; macd line 26, signal 34, bullish cross 44; 52w range 252;

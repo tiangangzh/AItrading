@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from anthropic import NOT_GIVEN
 from anthropic.lib._parse._response import parse_beta_response
 from anthropic.types.beta import BetaMessage
 
@@ -55,8 +56,8 @@ from aitrading.discovery.websearch import (
     WebIdeaList,
     _echo_content,
 )
-from aitrading.llm.anthropic_client import FALLBACK_BETA
-from aitrading.llm.base import LLMError, LLMRefusalError
+from aitrading.llm.anthropic_client import FALLBACK_BETA, output_schema
+from aitrading.llm.base import LLMError, LLMOutputError, LLMRefusalError
 
 FIX = Path(__file__).parent / "fixtures" / "discovery"
 ATOM_NS = "http://www.w3.org/2005/Atom"
@@ -975,7 +976,9 @@ class FakeMessages:
         self.owner.requests.append({"method": "parse", "beta": self.beta, **{k: v for k, v in kwargs.items() if k != "output_format"},
                                     "output_format": kwargs.get("output_format")})
         payload = self.owner.parse_payloads.pop(0)
-        parsed = parse_beta_response(output_format=kwargs["output_format"], response=BetaMessage.model_validate(payload))
+        # like the SDK: without output_format nothing is validated inside the call (parsed_output stays None)
+        fmt = kwargs.get("output_format") or NOT_GIVEN
+        parsed = parse_beta_response(output_format=fmt, response=BetaMessage.model_validate(payload))
         parsed._request_id = "req_structure_1"
         return parsed
 
@@ -1034,7 +1037,9 @@ def test_websearch_discover_end_to_end():
     # --- structuring call: no tools, typed output, only real URLs offered
     parse_req = [r for r in client.requests if r["method"] == "parse"][0]
     assert "tools" not in parse_req
-    assert parse_req["output_format"] is WebIdeaList
+    # schema in output_config.format, validated after the stop reason (no output_format: the SDK would validate in-call)
+    assert parse_req["output_format"] is None
+    assert parse_req["output_config"] == {"effort": "medium", "format": output_schema(WebIdeaList)}
     assert parse_req["system"][0]["text"] == STRUCTURE_SYSTEM
     user = parse_req["messages"][0]["content"]
     assert "<research_report>" in user and "Excerpt: We revisit post-earnings announcement drift" in user
@@ -1103,9 +1108,32 @@ def test_websearch_truncated_structured_output_raises_llmerror():
     structure["content"][1]["text"] = '{"items": [{"title": "Earnings Announcement'
     structure["stop_reason"] = "max_tokens"
     src = make_source(FakeAnthropic(research_payloads(), [structure]))
-    with pytest.raises(LLMError, match="did not validate"):
+    with pytest.raises(LLMError, match="truncated at max_tokens"):
         src.discover("earnings drift")
-    assert src.calls[-1].purpose == "discover:structure" and src.calls[-1].error == "unparsed"
+    rec = src.calls[-1]
+    assert rec.purpose == "discover:structure" and rec.error == "max_tokens"
+    assert rec.stop_reason == "max_tokens" and rec.output_tokens > 0  # the audit record keeps stop reason and usage
+
+
+def test_websearch_structured_output_that_breaks_the_schema_raises_llmoutputerror():
+    structure = structure_payload()
+    structure["content"][1]["text"] = '{"items": [{"title": 5}]}'
+    src = make_source(FakeAnthropic(research_payloads(), [structure]))
+    with pytest.raises(LLMOutputError, match="does not validate as WebIdeaList") as ei:
+        src.discover("earnings drift")
+    assert ei.value.errors()
+    rec = src.calls[-1]
+    assert rec.error.startswith("invalid_output:") and rec.stop_reason == structure["stop_reason"]
+
+
+def test_websearch_structuring_refusal_raises_refusal_error():
+    structure = structure_payload()
+    structure["content"][1]["text"] = '{"items": ['
+    structure["stop_reason"] = "refusal"
+    src = make_source(FakeAnthropic(research_payloads(), [structure]))
+    with pytest.raises(LLMRefusalError):
+        src.discover("earnings drift")
+    assert src.calls[-1].error.startswith("refusal")
 
 
 def test_websearch_pause_turn_is_capped():
@@ -1182,6 +1210,40 @@ def test_websearch_domain_filters_and_validation():
         make_source(FakeAnthropic([])).discover("   ")
     with pytest.raises(ValueError):
         make_source(FakeAnthropic([])).discover("momentum", max_ideas=0)
+
+
+def test_websearch_research_calls_use_automatic_caching():
+    """Regression: pause_turn continuations re-sent every fetched page (up to 8 x 20k tokens) with no
+    cache breakpoint after the system prompt, re-billing them in full on each continuation."""
+    client = FakeAnthropic(research_payloads(), [structure_payload()])
+    make_source(client, max_searches=5, max_fetches=4).discover("post-earnings drift and momentum variants", max_ideas=5)
+    research = [r for r in client.requests if r["method"] == "create"]
+    assert len(research) >= 2  # the fixture pauses at least once
+    assert all(r["cache_control"] == {"type": "ephemeral"} for r in research)
+    assert all(r["system"][0]["cache_control"] == {"type": "ephemeral"} for r in research)
+    # the continuation's prefix is the previous request plus the paused turn (so the cache can be read)
+    assert research[1]["messages"][: len(research[0]["messages"])] == research[0]["messages"]
+
+
+def test_websearch_applies_the_domains_configured_in_sources_json(monkeypatch, tmp_path):
+    """Regression: sources.json's web_allowed_domains / web_blocked_domains were parsed but never
+    reached the web search tools, so `aitrading discover` searched the whole web anyway."""
+    monkeypatch.setenv(S.SOURCES_ENV, json.dumps({"web_allowed_domains": ["https://ssrn.com/", "arxiv.org", "nber.org"]}))
+    src = make_source(FakeAnthropic([]))
+    assert src.allowed_domains == ["ssrn.com", "arxiv.org", "nber.org"]
+    assert all(t["allowed_domains"] == ["ssrn.com", "arxiv.org", "nber.org"] for t in src.tools())
+    # explicit arguments win; domains_from_config=False ignores the file
+    assert make_source(FakeAnthropic([]), blocked_domains=["reddit.com"]).allowed_domains is None
+    assert not any("allowed_domains" in t for t in make_source(FakeAnthropic([]), domains_from_config=False).tools())
+    monkeypatch.setenv(S.SOURCES_ENV, json.dumps({"web_blocked_domains": ["reddit.com"]}))
+    assert all(t["blocked_domains"] == ["reddit.com"] for t in make_source(FakeAnthropic([])).tools())
+    monkeypatch.setenv(S.SOURCES_ENV, json.dumps({"web_allowed_domains": ["a.com"], "web_blocked_domains": ["b.com"]}))
+    with pytest.raises(ValueError, match="sources.json"):
+        make_source(FakeAnthropic([]))
+    # no sources.json: no restriction
+    monkeypatch.delenv(S.SOURCES_ENV)
+    monkeypatch.setattr(S, "default_sources_path", lambda: tmp_path / "none.json")
+    assert make_source(FakeAnthropic([])).allowed_domains is None
 
 
 def test_echo_content_after_mid_output_fallback():

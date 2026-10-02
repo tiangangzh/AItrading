@@ -791,6 +791,17 @@ def test_strategy_page_shows_idea_holdings_trades_and_paper_vs_backtest():
     assert dates == sorted(dates, reverse=True) and dates[0] == "2023-11-30"
     assert "price for CCC is stale" in paper
     assert DISCLAIMER in page
+    assert "T-bill" not in paper  # no comparison note in the summary: none shown
+
+
+def test_strategy_page_shows_backtest_comparison_notes():
+    spec = TEMPLATES["low_volatility"].spec()
+    paper = make_paper()
+    paper["backtest_comparison_notes"] = ["The backtest credits the 1-month T-bill rate on idle cash & short proceeds."]
+    page = render_strategy_page("lowvol", spec, make_result(spec=spec), paper)
+    assert_well_formed(page)
+    section = page[page.index('id="paper"'):page.index('id="backtest"')]
+    assert "The backtest credits the 1-month T-bill rate on idle cash &amp; short proceeds." in section
 
 
 def test_strategy_page_expected_path_fallbacks_and_oldest_first_trades():

@@ -36,7 +36,7 @@ from aitrading.core.models import (
     RankedCandidate,
     TranscriptSegment,
 )
-from aitrading.llm.base import LLMError, LLMRefusalError, ScriptedLLM
+from aitrading.llm.base import LLMError, LLMOutputError, LLMRefusalError, ScriptedLLM
 from aitrading.screen.catalog import default_catalog
 from aitrading.screen.spec import Condition, RankFactor, ScreenSpec
 
@@ -636,6 +636,35 @@ def test_failed_repair_call_keeps_first_thesis():
     assert res.rounds == 2
     assert res.repair_error is not None and res.repair_error.startswith("LLMRefusalError")
     assert len(llm.kwargs) == 2  # no further repair attempt after a failure
+
+
+def _schema_error() -> Exception:
+    try:
+        DislocationThesis.model_validate({"ticker": "ACME"})
+    except Exception as e:  # pydantic ValidationError
+        return e
+    raise AssertionError("expected a ValidationError")
+
+
+@pytest.mark.parametrize("failure,kind", [
+    (LLMError("[explain:ACME:repair] output truncated at max_tokens=16000"), "LLMError"),
+    (LLMOutputError("[explain:ACME:repair] structured output does not validate"), "LLMOutputError"),
+    (_schema_error(), "ValidationError"),  # a custom StructuredLLM that lets pydantic's error escape
+])
+def test_truncated_or_invalid_repair_reply_keeps_first_thesis(failure, kind):
+    first = make_thesis(fcf=6.0)  # one failed check -> a repair round
+    llm = RecordingLLM([first, failure])
+    res = run(Explainer(llm, verifier=StubVerifier(), max_repair_rounds=2))
+    assert res.thesis == first and res.rounds == 2
+    assert res.repair_error is not None and res.repair_error.startswith(kind)
+
+
+def test_scripted_invalid_output_raises_llm_output_error():
+    llm = ScriptedLLM({"explain": lambda *a: {"ticker": "ACME"}})
+    with pytest.raises(LLMOutputError) as info:
+        run(Explainer(llm, verifier=StubVerifier()))
+    assert info.value.errors() and isinstance(info.value, LLMError)
+    assert llm.calls[-1].error.startswith("invalid_output")
 
 
 def test_verifier_exceptions_are_not_swallowed():

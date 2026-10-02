@@ -25,8 +25,9 @@ strings (category labels) are shown verbatim with whitespace collapsed.
 Errors
 ------
 ``LLMError`` / ``LLMRefusalError`` from the first call propagate to the caller. A failure in a
-repair call does not discard the first-round thesis: the best result so far is returned and the
-error is reported in ``ExplanationResult.repair_error``.
+repair call (an ``LLMError`` such as a truncated or schema-violating reply, or a raw pydantic
+``ValidationError`` from a custom ``StructuredLLM``) does not discard the first-round thesis: the
+best result so far is returned and the error is reported in ``ExplanationResult.repair_error``.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
+from pydantic import ValidationError
 
 from aitrading.agent.prompts import EXPLAINER_SYSTEM_PROMPT, FINAL_INSTRUCTIONS, NO_DOCUMENTS_NOTE, REPAIR_INSTRUCTIONS
 from aitrading.core.models import DislocationThesis, Document, GroundingReport, RankedCandidate
@@ -390,7 +392,7 @@ class Explainer:
             rounds += 1
             try:
                 retry = self._ask(f"explain:{ticker}:repair", user + "\n\n" + build_repair_prompt(thesis, report), ticker)
-            except LLMError as e:
+            except (LLMError, ValidationError) as e:  # keep the first-round thesis whatever the repair call did
                 repair_error = f"{type(e).__name__}: {e}"
                 break
             retry_report = self._verify(retry, documents, shown)

@@ -787,3 +787,132 @@ def test_llm_explanations_skipped_when_provider_forbids_external_llm(provider):
     assert r.survivors > 0 and all(i.thesis is None and i.error is None for i in r.ideas)
     assert any("explanations skipped" in w for w in r.warnings)
     assert llm.calls == []
+
+
+# --------------------------------------------------------------------------------------------
+# Adjusted prices at a past as_of: the price floor must not use later splits (review finding)
+# --------------------------------------------------------------------------------------------
+
+
+_ADJ_IDX = pd.bdate_range("2018-01-01", "2026-10-01")
+_SPLIT_DAY = pd.Timestamp("2024-06-10")
+
+
+class AdjustedProvider:
+    """Yahoo-style adjusted closes: SPLT traded at $40 throughout and split 10:1 on 2024-06-10, so its
+    adjusted closes before the split are $4; PLAIN trades at $40 and PENNY at $2 throughout."""
+
+    name = "fakeadj"
+
+    def __init__(self, prices_as_traded=None, estimates=False):
+        from aitrading.data.base import Capability
+
+        self.capabilities = {Capability.PRICES, Capability.FUNDAMENTALS} | ({Capability.ESTIMATES} if estimates else set())
+        self.boundary = DataBoundary(provider="fakeadj")
+        self.warnings: list[str] = []
+        self.pushed_specs: list[ScreenSpec] = []
+        if prices_as_traded is not None:
+            self.prices_as_traded = prices_as_traded
+        split = pd.Series(40.0, index=_ADJ_IDX).where(_ADJ_IDX >= _SPLIT_DAY, 4.0)
+        self.close = pd.DataFrame({"SPLT": split, "PLAIN": 40.0, "PENNY": 2.0}, index=_ADJ_IDX)
+        self.volume = pd.DataFrame({"SPLT": 5e6, "PLAIN": 5e5, "PENNY": 1e7}, index=_ADJ_IDX)
+
+    def get_universe(self, spec, as_of):
+        from aitrading.core import fields as F
+
+        tickers = list(self.close.columns)
+        n = len(tickers)
+        df = pd.DataFrame({F.NAME: tickers, F.GICS_SECTOR: ["Industrials"] * n, F.GICS_INDUSTRY: [None] * n,
+                           F.EXCHANGE: ["NYSE"] * n, F.COUNTRY: ["US"] * n, F.CURRENCY: ["USD"] * n,
+                           F.SECURITY_TYPE: ["common_stock"] * n, F.MARKET_CAP: [4e9] * n, F.VENDOR_ID: tickers},
+                          index=pd.Index(tickers, name="ticker"))
+        return df[F.UNIVERSE_COLUMNS]
+
+    def get_price_history(self, tickers, start, end):
+        from aitrading.data.base import PricePanel
+
+        m = (_ADJ_IDX >= pd.Timestamp(start)) & (_ADJ_IDX <= pd.Timestamp(end))
+        c = self.close.loc[m, tickers]
+        return PricePanel(c, c, c, c, self.volume.loc[m, tickers])
+
+    def get_benchmark_history(self, start, end, symbol=None):
+        m = (_ADJ_IDX >= pd.Timestamp(start)) & (_ADJ_IDX <= pd.Timestamp(end))
+        return self.close.loc[m, "PLAIN"]
+
+    def get_fundamentals(self, tickers, as_of):
+        from aitrading.core import fields as F
+        from aitrading.data.base import empty_frame
+
+        return empty_frame(F.FUNDAMENTAL_COLUMNS, tickers)
+
+    def get_estimates(self, tickers, as_of):
+        from aitrading.core import fields as F
+        from aitrading.data.base import empty_frame
+
+        est = empty_frame(F.ESTIMATE_COLUMNS, tickers)
+        est[F.TARGET_PRICE_MEAN] = 50.0
+        return est
+
+    def get_documents(self, *a, **k):
+        return []
+
+
+class AdjustedPushdownProvider(AdjustedProvider):
+    def pushdown_screen(self, spec, as_of):
+        self.pushed_specs.append(spec)
+        return PushdownResult(tickers=list(self.close.columns), query="SCREEN(adj)")
+
+
+_ADJ_CLOCK = lambda: datetime(2026, 10, 2, 15, tzinfo=timezone.utc)  # noqa: E731
+
+
+def _adj_spec(**universe) -> ScreenSpec:
+    return ScreenSpec(name="t", observation="x", universe=UniverseSpec(**universe),
+                      conditions=[Condition(feature="return_1m_pct", op=">", value=-50)],
+                      ranking=[RankFactor(feature="return_1m_pct", direction="higher_is_better")])
+
+
+def _adj_run(provider, as_of, spec=None):
+    pipe = ResearchPipeline(provider, None, None, out_dir=None, clock=_ADJ_CLOCK)
+    return pipe.run("x", as_of, spec=spec or _adj_spec(min_avg_dollar_volume_usd_mn=None))
+
+
+def test_price_floor_not_applied_on_adjusted_prices_at_a_past_date():
+    r = _adj_run(AdjustedProvider(), date(2019, 6, 3))
+    tickers = sorted(i.candidate.ticker for i in r.ideas)
+    assert tickers == ["PENNY", "PLAIN", "SPLT"]  # SPLT traded at $40 then; its $4 is a 2024 split restatement
+    step = next(s for s in r.funnel if s.label.startswith("price >= 5"))
+    assert "NOT APPLIED" in step.label and step.remaining == 3 and step.missing_data == 0
+    assert any("price floor (universe min_price $5) not applied" in w and "2026-10-01" in w for w in r.warnings)
+
+
+def test_price_floor_applies_at_the_latest_data_date_and_on_as_traded_prices():
+    current = _adj_run(AdjustedProvider(), date(2026, 10, 1))
+    assert sorted(i.candidate.ticker for i in current.ideas) == ["PLAIN", "SPLT"]  # PENNY trades at $2
+    assert any(s.label == "price >= 5" for s in current.funnel)
+    assert not any("price floor" in w for w in current.warnings)
+    traded = _adj_run(AdjustedProvider(prices_as_traded=True), date(2019, 6, 3))
+    assert sorted(i.candidate.ticker for i in traded.ideas) == ["PLAIN"]  # declared as traded: $4 and $2 are real
+    assert not any("price floor" in w for w in traded.warnings)
+
+
+def test_suspended_price_floor_is_not_pushed_down_or_described_to_the_explainer():
+    pp = AdjustedPushdownProvider()
+    spy = SpyExplainer()
+    pipe = ResearchPipeline(pp, None, spy, out_dir=None, clock=_ADJ_CLOCK, explain_top_k=1)
+    r = pipe.run("x", date(2019, 6, 3), spec=_adj_spec(min_avg_dollar_volume_usd_mn=None))
+    assert pp.pushed_specs[0].universe.min_price is None
+    assert spy.calls and spy.calls[0]["spec"].universe.min_price is None
+    assert r.spec["universe"]["min_price"] == 5.0  # the reported spec is the user's
+    assert sorted(i.candidate.ticker for i in r.ideas) == ["PENNY", "PLAIN", "SPLT"]
+
+
+def test_adjusted_past_date_flags_liquidity_and_per_share_ratios():
+    spec = _adj_spec()  # default liquidity floor
+    r = ResearchPipeline(AdjustedProvider(estimates=True), None, None, out_dir=None, clock=_ADJ_CLOCK).run(
+        "x", date(2019, 6, 3), spec=spec)
+    assert any("dollar volume at 2019-06-03 is computed from dividend-adjusted closes" in w for w in r.warnings)
+    assert any(w.startswith("target_price_upside_pct") and "not point-in-time" in w for w in r.warnings)
+    now = ResearchPipeline(AdjustedProvider(estimates=True), None, None, out_dir=None, clock=_ADJ_CLOCK).run(
+        "x", date(2026, 10, 1), spec=spec)
+    assert not any("dividend-adjusted" in w or "not point-in-time" in w for w in now.warnings)

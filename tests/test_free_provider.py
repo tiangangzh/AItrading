@@ -689,6 +689,51 @@ def test_universe_columns_market_cap_and_spec_filters(tmp_path):
     assert sum(yf.info_calls.values()) == 4  # info fetched once per ticker, then memo / disk cache
 
 
+def test_universe_fails_fast_when_yahoo_is_unreachable(tmp_path):
+    """No network (or a proxy refusing the tunnel): every quote request fails with a network error. The
+    universe raises ProviderUnavailable at once with connection guidance instead of degrading to NaN and
+    letting the price downloads time out and retry for minutes before failing the same way."""
+
+    class OfflineYF(FakeYF):
+        def Ticker(self, sym):  # noqa: N802 - mirrors yfinance
+            t = FakeTicker(self, sym)
+
+            class _T:
+                ticker = t.ticker
+
+                @property
+                def info(self):
+                    raise ConnectionError("Failed to perform, curl: (7) CONNECT tunnel failed, response 403")
+
+            return _T()
+
+    yf = OfflineYF(universe_yf().frames, universe_yf().specs)
+    p = make_provider(tmp_path, yf=yf, tickers=["ACME", "BETA"])
+    with pytest.raises(ProviderUnavailable, match="Cannot reach Yahoo Finance.*HTTPS_PROXY"):
+        p.get_universe(UniverseSpec(), TODAY)
+    assert yf.download_calls == []  # no price download was attempted
+    # a quote Yahoo itself rejects (not a network error) still degrades to NaN, as before
+    p2 = make_provider(tmp_path / "b", yf=FakeYF({}, {}), tickers=["ACME", "BETA"])
+    u = p2.get_universe(UniverseSpec(), TODAY)
+    assert list(u.index) == ["ACME", "BETA"] and any("Yahoo quote info (universe): failed" in w for w in p2.warnings)
+
+
+def test_historical_universe_warns_about_survivorship_bias(tmp_path):
+    p = make_provider(tmp_path, yf=universe_yf(), tickers=["ACME", "BETA"])
+    p.get_universe(UniverseSpec(), TODAY)
+    p.get_universe(UniverseSpec(), date(2026, 9, 28))  # within the staleness window: today's list is fine
+    assert not any("SURVIVORSHIP" in w for w in p.warnings)
+    p.get_universe(UniverseSpec(), date(2022, 6, 1))
+    p.get_universe(UniverseSpec(), date(2023, 6, 30))  # a backtest asks at many past dates: one warning
+    surv = [w for w in p.warnings if "SURVIVORSHIP BIAS" in w]
+    assert len(surv) == 1 and "your ticker list (2 names)" in surv[0] and "delisted" in surv[0]
+
+    starter = FreeDataProvider(cache=DiskCache(tmp_path / "s"), sec=make_sec(tmp_path / "s")[0], yf_module=FakeYF(),
+                               today=lambda: TODAY, sleep=lambda _s: None)
+    starter._survivorship_warning()
+    assert any("bundled starter list" in w for w in starter.warnings)
+
+
 def test_price_panel_multi_and_single_ticker_layout(tmp_path):
     frames = {"ACME": price_frame("ACME"), "BETA": price_frame("BETA"), "BRK-B": price_frame("BRK-B"), "BAD": None}
     yf = FakeYF(frames)
@@ -1229,6 +1274,11 @@ def test_market_cap_for_adrs_and_multi_class_filers(tmp_path):
     assert u.loc["GIDX", F.MARKET_CAP] == pytest.approx(price_frame("GIDX").loc["2026-08-14", "Close"] * 2.16e9)
     assert any("BETA" in w and "20-F" in w for w in p.warnings)
     assert any("GIDX" in w and "share classes" in w for w in p.warnings)
+    # Yahoo's share counts are today's: at a historical as_of the snapshot lists those names, so a
+    # backtest reports their caps as not point-in-time; at today's date nothing is flagged.
+    from aitrading.backtest.runner import MCAP_CURRENT_SHARES_ATTR
+    assert sorted(u.attrs[MCAP_CURRENT_SHARES_ATTR]) == ["BETA", "GIDX"]
+    assert MCAP_CURRENT_SHARES_ATTR not in p.get_universe(None, TODAY).attrs
     # Near-equal classes (GOOGL-like): Yahoo's implied count agrees, so the point-in-time SEC sum is kept.
     from aitrading.data.sec_edgar import SharesInfo
     caps = p._market_caps(["GIDX"], date(2026, 8, 15), {"GIDX": {"impliedSharesOutstanding": 1.31e9}},
