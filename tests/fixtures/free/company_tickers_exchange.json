@@ -1,0 +1,28 @@
+{
+ "fields": [
+  "cik",
+  "name",
+  "ticker",
+  "exchange"
+ ],
+ "data": [
+  [
+   1234567,
+   "Acme Widgets Inc.",
+   "ACME",
+   "NYSE"
+  ],
+  [
+   7654321,
+   "Beta Robotics Corp.",
+   "BETA",
+   "Nasdaq"
+  ],
+  [
+   1111111,
+   "Gamma Index Trust",
+   "GIDX",
+   "NYSE"
+  ]
+ ]
+}

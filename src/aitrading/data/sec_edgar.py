@@ -79,6 +79,14 @@ class SecNotFound(ProviderError):
     """The SEC has no such resource (HTTP 404), e.g. a company without XBRL financial data."""
 
 
+class SecUnsupported(SecNotFound):
+    """The filer's XBRL data exists but cannot be used (IFRS statements, or US-GAAP in a non-USD currency)."""
+
+    def __init__(self, message: str, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason or message
+
+
 # =============================================================================================
 # Rate limiting
 # =============================================================================================
@@ -228,13 +236,16 @@ def _reduce_submissions(sub: dict) -> dict:
 # XBRL companyfacts -> point-in-time quarterly series
 # =============================================================================================
 
-Q_MIN, Q_MAX = 80, 100  # quarter duration (end - start) in days; 13/14-week quarters included
+Q_MIN, Q_MAX = 80, 115  # quarter duration (end - start) in days: 13/14-week quarters and 16-week Q1s
 FY_MIN, FY_MAX = 350, 380  # fiscal year (52/53-week years included)
 _ONE = timedelta(days=1)
 
+# ``Revenues`` (total revenue: includes lease, interest, premium and other non-ASC 606 income) comes first;
+# the ASC 606 tags cover contract-with-customer revenue only, a subset for REITs, utilities, banks and
+# insurers, so they are used only when ``Revenues`` is not reported (or not current).
 REVENUE_CONCEPTS = [
-    "RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet",
-    "RevenueFromContractWithCustomerIncludingAssessedTax",
+    "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet",
 ]
 GROSS_PROFIT_CONCEPTS = ["GrossProfit"]
 COST_OF_REVENUE_CONCEPTS = ["CostOfRevenue", "CostOfGoodsAndServicesSold"]
@@ -249,31 +260,71 @@ EQUITY_CONCEPTS = ["StockholdersEquity", "StockholdersEquityIncludingPortionAttr
 LTD_TOTAL = "LongTermDebt"  # includes current maturities
 LTD_PARTS = [("LongTermDebtNoncurrent", "LongTermDebtCurrent"),
              ("LongTermDebtAndCapitalLeaseObligations", "LongTermDebtAndCapitalLeaseObligationsCurrent")]
-SHORT_TERM_DEBT_CONCEPTS = ["ShortTermBorrowings", "CommercialPaper"]
+SHORT_TERM_DEBT_CONCEPTS = ["ShortTermBorrowings", "CommercialPaper"]  # CP is often inside ShortTermBorrowings
+DEBT_CURRENT = "DebtCurrent"  # short-term borrowings + current maturities of long-term debt
+# Debt tagged with other standard concepts, used only when none of the LongTermDebt* tags is on the current
+# balance sheet. Each group is one kind of debt (summed across groups); within a group the first alternative
+# found wins; within an alternative the present concepts are added (noncurrent + current portion).
+OTHER_DEBT_GROUPS: list[list[tuple[str, ...]]] = [
+    [("ConvertibleNotesPayable",), ("ConvertibleLongTermNotesPayable", "ConvertibleNotesPayableCurrent")],
+    [("NotesPayable",), ("LongTermNotesPayable", "NotesPayableCurrent"), ("SeniorNotes",)],
+    [("LongTermLineOfCredit",)],
+    [("OtherLongTermDebt",), ("OtherLongTermDebtNoncurrent", "OtherLongTermDebtCurrent")],
+]
+DEBT_CONCEPTS = [LTD_TOTAL, *(c for pair in LTD_PARTS for c in pair), *SHORT_TERM_DEBT_CONCEPTS, DEBT_CURRENT,
+                 *(c for group in OTHER_DEBT_GROUPS for alt in group for c in alt)]
 DILUTED_SHARES = "WeightedAverageNumberOfDilutedSharesOutstanding"
 DEI_SHARES = "EntityCommonStockSharesOutstanding"
 
 USGAAP_CONCEPTS = sorted({
     *REVENUE_CONCEPTS, *GROSS_PROFIT_CONCEPTS, *COST_OF_REVENUE_CONCEPTS, *OPERATING_INCOME_CONCEPTS,
     *NET_INCOME_CONCEPTS, *CFO_CONCEPTS, *CAPEX_CONCEPTS, *DA_CONCEPTS, *INTEREST_CONCEPTS, *CASH_CONCEPTS,
-    *EQUITY_CONCEPTS, LTD_TOTAL, *(c for pair in LTD_PARTS for c in pair), *SHORT_TERM_DEBT_CONCEPTS, DILUTED_SHARES,
+    *EQUITY_CONCEPTS, *DEBT_CONCEPTS, DILUTED_SHARES,
 })
 DEI_CONCEPTS = [DEI_SHARES]
+FOREIGN_FORMS = ("20-F", "40-F", "6-K")  # foreign private issuers: cover page counts ordinary shares, not ADSs
 
 
 def reduce_companyfacts(cf: dict) -> dict:
-    """Keep only the concepts this module reads (companyfacts can be 10+ MB for large filers)."""
+    """Keep only the concepts this module reads (companyfacts can be 10+ MB for large filers).
+
+    ``taxonomies`` records which taxonomies the filer uses (e.g. ``ifrs-full``) so IFRS filers can be
+    recognised after the unused taxonomies are dropped.
+    """
     facts = cf.get("facts") or {}
     gaap = facts.get("us-gaap") or {}
     dei = facts.get("dei") or {}
     return {
         "cik": cf.get("cik"),
         "entityName": cf.get("entityName"),
+        "taxonomies": sorted(facts),
         "facts": {
             "us-gaap": {k: {"units": gaap[k].get("units", {})} for k in USGAAP_CONCEPTS if k in gaap},
             "dei": {k: {"units": dei[k].get("units", {})} for k in DEI_CONCEPTS if k in dei},
         },
     }
+
+
+def _taxonomies(cf: dict) -> set[str]:
+    return set(cf.get("taxonomies") or (cf.get("facts") or {}).keys())
+
+
+def ifrs_only(cf: dict) -> bool:
+    """True for filers whose financial statements are IFRS XBRL (``ifrs-full``) with no US-GAAP facts."""
+    gaap = ((cf.get("facts") or {}).get("us-gaap")) or {}
+    return "ifrs-full" in _taxonomies(cf) and not gaap
+
+
+def unsupported_reason(cf: dict) -> str | None:
+    """Why this filer's fundamentals cannot be read (IFRS, or US-GAAP in another currency); None if fine."""
+    if ifrs_only(cf):
+        return "files IFRS financial statements (Form 20-F/40-F); only US-GAAP XBRL is read"
+    gaap = ((cf.get("facts") or {}).get("us-gaap")) or {}
+    money = {u for node in gaap.values() for u in ((node or {}).get("units") or {})
+             if "/" not in u and u not in ("shares", "pure")}
+    if money and "USD" not in money:
+        return f"reports its US-GAAP figures in {', '.join(sorted(money))}, not USD"
+    return None
 
 
 @dataclass(frozen=True)
@@ -342,48 +393,98 @@ def _find(quarters: dict[date, Quarter], target: date, tol_days: int) -> Quarter
     return best
 
 
-def quarterly_series(facts: Iterable[Fact], as_of: date) -> dict[date, Quarter]:
-    """Point-in-time discrete quarterly values (keyed by quarter end) for one duration concept.
+def _versions(facts: Iterable[Fact], as_of: date, *, durations: bool) -> dict[tuple, list[Fact]]:
+    """(start, end) -> every version of that period filed on/before ``as_of``, oldest first."""
+    out: dict[tuple, list[Fact]] = defaultdict(list)
+    for f in facts:
+        if f.filed > as_of or (f.start is None) == durations:
+            continue
+        out[(f.start, f.end)].append(f)
+    for k in out:
+        out[k].sort(key=lambda f: (f.filed, f.accn))
+    return out
 
-    1. Only facts filed on/before ``as_of``; for a period reported several times (original filing,
-       comparatives, restatements) the latest filing wins.
-    2. ~3-month facts are quarters directly.
-    3. Year-to-date facts (3/6/9/12 months from the same fiscal-year start, typical for cash-flow
-       items in 10-Qs) are differenced: quarter ending E = YTD(E) - YTD(previous quarter end). This
-       also derives Q4 = FY - 9M.
-    4. If a fiscal year has no 9-month YTD, Q4 = FY - (Q1 + Q2 + Q3).
-    Directly reported quarters take precedence over derived ones.
+
+def _vintage(versions: list[Fact], cutoff: date, accn: str | None = None) -> Fact | None:
+    """Latest version filed on/before ``cutoff``, preferring the one in filing ``accn`` (same document)."""
+    cands = [f for f in versions if f.filed <= cutoff]
+    if not cands:
+        return None
+    if accn:
+        same = [f for f in cands if f.accn == accn]
+        if same:
+            return same[-1]
+    return cands[-1]
+
+
+def _base_quarters(vers: dict[tuple, list[Fact]], cutoff: date) -> dict[date, Quarter]:
+    """Direct ~3-month quarters plus YTD differences, using only versions filed on/before ``cutoff``.
+
+    A difference YTD(E1) - YTD(E0) takes the later YTD's latest version and the earlier YTD's version
+    from the same vintage (same filing if it has one, else the latest filed no later than it), so a
+    recast comparative is never subtracted from an unrestated total or vice versa.
     """
-    best, first = _latest_by_period(facts, as_of, durations=True)
+    best = {k: f for k, vs in vers.items() if (f := _vintage(vs, cutoff)) is not None}
+    first = {k: vs[0].filed for k, vs in vers.items()}
     out: dict[date, Quarter] = {}
     for (s, e), f in sorted(best.items(), key=lambda kv: (kv[0][1], kv[0][0])):
         if Q_MIN <= (e - s).days <= Q_MAX and _find(out, e, 3) is None:
             out[e] = Quarter(s, e, f.val, f.filed, first[(s, e)], False)
 
-    by_start: dict[date, list[tuple[date, Fact, date]]] = defaultdict(list)
-    for (s, e), f in best.items():
+    by_start: dict[date, list[date]] = defaultdict(list)
+    for (s, e) in best:
         if (e - s).days <= FY_MAX:
-            by_start[s].append((e, f, first[(s, e)]))
+            by_start[s].append(e)
     for s in sorted(by_start):
-        items = sorted(by_start[s], key=lambda x: x[0])
-        for (e0, f0, ff0), (e1, f1, ff1) in zip(items, items[1:]):
-            if Q_MIN <= (e1 - e0).days <= Q_MAX and _find(out, e1, 3) is None:
-                out[e1] = Quarter(e0 + _ONE, e1, f1.val - f0.val, max(f0.filed, f1.filed), max(ff0, ff1), True)
+        ends = sorted(by_start[s])
+        for e0, e1 in zip(ends, ends[1:]):
+            if not (Q_MIN <= (e1 - e0).days <= Q_MAX) or _find(out, e1, 3) is not None:
+                continue
+            f1 = best[(s, e1)]
+            f0 = _vintage(vers[(s, e0)], f1.filed, f1.accn) or best[(s, e0)]
+            out[e1] = Quarter(e0 + _ONE, e1, f1.val - f0.val, max(f0.filed, f1.filed),
+                              max(first[(s, e0)], first[(s, e1)]), True)
+    return out
 
-    for (s, e), f in sorted(best.items(), key=lambda kv: kv[0][1]):
+
+def quarterly_series(facts: Iterable[Fact], as_of: date) -> dict[date, Quarter]:
+    """Point-in-time discrete quarterly values (keyed by quarter end) for one duration concept.
+
+    1. Only facts filed on/before ``as_of``; for a period reported several times (original filing,
+       comparatives, restatements) the latest filing wins.
+    2. ~3-month facts (80-115 days, so 16-week first quarters count) are quarters directly.
+    3. Year-to-date facts (3/6/9/12 months from the same fiscal-year start, typical for cash-flow
+       items in 10-Qs) are differenced: quarter ending E = YTD(E) - YTD(previous quarter end). This
+       also derives Q4 = FY - 9M.
+    4. If a fiscal year has no 9-month YTD, Q4 = FY - (Q1 + Q2 + Q3).
+    Directly reported quarters take precedence over derived ones.
+
+    Derivations never mix restatement vintages: the parts subtracted from a YTD or fiscal-year total are
+    the versions that were current when that total was filed. Example: FY 400 filed in February; later
+    10-Qs recast the prior-year 9M from 300 to 225 (discontinued operations) while the FY stays
+    unrestated until the next 10-K -> Q4 = 400 - 300 = 100 (as reported), not 400 - 225 = 175.
+    """
+    vers = _versions(facts, as_of, durations=True)
+    out = _base_quarters(vers, as_of)
+    at_cutoff: dict[date, dict[date, Quarter]] = {}
+    for (s, e), vs in sorted(vers.items(), key=lambda kv: kv[0][1]):
         if not (FY_MIN <= (e - s).days <= FY_MAX) or _find(out, e, 3) is not None:
             continue
+        f = vs[-1]
+        base = at_cutoff.get(f.filed)
+        if base is None:
+            base = at_cutoff[f.filed] = _base_quarters(vers, f.filed)
         chain: list[Quarter] = []
         cursor = s
         for _ in range(3):
-            nxt = next((q for q in out.values() if abs((q.start - cursor).days) <= 5 and q.end < e), None)
+            nxt = next((q for q in base.values() if abs((q.start - cursor).days) <= 5 and q.end < e), None)
             if nxt is None:
                 break
             chain.append(nxt)
             cursor = nxt.end + _ONE
         if len(chain) == 3 and Q_MIN <= (e - chain[-1].end).days <= Q_MAX + 1:
             out[e] = Quarter(chain[-1].end + _ONE, e, f.val - sum(q.value for q in chain),
-                             max([f.filed, *(q.filed for q in chain)]), max([first[(s, e)], *(q.first_filed for q in chain)]), True)
+                             max([f.filed, *(q.filed for q in chain)]), max([vs[0].filed, *(q.first_filed for q in chain)]), True)
     return dict(sorted(out.items()))
 
 
@@ -455,64 +556,114 @@ def _first_current_instant(cf: dict, concepts: list[str], as_of: date) -> tuple[
     return next(x for x in found if x[0] >= latest - timedelta(days=7))
 
 
+def balance_sheet_date(cf: dict, as_of: date) -> date | None:
+    """Date of the latest balance sheet public on ``as_of``: latest equity / cash instant, else latest debt instant."""
+    for group in (EQUITY_CONCEPTS + CASH_CONCEPTS, DEBT_CONCEPTS):
+        ends = [x[0] for x in (latest_instant(facts_for(cf, c), as_of) for c in group) if x is not None]
+        if ends:
+            return max(ends)
+    return None
+
+
 def total_debt(cf: dict, as_of: date) -> float:
-    """LongTermDebt (incl. current maturities; else noncurrent + current) + short-term borrowings.
+    """Total debt on the latest balance sheet public on ``as_of`` (NaN when no debt concept is tagged there).
 
-    If the company has a balance sheet but never tagged any debt concept, debt is taken as 0.
+    Only values dated on that balance sheet (within 7 days) count: a tag the company stopped using, or a
+    borrowing repaid and no longer tagged, is never carried forward. Composition, first match wins:
+
+    1. ``LongTermDebt`` (incl. current maturities) + short-term borrowings (``ShortTermBorrowings`` or
+       ``CommercialPaper``; else ``DebtCurrent`` minus ``LongTermDebtCurrent``).
+    2. ``LongTermDebtNoncurrent`` (or the capital-lease variant) + the current part: ``DebtCurrent``
+       when tagged (it already contains short-term borrowings and current maturities), else current
+       maturities + short-term borrowings.
+    3. Other standard debt tags (convertible notes, notes payable / senior notes, long-term line of
+       credit, other long-term debt), one value per kind, plus ``DebtCurrent`` or short-term borrowings.
+
+    No debt concept on the balance sheet -> NaN (unknown), never an invented 0. An explicitly tagged 0
+    is a real 0.
     """
-    cands: list[tuple[date, float]] = []
-    lt = latest_instant(facts_for(cf, LTD_TOTAL), as_of)
-    if lt:
-        cands.append(lt)
+    bs = balance_sheet_date(cf, as_of)
+    if bs is None:
+        return math.nan
+
+    def v(concept: str) -> float | None:
+        return instant_at(facts_for(cf, concept), as_of, bs)
+
+    stb = next((x for x in (v(c) for c in SHORT_TERM_DEBT_CONCEPTS) if x is not None), None)
+    dc = v(DEBT_CURRENT)
+    ltd = v(LTD_TOTAL)
+    if ltd is not None:
+        short = stb
+        if short is None and dc is not None:
+            cm = v("LongTermDebtCurrent")
+            if cm is not None and dc >= cm:
+                short = dc - cm
+        return ltd + (short or 0.0)
     for noncur, cur in LTD_PARTS:
-        nc = latest_instant(facts_for(cf, noncur), as_of)
-        if nc:
-            cur_val = instant_at(facts_for(cf, cur), as_of, nc[0]) or 0.0
-            cands.append((nc[0], nc[1] + cur_val))
-        else:
-            c = latest_instant(facts_for(cf, cur), as_of)
-            if c:
-                cands.append(c)
-    long_term: tuple[date, float] | None = None
-    if cands:  # the most recent balance-sheet date wins; ties keep priority order
-        latest = max(e for e, _ in cands)
-        long_term = next(x for x in cands if x[0] == latest)
-    ref_end = long_term[0] if long_term else None
-
-    short = 0.0
-    found_short = False
-    for concept in SHORT_TERM_DEBT_CONCEPTS:
-        st = latest_instant(facts_for(cf, concept), as_of)
-        if st and (ref_end is None or st[0] >= ref_end - timedelta(days=100)):
-            short = st[1]
-            found_short = True
-            break
-    if long_term is None and not found_short:
-        has_bs = any(_first_current_instant(cf, cs, as_of) for cs in (EQUITY_CONCEPTS, CASH_CONCEPTS))
-        return 0.0 if has_bs else math.nan
-    return (long_term[1] if long_term else 0.0) + short
+        nc = v(noncur)
+        if nc is not None:
+            parts = (v(cur) or 0.0) + (stb or 0.0)
+            return nc + (max(dc, parts) if dc is not None else parts)
+    total, found = 0.0, False
+    for group in OTHER_DEBT_GROUPS:
+        for alt in group:
+            # With DebtCurrent tagged, current portions are inside it: use only the first (total/noncurrent) tag.
+            vals = [x for x in (v(c) for c in (alt[:1] if dc is not None else alt)) if x is not None]
+            if vals:
+                total += sum(vals)
+                found = True
+                break
+    if dc is not None:
+        return total + dc
+    if stb is not None:
+        return total + stb
+    return total if found else math.nan
 
 
-def shares_outstanding(cf: dict, as_of: date) -> float:
-    """dei cover-page shares from the latest filing on/before ``as_of`` (all classes summed);
-    else the latest quarterly weighted-average diluted share count."""
+@dataclass(frozen=True)
+class SharesInfo:
+    """Share count used for market cap, with the facts needed to put it on the right basis."""
+
+    value: float
+    basis_date: date | None  # date the count refers to (dei cover-page date, or the diluted-share period end)
+    source: str  # "dei" (cover page) or "diluted" (weighted-average diluted shares)
+    form: str  # form of the filing that reported it ("10-Q", "10-K", "20-F", ...)
+    n_classes: int = 1  # dei values summed (one per share class)
+    ifrs: bool = False  # the filer's statements are IFRS
+
+    @property
+    def foreign_issuer(self) -> bool:
+        """20-F/40-F/6-K filer (or IFRS): its cover page counts ordinary shares, not the ADSs that trade in the US."""
+        return self.ifrs or self.form.upper().startswith(FOREIGN_FORMS)
+
+
+def shares_info(cf: dict, as_of: date) -> SharesInfo | None:
+    """dei cover-page shares from the latest filing on/before ``as_of`` (all classes summed); else the
+    latest quarterly weighted-average diluted share count. None if neither is reported."""
+    ifrs = ifrs_only(cf)
     dei = [f for f in facts_for(cf, DEI_SHARES, "dei", "shares") if f.filed <= as_of and f.start is None]
     if dei:
         last = max((f.filed, f.accn) for f in dei)
         in_filing = [f for f in dei if (f.filed, f.accn) == last]
         end = max(f.end for f in in_filing)
-        vals = {f.val for f in in_filing if f.end == end}
+        vals = [f.val for f in in_filing if f.end == end]  # a list: two classes may have equal counts
         total = float(sum(vals))
         if total > 0:
-            return total
+            return SharesInfo(total, end, "dei", in_filing[0].form, len(vals), ifrs)
     dil = facts_for(cf, DILUTED_SHARES, "us-gaap", "shares")
     best, _ = _latest_by_period(dil, as_of, durations=True)
     if best:
         quarterly = {k: f for k, f in best.items() if Q_MIN <= (k[1] - k[0]).days <= Q_MAX}
         pool = quarterly or best
-        (_, _), f = max(pool.items(), key=lambda kv: kv[0][1])
-        return float(f.val)
-    return math.nan
+        (_, end), f = max(pool.items(), key=lambda kv: kv[0][1])
+        return SharesInfo(float(f.val), end, "diluted", f.form, 1, ifrs)
+    return None
+
+
+def shares_outstanding(cf: dict, as_of: date) -> float:
+    """Share count from :func:`shares_info` (as of its own date, not split-adjusted); NaN if unknown."""
+    si = shares_info(cf, as_of)
+    return si.value if si is not None else math.nan
 
 
 def _ts(d: date | None) -> pd.Timestamp:
@@ -760,7 +911,8 @@ def pick_press_release(items: list[dict], primary_document: str = "") -> tuple[s
     for it in items or []:
         name = str(it.get("name") or "")
         low = name.lower()
-        if not low.endswith(_DOC_EXT) or "index" in low or re.match(r"^r\d+\.htm$", low):
+        if (not low.endswith(_DOC_EXT) or "index" in low or re.match(r"^r\d+\.htm$", low)
+                or re.match(r"^\d{10}-\d{2}-\d{6}", low)):  # XBRL viewer pages, full-submission .txt
             continue
         ext_rank = 0 if low.endswith((".htm", ".html")) else 1
         m = _EX99_RE.search(low)
@@ -797,25 +949,44 @@ _MDNA_PATTERNS = {
 }
 
 
+_HEADING_PREFIX_RE = re.compile(r"(?:part\s+i{1,2}\b\W*(?:financial\s+information\W*)?)?", re.I)
+_MIN_MDNA_CHARS = 500
+
+
+def _is_heading(text: str, pos: int) -> bool:
+    """True if ``pos`` starts a line (optionally after a 'Part I' label): a heading, not an inline cross-reference."""
+    line_start = text.rfind("\n", 0, pos) + 1
+    return bool(_HEADING_PREFIX_RE.fullmatch(text[line_start:pos].strip()))
+
+
 def extract_mdna(text: str, form: str, max_chars: int = MAX_DOC_CHARS) -> str | None:
     """MD&A section (10-Q Item 2 / 10-K Item 7) from a filing's plain text.
 
-    Heuristic: among all "Item 2/7 ... Management's Discussion and Analysis" headings take the one that
-    starts the longest section before the next Item 3/4 (10-Q) or Item 7A/8 (10-K) heading - the table
-    of contents and cross-references produce short spans. Capped at ``max_chars`` on a paragraph
-    boundary. None if no plausible section is found.
+    Heuristic over all "Item 2/7 ... Management's Discussion and Analysis" matches, each spanning to the
+    next Item 3/4 / Part II (10-Q) or Item 7A/8 (10-K) heading:
+
+    * spans shorter than 500 characters (table-of-contents entries) are ignored;
+    * a match at the start of a line (a heading) beats an inline one ("see Item 2. Management's
+      Discussion and Analysis" in the notes or the risk factors);
+    * a span closed by an end heading beats an open-ended one (a cross-reference in Part II or under
+      Item 8 has no end heading after it and would otherwise run on for ``2 x max_chars``);
+    * then the longest span wins.
+
+    Capped at ``max_chars`` on a paragraph boundary. None if no plausible section is found.
     """
     key = "10-K" if form.upper().startswith("10-K") else "10-Q"
     start_re, end_re = _MDNA_PATTERNS[key]
-    best: tuple[int, int] | None = None
+    cands: list[tuple[tuple[bool, bool, int], int, int]] = []
     for m in start_re.finditer(text):
         end_m = end_re.search(text, m.end())
         end = end_m.start() if end_m else min(len(text), m.start() + max_chars * 2)
-        if best is None or end - m.start() > best[1] - best[0]:
-            best = (m.start(), end)
-    if best is None or best[1] - best[0] < 500:
+        if end - m.start() < _MIN_MDNA_CHARS:
+            continue
+        cands.append(((_is_heading(text, m.start()), end_m is not None, end - m.start()), m.start(), end))
+    if not cands:
         return None
-    section = text[best[0]: best[1]].strip()
+    _, start, end = max(cands, key=lambda c: c[0])
+    section = text[start:end].strip()
     if len(section) > max_chars:
         cut = section.rfind("\n\n", 0, max_chars)
         section = section[: cut if cut > max_chars // 2 else max_chars].rstrip()
@@ -1107,20 +1278,41 @@ class SecEdgarClient:
 
     # ------------------------------------------------------------------ high level
     def fundamentals(self, ticker: str, as_of: date) -> dict[str, Any]:
+        """Fundamentals row; raises ``SecUnsupported`` for IFRS filers and non-USD US-GAAP filers."""
         ref = self._require(ticker)
-        return fundamentals_from_companyfacts(self.company_facts(ref.cik), as_of)
+        cf = self.company_facts(ref.cik)
+        reason = unsupported_reason(cf)
+        if reason:
+            raise SecUnsupported(f"{ticker}: {reason}", reason)
+        return fundamentals_from_companyfacts(cf, as_of)
 
     def shares_outstanding(self, ticker: str, as_of: date) -> float:
         ref = self._require(ticker)
         return shares_outstanding(self.company_facts(ref.cik), as_of)
 
-    def last_earnings_release_date(self, ticker: str, as_of: date) -> date | None:
-        """Filing date of the latest 8-K item 2.02 filed on/before ``as_of`` (point-in-time)."""
+    def shares_info(self, ticker: str, as_of: date) -> SharesInfo | None:
+        """Share count plus its date, form and number of classes (see :func:`shares_info`)."""
         ref = self._require(ticker)
-        for f in self.filings(ref.cik, start=as_of - timedelta(days=200), end=as_of, forms={"8-K", "8-K/A"}):
+        return shares_info(self.company_facts(ref.cik), as_of)
+
+    def last_earnings_release_date(self, ticker: str, as_of: date) -> date | None:
+        """Filing date of the latest original 8-K with item 2.02 filed on/before ``as_of`` (point-in-time).
+
+        8-K/A amendments (a corrected exhibit or an added reconciliation, filed days or weeks later) are
+        not the release event and are ignored.
+        """
+        ref = self._require(ticker)
+        for f in self.filings(ref.cik, start=as_of - timedelta(days=200), end=as_of, forms={"8-K"}):
             if f.is_earnings_release:
                 return f.filing_date
         return None
+
+    @staticmethod
+    def _amends_known_release(f: Filing, originals: list[Filing]) -> bool:
+        """An 8-K/A item 2.02 whose original release is known (same report date, or filed up to 45 days before)."""
+        ref_day = f.report_date or f.filing_date
+        return any((o.report_date or o.filing_date) == ref_day
+                   or timedelta(0) <= f.filing_date - o.filing_date <= timedelta(days=45) for o in originals)
 
     def documents(self, ticker: str, kinds: set[DocumentKind], start: date, end: date, limit: int = 10,
                   warn: Callable[[str], None] | None = None) -> list[Document]:
@@ -1139,14 +1331,21 @@ class SecEdgarClient:
             forms |= {"8-K", "8-K/A"}
         if want_filing:
             forms |= {"10-Q", "10-K", "10-KT"}
+        lookback = timedelta(days=60) if want_news else timedelta(0)  # to recognise amendments of earlier releases
+        listed = self.filings(ref.cik, start=start - lookback, end=end, forms=forms)
+        originals = [f for f in listed if f.form == "8-K" and f.is_earnings_release]
         docs: list[Document] = []
-        for f in self.filings(ref.cik, start=start, end=end, forms=forms):
+        for f in listed:
             if len(docs) >= limit:
                 break
+            if f.filing_date < start:
+                continue
             try:
                 if f.form.startswith("8-K"):
                     if not f.is_earnings_release:
                         continue
+                    if f.form != "8-K" and self._amends_known_release(f, originals):
+                        continue  # same quarter's release already covered by the original 8-K
                     doc = self._earnings_release_doc(ticker, company, fye, f)
                 else:
                     doc = self._mdna_doc(ticker, company, fye, f)

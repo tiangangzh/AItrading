@@ -1,0 +1,62 @@
+{
+ "directory": {
+  "item": [
+   {
+    "last-modified": "2026-07-28 16:05:12",
+    "name": "0001234567-26-000031-index-headers.html",
+    "type": "text.gif",
+    "size": ""
+   },
+   {
+    "last-modified": "2026-07-28 16:05:12",
+    "name": "0001234567-26-000031-index.html",
+    "type": "text.gif",
+    "size": ""
+   },
+   {
+    "last-modified": "2026-07-28 16:05:12",
+    "name": "0001234567-26-000031.txt",
+    "type": "text.gif",
+    "size": "250311"
+   },
+   {
+    "last-modified": "2026-07-28 16:05:12",
+    "name": "R1.htm",
+    "type": "text.gif",
+    "size": "3311"
+   },
+   {
+    "last-modified": "2026-07-28 16:05:12",
+    "name": "acme-20260728.htm",
+    "type": "text.gif",
+    "size": "25120"
+   },
+   {
+    "last-modified": "2026-07-28 16:05:12",
+    "name": "acme-20260728_htm.xml",
+    "type": "text.gif",
+    "size": "4120"
+   },
+   {
+    "last-modified": "2026-07-28 16:05:12",
+    "name": "acme-ex992_cfocommentary.htm",
+    "type": "text.gif",
+    "size": "41000"
+   },
+   {
+    "last-modified": "2026-07-28 16:05:12",
+    "name": "acme-ex991_q22026.htm",
+    "type": "text.gif",
+    "size": "90210"
+   },
+   {
+    "last-modified": "2026-07-28 16:05:12",
+    "name": "acmelogo.jpg",
+    "type": "image2.gif",
+    "size": "5120"
+   }
+  ],
+  "name": "/Archives/edgar/data/1234567/000123456726000031",
+  "parent-dir": "/Archives/edgar/data/1234567/"
+ }
+}
