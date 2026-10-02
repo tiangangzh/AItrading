@@ -32,7 +32,7 @@ class PerformanceStats(BaseModel):
     skew: float | None
     excess_kurtosis: float | None
     mean_return_t_stat: float | None = Field(description="t-stat of the mean periodic return (Newey-West).")
-    avg_turnover_pct: float | None = Field(None, description="Average one-way turnover per rebalance, % of book.")
+    avg_turnover_pct: float | None = Field(None, description="Average one-way turnover per rebalance = 0.5 x sum|w_target - w_drifted|, % of book.")
     beta_to_benchmark: float | None = None
     tracking_error_pct: float | None = None
     information_ratio: float | None = None

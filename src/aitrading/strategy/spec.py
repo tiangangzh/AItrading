@@ -77,6 +77,12 @@ class StrategySpec(BaseModel):
     time_series: TimeSeriesRule | None = None
     attribution_model: FactorModelName | None = Field("ff3", description="Factor model used to attribute the strategy's returns (alpha/betas).")
     costs_bps: float = Field(10.0, ge=0, description="One-way transaction cost in basis points, charged on turnover.")
+    delisting_return: float = Field(
+        0.0,
+        gt=-1,
+        description="Return booked when a held name stops trading for good (terminal delisting). 0 is optimistic; "
+        "e.g. -0.3 approximates performance delistings (Shumway 1997).",
+    )
     benchmark: str | None = Field(None, description="Benchmark ticker; None = the provider's default broad US index.")
     assumptions: list[str] = Field(default_factory=list)
     unsupported_requests: list[str] = Field(default_factory=list)
