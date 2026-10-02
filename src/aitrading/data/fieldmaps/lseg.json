@@ -1,0 +1,435 @@
+{
+  "vendor": "lseg",
+  "schema": 1,
+  "version": "2026-10-02",
+  "source": "docs/VENDOR_REFERENCE.md section 2 (LSEG Data Library for Python, lseg-data 2.1.1). Statuses are copied from table 2.3; entries not in that table say where they come from in 'notes'.",
+  "status_meaning": {
+    "confirmed": "Seen in vendor-authored code or docs in the form shown. May be compiled; still needs a field_validation_log entry (gate G5) before it is used as a production filter predicate.",
+    "corrected": "Verified only in the form shown here. Use exactly this form; parts noted VERIFY stay configurable.",
+    "unverifiable": "Could not be confirmed. Configurable only, never hard-coded; preflighted on test_ric before every run; a failure suspends the leg (NOT EVALUATED); never pushed as a SCREEN threshold."
+  },
+  "test_ric": "IBM.N",
+
+  "parameters": {
+    "Curn": {
+      "value": "USD",
+      "status": "confirmed",
+      "notes": "Snapshot get_data parameters {'Curn': 'USD'} as in the reference get_tr(); every currency amount is requested in USD."
+    },
+    "SDate": {
+      "value": "{as_of}",
+      "status": "unverifiable",
+      "notes": "Anchors every snapshot to the absolute as_of (ADR graft 4: never '0D'). The global SDate parameter is not shown in VENDOR_REFERENCE: record in the admission log that values move with SDate."
+    }
+  },
+
+  "screen": {
+    "universe": {
+      "expression": "U(IN(Equity(active,public,primary))/*UNV:Public*/)",
+      "status": "confirmed",
+      "notes": "Official SCREEN universe (VENDOR_REFERENCE 2.2). Lists instruments active today: a historical as_of is survivorship-biased."
+    },
+    "currency": {
+      "expression": "CURN=USD",
+      "status": "confirmed",
+      "notes": "Last SCREEN argument; makes TR.CompanyMarketCap(Scale=6) USD millions."
+    },
+    "country": {
+      "template": "IN(TR.ExchangeCountryCode,\"{value}\")",
+      "status": "confirmed",
+      "notes": "US listing (table 2.3 'US listing / share type'). Compiled from UniverseSpec.country."
+    },
+    "security_type": {
+      "template": "IN(TR.InstrumentTypeCode,\"{value}\")",
+      "values": {"common_stock": "ORD"},
+      "status": "confirmed",
+      "notes": "Only ORD (ordinary shares) is verified. Other canonical security types have no verified code and are screened locally."
+    },
+    "listing_filters": [
+      {
+        "label": "exchange market not OTCM (OTC Markets excluded from the LSEG universe)",
+        "expression": "NOT_IN(TR.ExchangeMarketIdCode,\"OTCM\")",
+        "status": "confirmed",
+        "notes": "From the official VolatilityScreening sample. Part of the LSEG universe definition (get_universe uses it too)."
+      }
+    ]
+  },
+
+  "features": {
+    "market_cap_usd_bn": {
+      "expression": "TR.CompanyMarketCap(Scale=6)",
+      "unit": "USD millions (with CURN=USD)",
+      "threshold_scale": 1000,
+      "status": "confirmed",
+      "screen": "official",
+      "notes": "'>=' form used in official SCREENs. Catalog USD bn x 1000 = USD mn."
+    },
+    "return_3m_pct": {
+      "expression": "TR.TotalReturn3Mo",
+      "unit": "percent",
+      "threshold_scale": 1,
+      "status": "corrected",
+      "screen": "official",
+      "notes": "In SCREEN, percent. Window is 3 calendar months vs the catalog's 63 sessions: borderline names may be dropped by the push-down (the local engine re-checks every survivor). Set screen to 'none' in an override to keep it local."
+    },
+    "return_1m_pct": {
+      "expression": "TR.TotalReturn1Mo",
+      "unit": "percent (assumed by analogy with TR.TotalReturn3Mo)",
+      "threshold_scale": 1,
+      "status": "corrected",
+      "units_verified": false,
+      "screen": "preflight",
+      "notes": "Code listed in table 2.3; only TR.TotalReturn3Mo is documented as percent inside SCREEN."
+    },
+    "return_12m_pct": {
+      "expression": "TR.TotalReturn52Wk",
+      "unit": "percent (assumed by analogy with TR.TotalReturn3Mo)",
+      "threshold_scale": 1,
+      "status": "corrected",
+      "units_verified": false,
+      "screen": "preflight",
+      "notes": "Code listed in table 2.3; units not documented."
+    },
+    "return_6m_pct": {
+      "expression": "TR.TotalReturn6Mo",
+      "unit": "unknown",
+      "threshold_scale": 1,
+      "status": "unverifiable",
+      "screen": "none",
+      "notes": "TR.TotalReturn6Mo unverifiable (table 2.3). Computed locally from history."
+    },
+    "price": {
+      "expression": "TR.PriceClose",
+      "unit": "USD",
+      "threshold_scale": 1,
+      "status": "confirmed",
+      "screen": "preflight",
+      "notes": "EOD close (table 2.3 'Last price'). Not shown inside an official SCREEN, so it is pushed only after a passing preflight that day. The latest close equals the latest adjusted close."
+    },
+    "gics_sector": {
+      "expression": "TR.GICSSector",
+      "unit": "label",
+      "status": "corrected",
+      "screen": "preflight",
+      "notes": "TR.GICSIndustry / SubIndustry / SectorCode unverifiable. Pushed only as single-value IN / NOT_IN after a passing preflight."
+    },
+    "high_52w": {
+      "expression": "TR.Price52WeekHigh",
+      "unit": "USD",
+      "threshold_scale": 1,
+      "status": "confirmed",
+      "screen": "none",
+      "notes": "Code confirmed; use in SCREEN UNVERIFIED and the vendor value may not be corporate-action adjusted like the catalog's adjusted 252-session high. Computed locally."
+    },
+    "low_52w": {
+      "expression": "TR.Price52WeekLow",
+      "unit": "USD",
+      "threshold_scale": 1,
+      "status": "confirmed",
+      "screen": "none",
+      "notes": "As high_52w."
+    },
+    "drawdown_from_52w_high_pct": {
+      "expression": "TR.PricePctChg52WkHigh",
+      "unit": "percent, negative below the high (ASSUMED)",
+      "threshold_scale": 1,
+      "status": "confirmed",
+      "units_verified": false,
+      "screen": "preflight",
+      "notes": "Codes confirmed. Sign/scale and use in SCREEN UNVERIFIED. Compute px/hi52-1 locally. After admission (G5) an override may set units_verified=true (and a negative threshold_scale if the vendor reports the drop as a positive number)."
+    },
+    "volatility_20d_pct": {
+      "expression": "TR.Volatility20D",
+      "unit": "unknown",
+      "threshold_scale": 1,
+      "status": "confirmed",
+      "units_verified": false,
+      "screen": "none",
+      "notes": "Realized TR.Volatility10D/20D/30D/60D/90D confirmed (TR.Volatility10D appears in official SCREENs); units and the estimator (vs annualised stdev of daily log returns) are undocumented. Computed locally."
+    },
+    "enterprise_value_usd_bn": {
+      "expression": "TR.EV(Scale=6)",
+      "unit": "USD millions (with Curn=USD)",
+      "threshold_scale": 1000,
+      "status": "confirmed",
+      "screen": "none",
+      "notes": "TR.EV confirmed. The vendor EV definition may differ from the catalog's market cap + total debt - cash, so it is not pushed (a meaning-changing mapping)."
+    },
+    "ev_to_ebitda": {
+      "expression": "TR.EVToEBITDA",
+      "unit": "x",
+      "threshold_scale": 1,
+      "status": "corrected",
+      "screen": "none",
+      "notes": "TR.FwdEVToEBITDA unverifiable. Vendor EV / EBITDA definitions differ from the catalog's: not pushed."
+    },
+    "ev_to_sales": {
+      "expression": "TR.EVToSales",
+      "unit": "x",
+      "threshold_scale": 1,
+      "status": "confirmed",
+      "screen": "none",
+      "notes": "Vendor EV definition differs from the catalog's: not pushed."
+    },
+    "net_debt_to_ebitda": {
+      "expression": "TR.NetDebtToEBITDA",
+      "unit": "x",
+      "threshold_scale": 1,
+      "status": "confirmed",
+      "screen": "none",
+      "notes": "Net debt definitions differ (TR.NetDebt vs TR.F.NetDebt): not pushed."
+    },
+    "gross_margin_pct": {
+      "expression": "TR.GrossMargin(Period=LTM)",
+      "unit": "unknown",
+      "threshold_scale": 1,
+      "status": "unverifiable",
+      "screen": "none",
+      "notes": "Preflight."
+    },
+    "operating_margin_pct": {
+      "expression": "TR.OperProfitMarginPct",
+      "unit": "unknown",
+      "threshold_scale": 1,
+      "status": "unverifiable",
+      "screen": "none",
+      "notes": "TR.OperProfitMarginPct / TR.OperatingMargin unverifiable; official samples show only TR.OperatingProfitMarginPct5YrAvg and TR.PretaxMarginPercent."
+    },
+    "net_debt_usd_bn": {
+      "expression": "TR.NetDebt",
+      "unit": "unknown",
+      "threshold_scale": 1,
+      "status": "unverifiable",
+      "screen": "none",
+      "notes": "TR.NetDebt, TR.F.NetDebt unverifiable; definitions differ."
+    },
+    "sma_50": {"expression": null, "compute": "local", "status": "corrected", "notes": "Compute from TRDPRC_1 history; MAVG inside SCREEN UNVERIFIED."},
+    "sma_200": {"expression": null, "compute": "local", "status": "corrected", "notes": "Compute from TRDPRC_1 history; MAVG inside SCREEN UNVERIFIED."},
+    "sma_50_vs_sma_200_pct": {"expression": null, "compute": "local", "status": "corrected", "notes": "SMA50 > SMA200 is local for LSEG (VENDOR_REFERENCE section 4)."},
+    "price_vs_sma_50_pct": {"expression": null, "compute": "local", "status": "corrected", "notes": "Compute from history."},
+    "price_vs_sma_200_pct": {"expression": null, "compute": "local", "status": "corrected", "notes": "Compute from history."},
+    "rsi_14": {"expression": null, "compute": "local", "status": "corrected", "notes": "Compute Wilder locally. TR.RSISimple14D appears only in a sample comment (simple, not Wilder); RSI() smoothing undocumented."},
+    "macd_line": {"expression": null, "compute": "local", "status": "confirmed", "notes": "No field exists: EMA12-EMA26 locally."},
+    "macd_signal": {"expression": null, "compute": "local", "status": "confirmed", "notes": "No field exists: EMA9 of the MACD line locally."},
+    "macd_histogram": {"expression": null, "compute": "local", "status": "confirmed", "notes": "No field exists."},
+    "rel_volume_5d": {"expression": null, "compute": "local", "status": "corrected", "notes": "Volume ratio computed from ACVOL_UNS history (VENDOR_REFERENCE section 4: local)."},
+    "avg_dollar_volume_20d_usd_mn": {"expression": null, "compute": "local", "status": "corrected", "notes": "Compute ACVOL_UNS.tail(20) x close; TR.AvgDailyVolume6M is third-party and 6-month only."},
+    "rel_strength_3m_pp": {"expression": null, "compute": "local", "status": "corrected", "notes": "Local ratio vs .SPX (benchmark undocumented; .SPX history may be unentitled, fall back to SPY). TR.RelPricePctChgYTD is YTD only."},
+    "rel_strength_6m_pp": {"expression": null, "compute": "local", "status": "corrected", "notes": "As rel_strength_3m_pp."},
+    "rel_strength_12m_pp": {"expression": null, "compute": "local", "status": "corrected", "notes": "As rel_strength_3m_pp."},
+    "fcf_yield_pct": {"expression": null, "compute": "local", "status": "unverifiable", "notes": "Compute TR.FreeCashFlow(LTM,Scale=6)/TR.CompanyMarketCap(Scale=6); depends on TR.FreeCashFlow (unverifiable). Residual."},
+    "revenue_growth_last_q_yoy_pct": {"expression": null, "compute": "local", "status": "corrected", "notes": "TR.RevenueActValue(Period=FQ0) vs (Period=FQ-4), computed locally. FQ-4 combination UNVERIFIED. Single-quarter, not LTM."},
+    "revenue_growth_yoy_pct": {"expression": null, "compute": "local", "status": "unverifiable", "notes": "No verified LTM revenue field. LSEG supplies the single-quarter YoY (revenue_growth_last_q_yoy_pct) instead; trailing growth is residual."},
+    "short_interest_pct_float": {"expression": null, "compute": "local", "status": "corrected", "notes": "100*TR.ShortInterest(SDate)/TR.SharesFreeFloat(SDate) computed locally. Third-party evidence only. TR.SIShortInterest unverifiable."},
+    "days_to_cover": {"expression": null, "compute": "local", "status": "corrected", "notes": "TR.ShortInterest / avg20(ACVOL_UNS); TR.ShortInterestDTC was found nowhere."},
+    "iv_30d_pct": {"expression": null, "compute": "survivors", "status": "confirmed", "notes": "RIC <root>ATMIV.U + TR.30DAYATTHEMONEYIMPLIEDVOLATILITYINDEXFOR{CALL,PUT}OPTIONS; pattern verified for WMT only. Fetch for survivors only."},
+    "put_call_volume_ratio": {"expression": null, "compute": "local", "status": "confirmed", "notes": "No field: compute from the chain (PUTCALLIND, ACVOL_1, OPINT_1). US chain RIC 0#<root>*.U and ACVOL_1/OPINT_1 unverified; not implemented."},
+    "put_call_oi_ratio": {"expression": null, "compute": "local", "status": "confirmed", "notes": "As put_call_volume_ratio."}
+  },
+
+  "raw": {
+    "universe": {
+      "name": {
+        "code": "TR.CommonName",
+        "kind": "label",
+        "status": "confirmed",
+        "notes": "From the reference CORE map (VENDOR_REFERENCE 2.2 sample); not a row of table 2.3."
+      },
+      "gics_sector": {
+        "code": "TR.GICSSector",
+        "kind": "label",
+        "status": "corrected",
+        "notes": "GICS / TRBC row: TR.GICSSector corrected."
+      },
+      "gics_industry": {
+        "code": "TR.GICSIndustry",
+        "kind": "label",
+        "status": "unverifiable",
+        "notes": "TR.GICSIndustry/SubIndustry/SectorCode unverifiable (TR.GICSIndustryCode is corrected but is a code, not a name). Preflighted."
+      },
+      "exchange": {
+        "code": "TR.ExchangeMarketIdCode",
+        "kind": "label",
+        "status": "confirmed",
+        "value_map": {"XNYS": "NYSE", "XNAS": "NASDAQ", "XNGS": "NASDAQ", "XNMS": "NASDAQ", "XNCM": "NASDAQ", "XASE": "NYSE American", "ARCX": "NYSE Arca", "BATS": "CBOE", "XCBO": "CBOE"},
+        "notes": "ISO 10383 MIC; mapped to the canonical exchange label (unknown MICs pass through unchanged)."
+      },
+      "country": {
+        "code": "TR.ExchangeCountryCode",
+        "kind": "label",
+        "status": "confirmed",
+        "notes": "ISO alpha-2 of the listing exchange (the canonical 'country' is the primary-listing country)."
+      },
+      "security_type": {
+        "code": "TR.InstrumentTypeCode",
+        "kind": "label",
+        "status": "confirmed",
+        "value_map": {"ORD": "common_stock"},
+        "notes": "Only ORD is verified; other codes pass through lower-cased (they never match 'common_stock')."
+      },
+      "market_cap": {
+        "code": "TR.CompanyMarketCap(Scale=6)",
+        "unit": "USD millions (Curn=USD)",
+        "to_canonical": 1000000,
+        "status": "confirmed",
+        "notes": "x 1e6 -> USD absolute."
+      }
+    },
+    "fundamentals": {
+      "revenue_last_q": {
+        "code": "TR.RevenueActValue(Period=FQ0)",
+        "unit": "USD (Curn=USD; no Scale parameter: absolute units ASSUMED, record in the admission log)",
+        "to_canonical": 1,
+        "status": "corrected",
+        "notes": "Revenue growth YoY row: FQ0 vs FQ-4 computed locally; single quarter, not LTM."
+      },
+      "revenue_last_q_prior_year": {
+        "code": "TR.RevenueActValue(Period=FQ-4)",
+        "unit": "USD (as revenue_last_q)",
+        "to_canonical": 1,
+        "status": "unverifiable",
+        "notes": "FQ-4 combination UNVERIFIED. Preflighted."
+      },
+      "fcf_ttm": {
+        "code": "TR.FreeCashFlow(Period=LTM,Scale=6)",
+        "unit": "USD millions (Curn=USD)",
+        "to_canonical": 1000000,
+        "status": "unverifiable",
+        "notes": "TR.FreeCashFlow(Period=LTM); TR.F.LeveredFOCF: third-party live-validated only. Preflighted."
+      },
+      "shares_outstanding": {
+        "code": "TR.SharesOutstanding",
+        "unit": "shares",
+        "to_canonical": 1,
+        "status": "corrected",
+        "notes": "Free float / shares row; TR.CompanySharesOutstanding is third-party."
+      },
+      "report_date": {
+        "code": "TR.RevenueActReportDate",
+        "kind": "date",
+        "status": "corrected",
+        "notes": "Earnings events row. A report date after as_of blanks the row (look-ahead guard)."
+      }
+    },
+    "estimates": {
+      "revenue_ntm_est": {
+        "code": "TR.RevenueMeanEstimate(Period=NTM,Scale=6,Curn=USD)",
+        "unit": "USD millions",
+        "to_canonical": 1000000,
+        "status": "unverifiable",
+        "notes": "Period=NTM is third-party. The corrected form TR.RevenueMeanEstimate(Period=FY1,Scale=6,Curn=USD) is FY1, not NTM, and is NOT substituted (meaning-changing)."
+      },
+      "last_eps_surprise": {
+        "code": "TR.EPSActSurprise",
+        "unit": "percent (ASSUMED)",
+        "to_canonical": 0.01,
+        "status": "corrected",
+        "units_verified": false,
+        "notes": "Earnings events row. Units undocumented: not served until admitted (set units_verified=true in an override)."
+      },
+      "last_earnings_date": {
+        "code": "TR.RevenueActReportDate",
+        "kind": "date",
+        "status": "corrected",
+        "notes": "Report date of the latest revenue actual."
+      },
+      "next_earnings_date": {
+        "code": "TR.ExpectedReportDate",
+        "kind": "date",
+        "status": "unverifiable",
+        "notes": "TR.ExpectedReportDate unverifiable. Preflighted."
+      }
+    },
+    "short_interest": {
+      "short_interest_shares": {
+        "code": "TR.ShortInterest(SDate={as_of})",
+        "unit": "shares",
+        "to_canonical": 1,
+        "status": "unverifiable",
+        "notes": "Reference form TR.ShortInterest(SDate=0D), anchored to the absolute as_of. Third-party evidence only. LSEG keeps short interest only for listed names (survivorship)."
+      },
+      "short_interest_shares_1m_ago": {
+        "code": "TR.ShortInterest(SDate={as_of_1m})",
+        "unit": "shares",
+        "to_canonical": 1,
+        "status": "unverifiable",
+        "notes": "As short_interest_shares, 30 calendar days earlier."
+      },
+      "float_shares": {
+        "code": "TR.SharesFreeFloat(SDate={as_of})",
+        "unit": "shares",
+        "to_canonical": 1,
+        "status": "unverifiable",
+        "notes": "TR.SharesFreeFloat is third-party (TR.FreeFloat / TR.FreeFloatPct are corrected but their units are undocumented)."
+      },
+      "settlement_date": {
+        "code": "TR.ShortInterest(SDate={as_of}).date",
+        "kind": "date",
+        "status": "unverifiable",
+        "notes": "Not in VENDOR_REFERENCE: the '.date' field property is standard TR syntax but unverified for this field. Preflighted."
+      }
+    },
+    "options": {
+      "iv_30d_atm": {
+        "ric_template": "{root}ATMIV.U",
+        "codes": [
+          "TR.30DAYATTHEMONEYIMPLIEDVOLATILITYINDEXFORCALLOPTIONS",
+          "TR.30DAYATTHEMONEYIMPLIEDVOLATILITYINDEXFORPUTOPTIONS"
+        ],
+        "combine": "mean",
+        "unit": "vol points (percent)",
+        "to_canonical": 0.01,
+        "status": "confirmed",
+        "notes": "Pattern verified for WMT only, so each <root>ATMIV.U must resolve (unresolved -> NaN). Fetch for survivors only. IMP_VOLT is an alternative."
+      }
+    }
+  },
+
+  "history": {
+    "interval": "daily",
+    "adjustments": {
+      "value": ["exchangeCorrection", "manualCorrection", "CCH", "CRE", "RTS", "RPO"],
+      "status": "unverifiable",
+      "notes": "get_history(..., adjustments) is corrected, but corporate-action adjustment of TRDPRC_1 is UNVERIFIED: cross-check drawdown vs TR.Price52WeekHigh around splits (LSEGProvider.crosscheck_adjustment)."
+    },
+    "fields": {
+      "close": {"code": "TRDPRC_1", "status": "confirmed", "notes": "Last price (history)."},
+      "volume": {"code": "ACVOL_UNS", "status": "confirmed", "notes": "Daily volume (history)."},
+      "open": {"code": "OPEN_PRC", "status": "unverifiable", "notes": "Not in VENDOR_REFERENCE (standard historical-pricing name). Preflighted; NaN when it fails."},
+      "high": {"code": "HIGH_1", "status": "unverifiable", "notes": "Not in VENDOR_REFERENCE (standard historical-pricing name). Preflighted; NaN when it fails."},
+      "low": {"code": "LOW_1", "status": "unverifiable", "notes": "Not in VENDOR_REFERENCE (standard historical-pricing name). Preflighted; NaN when it fails."}
+    }
+  },
+
+  "benchmark": {
+    "ric": ".SPX",
+    "status": "corrected",
+    "fallback_ric": "SPY.P",
+    "fallback_status": "unverifiable",
+    "notes": "Relative strength row: local ratio vs .SPX; benchmark undocumented; .SPX history may be unentitled (fall back to SPY). The SPY RIC is not in VENDOR_REFERENCE."
+  },
+
+  "documents": {
+    "news": {
+      "enabled": true,
+      "query_template": "R:{ric}",
+      "status": "confirmed",
+      "licence_class": "L3",
+      "notes": "ld.news.get_headlines / get_story confirmed; content is licence class L3 (Reuters copyright). The 'R:<RIC>' query syntax follows the LSEG-API-Samples news examples (not reproduced in VENDOR_REFERENCE)."
+    },
+    "filings": {
+      "enabled": false,
+      "feed": "EDGAR",
+      "search_parameters": {},
+      "status": "confirmed",
+      "licence_class": "L3",
+      "notes": "filings.search.Definition(feed=Feed.EDGAR, ...) / filings.retrieval.Definition(...) confirmed (Filings entitlement needed). Search parameters beyond feed are NOT in VENDOR_REFERENCE, so this is off by default: set enabled=true and search_parameters (placeholders {ric} {ticker} {start} {end} {limit}) in an AITRADING_FIELDMAP_LSEG override after verifying them. SEC EDGAR (L0, aitrading.data.sec_edgar) is the preferred filings source."
+    },
+    "transcripts": {
+      "enabled": false,
+      "status": "confirmed",
+      "licence_class": "L3",
+      "notes": "StreetEvents XML over SFTP ftp-setranscripts.lseg.com:/TRANSCRIPT/XML_Add_IDs/Current (separate licence, L3; pin the host key). Out of scope for this adapter: get_documents returns no transcripts."
+    }
+  }
+}

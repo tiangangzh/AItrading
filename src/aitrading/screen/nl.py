@@ -545,7 +545,10 @@ _LOW = (
     r"(?:(?:52|fifty[\s-]two)[\s-]?(?:week|wk|w)|1[\s-]?year|one[\s-]year|12[\s-]?month|yearly|annual)?[\s-]*(?:lows?|bottoms?)\b"
 )
 
-_NEGATION = re.compile(r"\b(?:not|no|never|without|nor|isn't|aren't|wasn't|weren't|don't|doesn't|non)\b[\s-]+(?:[a-z']+[\s-]+){0,2}$")
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|without|nor|isn't|aren't|wasn't|weren't|don't|doesn't|non)\b[\s-]+"
+    r"(?:(?:a|an|the|in|be|been|being|currently|yet|very|too|so|showing|having|have|has|had|on|at|trading|seeing|any)\s+){0,2}$"
+)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -611,7 +614,8 @@ class _Ctx:
 
     def quote(self, m: re.Match | tuple[int, int]) -> str:
         s, e = (m.start(), m.end()) if isinstance(m, re.Match) else m
-        return " ".join(self.original[s:e].split()).strip(" ,;:(")
+        q = " ".join(self.original[s:e].split()).strip(" ,;:(")
+        return q + ")" * max(0, q.count("(") - q.count(")"))
 
     def consume(self, s: int, e: int) -> None:
         self.masked = self.masked[:s] + "\x00" * (e - s) + self.masked[e:]
@@ -752,15 +756,15 @@ def _h_adv(m: re.Match, ctx: _Ctx) -> list[_Hit] | None:
     v, _ = parsed
     mn = v.lo * 1e3
     if v.op in (">", ">=") or (v.op is None and _SUF_GE.search(m.group("val"))):
-        ctx.min_adv = _num(mn)
-        ctx.note(f"Liquidity floor from '{ctx.quote(m)}': universe min_avg_dollar_volume_usd_mn = {mn:g}.")
+        ctx.min_adv = _num(max(mn, ctx.min_adv or 0.0))
+        ctx.note(f"Liquidity floor {mn:g} USD mn from '{ctx.quote(m)}' (universe min_avg_dollar_volume_usd_mn keeps the strictest floor).")
         return []
     if v.op in ("<", "<="):
         return [ctx.hit(m, [ctx.cond(m, "avg_dollar_volume_20d_usd_mn", v.op, mn)])]
     if v.op == "between":
         return [ctx.hit(m, [ctx.cond(m, "avg_dollar_volume_20d_usd_mn", "between", v.lo * 1e3, (v.hi or 0) * 1e3)])]
-    ctx.min_adv = _num(mn)
-    ctx.note(f"Liquidity floor from '{ctx.quote(m)}': universe min_avg_dollar_volume_usd_mn = {mn:g}.")
+    ctx.min_adv = _num(max(mn, ctx.min_adv or 0.0))
+    ctx.note(f"Liquidity floor {mn:g} USD mn from '{ctx.quote(m)}' (universe min_avg_dollar_volume_usd_mn keeps the strictest floor).")
     return []
 
 
@@ -770,8 +774,8 @@ def _h_price(m: re.Match, ctx: _Ctx) -> list[_Hit] | None:
         return None
     op = v.op or ">="
     if op in (">", ">="):
-        ctx.min_price = _num(v.lo)
-        ctx.note(f"Price floor from '{ctx.quote(m)}': universe min_price = {v.lo:g}.")
+        ctx.min_price = _num(max(v.lo, ctx.min_price or 0.0))
+        ctx.note(f"Price floor {v.lo:g} from '{ctx.quote(m)}' (universe min_price keeps the strictest floor).")
         return []
     if op == "between":
         return [ctx.hit(m, [ctx.cond(m, "price", "between", v.lo, v.hi)])]
@@ -803,15 +807,16 @@ def _h_cross_word(m: re.Match, ctx: _Ctx) -> list[_Hit]:
     return [ctx.hit(m, [c], notes=notes)]
 
 
-def _slope_conds(m: re.Match, ctx: _Ctx, n: int) -> tuple[list[Condition], list[str]]:
+def _slope_conds(m: re.Match, ctx: _Ctx, n: int) -> list[Condition]:
+    """'above a rising 200-day' also constrains the slope (only the 200-day slope is in the catalog)."""
     txt = m.group(0)
     up, dn = re.search(rf"\b(?:{_SLOPE_UP})\b", txt), re.search(rf"\b(?:{_SLOPE_DN})\b", txt)
     if not (up or dn):
-        return [], []
+        return []
     if n != 200:
         ctx.unsupported_add(f"slope of the {n}-day average ('{ctx.quote(m)}')")
-        return [], []
-    return [ctx.cond(m, "sma_200_slope_1m_pct", ">" if up else "<", 0)], []
+        return []
+    return [ctx.cond(m, "sma_200_slope_1m_pct", ">" if up else "<", 0)]
 
 
 def _h_price_vs(n: int) -> Handler:
@@ -843,8 +848,7 @@ def _h_price_vs(n: int) -> Handler:
                 if v.op is None:
                     notes.append(f"'{ctx.quote(m)}' read as at least {a:g}% {'above' if above else 'below'}.")
                 conds = [ctx.cond(m, feature, op if above else _FLIP[op], a if above else -a)]
-        extra, _ = _slope_conds(m, ctx, n)
-        return [ctx.hit(m, conds + extra, notes=notes)]
+        return [ctx.hit(m, conds + _slope_conds(m, ctx, n), notes=notes)]
 
     return h
 
@@ -1262,9 +1266,9 @@ def _build_rules() -> list[_Rule]:
     add([_r(rf"\b{adv_subject}{_GLUE}(?P<val>{_money_valre()})", _h_adv)])
     add([
         _r(rf"\b(?:share\s+)?prices?{_GLUE}(?P<val>{_COMP}\s*\$\s*{_UNUM}|\$\s*{_UNUM}\s*\+)(?![\d.]*\s*(?:b|bn|m|mn|k|billion|million)\b)", _h_price),
-        _r(rf"\b(?:stocks?|shares|names)\s+(?:trading\s+|priced\s+)?(?P<val>(?:above|over|at\s+least)\s+\$\s*{_UNUM})(?![\d.]*\s*(?:b|bn|m|mn|k|billion|million)\b)", _h_price),
         _r(rf"\bno\s+(?:stocks?\s+|names\s+)?(?:priced\s+)?(?:under|below)\s+(?P<val>\$\s*{_UNUM})(?![\d.]*\s*(?:b|bn|m|mn|k|billion|million)\b)",
-           lambda m, ctx: _h_price_floor_words(m, ctx), negatable=False),
+           _h_price_floor_words, negatable=False),
+        _r(rf"\b(?:stocks?|shares|names)\s+(?:trading\s+|priced\s+)?(?P<val>(?:above|over|at\s+least|under|below|less\s+than)\s+\$\s*{_UNUM})(?![\d.]*\s*(?:b|bn|m|mn|k|billion|million)\b)", _h_price),
         _r(r"\b(?:no|excluding|exclude|ex|avoid(?:ing)?|without)[\s-]+penny[\s-]stocks?\b",
            _h_consume("'{q}': kept the default $5 minimum price."), negatable=False),
         _r(r"\b(?:highly\s+|very\s+|sufficiently\s+)?liquid\b(?!ity)", _h_consume("'{q}': kept the default liquidity floor ($5mn 20-day ADV).")),
@@ -1427,7 +1431,7 @@ def _build_rules() -> list[_Rule]:
     up_dn = r"expanding|expanded|rising|improving|improved|increasing|widening|up|contracting|contracted|shrinking|falling|declining|down|compressing|compressed"
     chg = rf"(?:\s+(?:by\s+)?(?P<val>(?:{_COMP}\s*)?{_UNUM}\s*(?:pp\b|ppts?\b|percentage\s+points?\b|points?\b|bps\b|basis\s+points\b)))?"
     add([
-        _r(rf"\b(?P<d>expanding|rising|improving|increasing|widening|contracting|shrinking|falling|declining|compressing)\s+(?P<k>gross|operating|ebit)\s+margins?\b", _h_margin_change),
+        _r(r"\b(?P<d>expanding|rising|improving|increasing|widening|contracting|shrinking|falling|declining|compressing)\s+(?P<k>gross|operating|ebit)\s+margins?\b", _h_margin_change),
         _r(rf"\b(?P<k>gross|operating|ebit)\s+margins?\s+(?:are\s+|is\s+|have\s+been\s+|has\s+been\s+)?(?P<d>{up_dn})\b{chg}", _h_margin_change),
         *_subject(r"gross\s+(?:profit\s+)?margins?", "gross_margin_pct", P, ">="),
         *_subject(r"(?:operating|op\.?|ebit)\s+margins?", "operating_margin_pct", P, ">="),
@@ -1515,7 +1519,7 @@ def _build_rules() -> list[_Rule]:
         _r(r"\b(?:low|little|minimal)\s+short\s+interest\b",
            _fixed("short_interest_pct_float", "<", 3, covered_by={"short_interest_pct_float", "days_to_cover"}, default="default for 'low short interest'")),
         _r(r"\b(?:fcf|free[\s-]cash[\s-]flow)[\s-]positive\b|\bpositive\s+(?:free[\s-]cash[\s-]flows?|fcf)\b",
-           _fixed("fcf_yield_pct", ">", 0, covered_by={"fcf_yield_pct", "fcf_margin_pct"}, default="positive free cash flow")),
+           _fixed("fcf_yield_pct", ">", 0, covered_by={"fcf_yield_pct", "fcf_margin_pct"}, default="default for 'FCF positive'")),
         _r(r"\b(?:strong|robust|healthy|solid|high|good|significant|ample|abundant|plenty\s+of|lots\s+of|consistent|great)\s+(?:free[\s-]cash[\s-]flows?|fcf|cash\s+flows?|cash\s+generation)(?:\s+generation)?\b|\bcash[\s-]generative\b",
            _fixed("fcf_yield_pct", ">", 5, covered_by={"fcf_yield_pct", "fcf_margin_pct"}, default="default for 'strong free cash flow'")),
         _r(r"\b(?:cheap(?:ly\s+valued)?|inexpensive|undervalued|under-valued|attractively\s+valued|low\s+valuations?|trading\s+at\s+a\s+discount|value\s+(?:stocks|names))\b",
@@ -1545,8 +1549,8 @@ def _h_price_floor_words(m: re.Match, ctx: _Ctx) -> list[_Hit] | None:
     v = _parse_val(m.group("val"))
     if v is None:
         return None
-    ctx.min_price = _num(v.lo)
-    ctx.note(f"Price floor from '{ctx.quote(m)}': universe min_price = {v.lo:g}.")
+    ctx.min_price = _num(max(v.lo, ctx.min_price or 0.0))
+    ctx.note(f"Price floor {v.lo:g} from '{ctx.quote(m)}' (universe min_price keeps the strictest floor).")
     return []
 
 
@@ -1687,9 +1691,11 @@ typically meaningfully significantly
 generating generate generates producing produce produces showing having trading trade trades traded remain remains remained
 remaining stay stays stayed holding hold holds seeing seen see
 elevated not there here just only even s u
+after before following amid despite given along alongside together combined because due
 """.split())
 _TOKEN = re.compile(r"[a-z][a-z'&-]*|\$?\d+(?:\.\d+)?%?[a-z]*")
 _FRAGMENT = re.compile(r"(?:[^\x00,;:!?()\[\]{}\".]|\.(?=\d))+")
+_CONJ = re.compile(r"\b(?:and|or|but|with|while|where|whereas|that|which|plus|then)\b")
 
 
 def _content(tok: str) -> bool:
@@ -1761,7 +1767,8 @@ class HeuristicScreenTranslator:
 
     def __init__(self, catalog: FeatureCatalog | None = None):
         self.catalog = catalog or default_catalog()
-        names = sorted(self.catalog.names(), key=len, reverse=True)
+        # Identifier-style names only ("rsi_14 < 35"); plain words such as "price" go through the phrase rules.
+        names = sorted((n for n in self.catalog.names() if "_" in n), key=len, reverse=True)
         lit = "|".join(re.escape(n) for n in names) or r"(?!x)x"
         self._rules: list[_Rule] = [
             _r(rf"\b(?P<f>{lit})\b{_GLUE}(?P<val>(?:==|!=|=)\s*{_NUM}|{_valre(_PCT)})", _h_literal(self.catalog)),
@@ -1838,12 +1845,18 @@ class HeuristicScreenTranslator:
 
     def _leftovers(self, ctx: _Ctx) -> None:
         missed: list[str] = []
+        spans: list[tuple[int, int]] = []
         for frag in _FRAGMENT.finditer(ctx.masked):
-            toks = [t for t in _TOKEN.finditer(frag.group(0)) if _content(t.group(0))]
+            cut = frag.start()
+            for c in _CONJ.finditer(frag.group(0)):
+                spans.append((cut, frag.start() + c.start()))
+                cut = frag.start() + c.end()
+            spans.append((cut, frag.end()))
+        for a, b in spans:
+            toks = [t for t in _TOKEN.finditer(ctx.masked[a:b]) if _content(t.group(0))]
             if not toks:
                 continue
-            s, e = frag.start() + toks[0].start(), frag.start() + toks[-1].end()
-            q = ctx.quote((s, e))
+            q = ctx.quote((a + toks[0].start(), a + toks[-1].end()))
             if q:
                 missed.append(q)
                 ctx.unsupported_add(q)
@@ -2011,18 +2024,18 @@ def _merge_sector_inclusion(conds: list[Condition]) -> list[Condition]:
 
 
 def _cap_tag(c: Condition) -> str:
-    if c.op == "between" and c.value and c.value_high:
-        mid = math.sqrt(max(c.value, 1e-6) * c.value_high)
-    elif c.value is not None:
-        mid = c.value * (2 if c.op in (">", ">=") else 0.5)
-    else:
+    if c.value is None:
         return "cap"
-    return "micro_cap" if mid < 0.3 else "small_cap" if mid < 2 else "mid_cap" if mid < 25 else "large_cap"
+    if c.op == "between" and c.value_high is not None:
+        mid = math.sqrt(max(c.value, 1e-6) * max(c.value_high, 1e-6))
+        return "micro_cap" if mid < 0.3 else "small_cap" if mid < 2 else "mid_cap" if mid < 25 else "large_cap"
+    if c.op in (">", ">="):
+        return "large_cap" if c.value >= 10 else "mid_cap" if c.value >= 2 else "small_cap" if c.value >= 0.3 else "cap"
+    return "micro_cap" if c.value <= 0.3 else "small_cap" if c.value <= 2 else "mid_cap" if c.value <= 10 else "cap"
 
 
 def _tag(c: Condition) -> str:
     f = c.feature
-    hi = c.value_high if c.op == "between" else c.value
     if f == "market_cap_usd_bn":
         return _cap_tag(c)
     if f in ("sma_50_vs_sma_200_pct", "price_vs_sma_200_pct", "price_vs_sma_50_pct", "golden_cross_20d", "sma_200_slope_1m_pct"):
@@ -2030,7 +2043,14 @@ def _tag(c: Condition) -> str:
     if f in _MOM_FEATURES:
         return "momentum"
     if f == "drawdown_from_52w_high_pct":
-        return "pullback" if hi is not None and hi < -2 else "near_highs"
+        upper = c.value_high if c.op == "between" else c.value if c.op in ("<", "<=") else None
+        return "pullback" if upper is not None and upper < -2 else "near_highs"
+    if f in ("eps_revision_3m_pct", "revenue_revision_3m_pct"):
+        return "revisions"
+    if f in _LEVERAGE_FEATURES:
+        return "net_cash" if f == "net_debt_usd_bn" else "balance_sheet"
+    if f.endswith(("margin_pct", "margin_change_yoy_pp")):
+        return "margins"
     if f == "rsi_14":
         return "oversold" if c.op in ("<", "<=") else "overbought" if c.op in (">", ">=") else "rsi"
     if f in _VOLUME_FEATURES:
