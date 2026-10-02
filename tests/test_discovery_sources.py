@@ -693,6 +693,171 @@ def test_fetch_url_errors():
     assert doc.title == "A plain note" and doc.text == "A plain note\nabout momentum."
 
 
+def test_fetch_url_pdf_link_that_returns_a_web_page(monkeypatch):
+    # regression: a .pdf link answered with an HTML consent / paywall page was fed to the PDF reader
+    _install_fake_pypdf(monkeypatch, FAKE_PDF_PAGES)
+    consent = "<html><body><h1>Before you continue</h1><p>We use cookies.</p></body></html>"
+    for ctype in ("text/html; charset=utf-8", "application/pdf", ""):
+        headers = {"content-type": ctype} if ctype else {}
+        client = mock_client(lambda r, h=headers: httpx.Response(200, text=consent, headers=h))
+        with pytest.raises(SourceError, match="returned a web page.*load_pdf"):
+            fetch_url("https://journal.example.com/content/paper.pdf", client=client)
+    # a real PDF behind a .pdf link is read whatever the content type says
+    client = mock_client(lambda r: httpx.Response(200, content=b"%PDF-1.7 fake", headers={"content-type": "text/html"}))
+    assert "0.92% per month" in fetch_url("https://journal.example.com/content/paper.pdf", client=client).text
+
+
+def test_fetch_url_decodes_with_the_pages_meta_charset():
+    # regression: without a charset in the header, httpx decoded windows-1252 pages as UTF-8 (U+FFFD garbage)
+    page = (
+        '<html><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1252">'
+        "<title>Müller – Momentum</title></head><body><p>“Winners” keep winning – Müller (2026).</p></body></html>"
+    )
+    client = mock_client(lambda r: httpx.Response(200, content=page.encode("cp1252"), headers={"content-type": "text/html"}))
+    doc = fetch_url("https://blog.example.com/post", client=client)
+    assert doc.title == "Müller – Momentum"
+    assert doc.text == "“Winners” keep winning – Müller (2026)."
+    plain = mock_client(lambda r: httpx.Response(200, content="Café – note".encode("cp1252"), headers={"content-type": "text/plain"}))
+    assert fetch_url("https://blog.example.com/note.txt", client=plain).text == "Café – note"
+
+
+def test_fetch_url_size_cap_is_enforced_while_streaming(monkeypatch):
+    # regression: the whole body used to be buffered before the MAX_FETCH_BYTES check
+    monkeypatch.setattr(S, "MAX_FETCH_BYTES", 10_000)
+    produced: list[int] = []
+
+    def endless():
+        while True:
+            produced.append(1)
+            yield b"<p>" + b"x" * 4096 + b"</p>"
+
+    client = mock_client(lambda r: httpx.Response(200, content=endless(), headers={"content-type": "text/html"}))
+    with pytest.raises(SourceError, match="too large"):
+        fetch_url("https://big.example.com/page", client=client)
+    assert len(produced) <= 4  # stopped right after the cap, not at the end of the stream
+
+    # a declared Content-Length above the cap is refused before reading the body
+    def declared(request):
+        return httpx.Response(200, content=b"<p>small</p>", headers={"content-type": "text/html", "content-length": "50000000"})
+
+    with pytest.raises(SourceError, match="too large"):
+        fetch_url("https://big.example.com/declared", client=mock_client(declared))
+
+    # a gzip bomb is stopped at the cap while decompressing
+    bomb = gzip.compress(b"<p>" + b"a" * 5_000_000 + b"</p>")
+    assert len(bomb) < 10_000
+    client = mock_client(
+        lambda r: httpx.Response(200, content=bomb, headers={"content-type": "text/html", "content-encoding": "gzip"})
+    )
+    with pytest.raises(SourceError, match="too large"):
+        fetch_url("https://big.example.com/bomb", client=client)
+
+
+class _SlowStream(httpx.SyncByteStream):
+    """A body that trickles out: each chunk 'takes' 10 s on the fake clock."""
+
+    def __init__(self, clock: "FakeClock", chunks: int) -> None:
+        self.clock, self.chunks = clock, chunks
+
+    def __iter__(self):
+        for _ in range(self.chunks):
+            self.clock.t += 10.0
+            yield b"<item>"
+
+
+def test_feed_download_has_an_overall_time_limit_and_size_cap(monkeypatch):
+    clock = FakeClock()
+
+    def slow(request):
+        return httpx.Response(200, stream=_SlowStream(clock, 1000), headers={"content-type": "application/rss+xml"})
+
+    src = FeedSource([FeedConfig(name="Slow", url="https://slow.example.com/feed")], client=mock_client(slow),
+                     timeout_s=5.0, clock=clock, sleep=clock.sleep)
+    assert src.fetch() == []
+    assert any("did not finish within 60 s" in w for w in src.warnings)
+    assert clock.t - 1000.0 < 120  # gave up after ~60 s instead of trickling for 10,000 s
+
+    monkeypatch.setattr(S, "MAX_FEED_BYTES", 1000)
+    big = mock_client(lambda r: httpx.Response(200, content=b"<rss>" + b" " * 5000 + b"</rss>"))
+    src = FeedSource([FeedConfig(name="Big", url="https://big.example.com/feed")], client=big, min_interval_s=0)
+    assert src.fetch() == [] and any("'Big'" in w and "too large" in w for w in src.warnings)
+
+
+def test_fetch_url_refuses_local_and_private_addresses(fake_dns):
+    # regression (SSRF): links from feeds / papers / the model must not make the PC read intranet pages
+    seen: list[str] = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, text="<p>internal admin page</p>", headers={"content-type": "text/html"})
+
+    fake_dns["router.example.net"] = ["192.168.1.1"]
+    fake_dns["mapped.example.net"] = ["::ffff:127.0.0.1"]
+    for url in (
+        "http://127.0.0.1:8080/admin",
+        "http://localhost/",
+        "http://printer.local/",
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/",
+        "http://10.0.0.1/",
+        "http://0.0.0.0/",
+        "http://router.example.net/",
+        "http://mapped.example.net/",
+    ):
+        with pytest.raises(SourceError, match="refusing to fetch"):
+            fetch_url(url, client=mock_client(handler))
+    assert seen == []  # nothing was requested
+
+    # a public page that redirects to an internal address is refused at the redirect
+    def redirecting(request):
+        seen.append(str(request.url))
+        if request.url.host == "evil.example.com":
+            return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data/"})
+        return httpx.Response(200, text="<p>metadata secrets</p>", headers={"content-type": "text/html"})
+
+    with pytest.raises(SourceError, match=r"refusing to fetch http://169\.254\.169\.254.*redirected from"):
+        fetch_url("https://evil.example.com/x", client=mock_client(redirecting))
+    assert seen == ["https://evil.example.com/x"]
+
+    # opting in reads an intranet page on purpose
+    doc = fetch_url("http://10.0.0.1/wiki/idea", client=mock_client(handler), allow_private=True)
+    assert doc.text == "internal admin page"
+
+
+def test_fetch_url_follows_public_redirects():
+    def handler(request):
+        if request.url.path == "/old":
+            return httpx.Response(301, headers={"location": "/new"})
+        if request.url.path == "/loop":
+            return httpx.Response(302, headers={"location": "/loop"})
+        if request.url.path == "/ftp":
+            return httpx.Response(302, headers={"location": "ftp://files.example.com/x"})
+        return httpx.Response(200, text="<p>Moved here.</p>", headers={"content-type": "text/html"})
+
+    doc = fetch_url("https://site.example.com/old", client=mock_client(handler))
+    assert doc.url == "https://site.example.com/new" and doc.text == "Moved here."
+    with pytest.raises(SourceError, match="too many redirects"):
+        fetch_url("https://site.example.com/loop", client=mock_client(handler))
+    with pytest.raises(SourceError, match="unsupported URL"):
+        fetch_url("https://site.example.com/ftp", client=mock_client(handler))
+
+
+def test_feed_source_refuses_private_feeds_unless_allowed(fake_dns):
+    rss = fixture_bytes("blog_rss2.xml")
+    client = mock_client(lambda r: httpx.Response(200, content=rss))
+    feeds = [FeedConfig(name="Intranet", url="http://10.1.2.3/feed")]
+    src = FeedSource(feeds, client=client, min_interval_s=0)
+    assert src.fetch() == [] and any("'Intranet'" in w and "refusing to fetch" in w for w in src.warnings)
+    allowed = [FeedConfig(name="Intranet", url="http://10.1.2.3/feed", allow_private=True)]
+    assert len(FeedSource(allowed, client=client, min_interval_s=0).fetch()) == 3
+    assert len(FeedSource(feeds, client=client, min_interval_s=0, allow_private=True).fetch()) == 3
+    # arXiv requests go through the same guard
+    fake_dns["export.arxiv.org"] = ["127.0.0.1"]
+    arxiv = ArxivSource(client=mock_client(lambda r: httpx.Response(200, content=fixture_bytes("arxiv_qfin.atom.xml"))))
+    assert arxiv.search("momentum") == [] and "refusing to fetch" in arxiv.warnings[0]
+
+
 def test_load_pdf_with_fake_pypdf(tmp_path, monkeypatch):
     _install_fake_pypdf(monkeypatch, FAKE_PDF_PAGES)
     p = tmp_path / "industry_neutral_momentum.pdf"
