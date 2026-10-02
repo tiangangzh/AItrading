@@ -10,14 +10,21 @@ Sessions (VENDOR_REFERENCE 2.1)
 -------------------------------
 The session is opened lazily on the first data call with ``ld.open_session(name=..., app_key=...)``:
 
-* **Desktop** (``session_name=None`` -> the library default ``desktop.workspace``): talks to LSEG
+* **Platform** (the default, ``session_name='platform.ldp'``): unattended server runs with an LSEG Data
+  Platform service account (v1 username/password or v2 ``client_id``/``client_secret``) configured in
+  ``lseg-data.config.json``. The library looks for it in ``$LD_LIB_CONFIG_PATH``, then the working
+  directory, then ``~`` (not next to the script). Content is licence class L3.
+* **Desktop** (opt-in only: ``session_name='desktop.workspace'``, the *library's* default): talks to LSEG
   Workspace running on this machine. The app key is read from ``$LSEG_APP_KEY`` (``app_key_env``) or the
   config file. Workspace is licensed for individual use (licence class L4): it **must not run on a
-  server**, and lifting Workspace ``edp-token``s is prohibited (ADR section 7).
-* **Platform** (``session_name='platform.ldp'``): unattended server runs with an LSEG Data Platform
-  service account (v1 username/password or v2 ``client_id``/``client_secret``) configured in
-  ``lseg-data.config.json``. The library looks for it in ``$LD_LIB_CONFIG_PATH``, then the working
-  directory, then ``~`` (not next to the script).
+  server**, and lifting Workspace ``edp-token``s is prohibited (ADR section 7). The adapter never opens
+  it unless it is named, says so in ``warnings``, tags its documents L4 and refuses to widen its boundary.
+
+Requests are paced (``request_pause_s``) and counted against ``daily_request_cap`` (Workspace allows
+10k requests/day; Platform limits are UNVERIFIED), which raises ``ProviderError`` when exhausted.
+Session/authentication/quota errors stop at once (no retries); throttling errors back off
+exponentially; a failed ``get_history`` batch is retried one RIC at a time only until a circuit breaker
+sees the same error several times in a row.
 
 The HTTP request timeout is raised to 300 s (``ld.get_config().set_param('http.request-timeout', 300)``).
 
@@ -29,21 +36,31 @@ Data
   suffix (``AAPL.O`` -> ``AAPL``, ``IBM.N`` -> ``IBM``; a trailing lower-case share class becomes
   ``-X``: ``BRKb.N`` -> ``BRK-B``; a delisting suffix ``^..`` is dropped; index RICs such as ``.SPX`` stay
   as they are). The RIC is kept as ``vendor_id``. Two RICs with the same root keep the first; the
-  other uses its full RIC as ticker (warned). Tickers this session has not seen and that are not RICs
-  (no '.') are dropped and flagged unless ``rics={ticker: RIC}`` (the maintained symbology table, ADR
-  graft 6) supplies them.
+  other uses its full RIC as ticker (warned). Tickers this session has not seen are used as RICs only
+  when they are RIC-shaped (an index RIC such as ``.SPX``, or ``<root>.<suffix>`` with an exchange
+  suffix from the field map's ``symbology.ric_suffixes``); anything else - including dotted
+  share-class tickers such as ``BRK.B``, whose RIC is ``BRKb.N`` - is dropped and flagged unless
+  ``rics={ticker: RIC}`` (the maintained symbology table, ADR graft 6) supplies it.
 * Snapshots (fundamentals, estimates, short interest, options): ``ld.get_data(rics, codes,
   parameters={'Curn': 'USD', 'SDate': as_of})``, chunked to ~8,000 data points per request. LSEG
   drops bad or unentitled fields silently, so the returned column count is asserted on every response;
   on a mismatch the chunk is re-requested one field at a time and the dropped fields become
-  ``LEG NOT EVALUATED`` (NaN plus a warning).
+  ``LEG NOT EVALUATED`` (NaN plus a warning); later chunks of the same request skip them. When an
+  instrument comes back on several rows the first row is kept whole (values are never combined across
+  rows) and a warning names it.
 * Units: the field map's ``to_canonical`` factor converts to canonical units (``Scale=6`` USD millions
   x 1e6 -> USD absolute; implied-vol points x 0.01 -> fraction). Missing values never become numbers
   (no ``fillna``); non-numeric and infinite values are NaN.
 * ``unverifiable`` field-map entries are preflighted on the field map's ``test_ric`` (``IBM.N``) once a
-  day per provider: the field must come back as one non-empty column. A failure suspends the leg (NaN
-  plus a ``LEG NOT EVALUATED`` warning). Entries flagged ``units_verified: false`` are not served at all
-  until an override marks them admitted. ``field_log`` records what was used, for the audit trail.
+  day per provider, **with the same request parameters as the real request**: the field must come back
+  as one non-empty column. A failure suspends the leg (NaN plus a ``LEG NOT EVALUATED`` warning).
+  Unverifiable request parameters (the global ``SDate`` and the history ``adjustments``) are preflighted
+  the same way (with vs without); a failing one is dropped, warned and logged, and a historical
+  ``as_of`` that lost its ``SDate`` anchor gets NaN snapshots rather than current values. Entries
+  flagged ``units_verified: false`` are not served at all until an override marks them admitted.
+  ``field_log`` records what was used, for the audit trail.
+* Push-down (gate G5): only features admitted through the field map (``"admitted": true``) or the
+  ``admitted=`` constructor argument are pushed as SCREEN thresholds; the default admits nothing.
 * Prices: ``ld.get_history(rics, [TRDPRC_1, ACVOL_UNS, ...], interval='daily', start, end,
   adjustments=[...])``. Technical features are computed locally from this history (the reference's
   recommendation). Whether ``TRDPRC_1`` is fully corporate-action adjusted is UNVERIFIED: a warning
@@ -52,19 +69,24 @@ Data
 * Fundamentals are thin by design: only fields the reference lists. ``revenue_last_q`` vs
   ``revenue_last_q_prior_year`` is a *single-quarter* YoY (FQ0 vs FQ-4), not LTM; TTM revenue,
   EBITDA, debt and cash are not mapped (NaN). Users can add entries through an override file.
-* Documents: news via ``ld.news.get_headlines`` / ``get_story`` (licence class L3, Reuters copyright);
-  filings via ``lseg.data.content.filings`` only when enabled in the field map (its search parameters
-  are not in the reference); transcripts (StreetEvents XML over SFTP) are out of scope: none are
-  returned and a warning says so.
+* Documents: news via ``ld.news.get_headlines`` / ``get_story`` (licence class L3, Reuters copyright;
+  L4 through a desktop session), paced like every other request; filings via
+  ``lseg.data.content.filings`` only when enabled in the field map (its search parameters are not in
+  the reference); transcripts (StreetEvents XML over SFTP) are out of scope: none are returned and a
+  warning says so. Each document's metadata carries the session and its licence class.
 
 Licensing boundary (ADR section 7)
 ----------------------------------
 The default boundary is ``deny_all_text('lseg')`` with ``allow_numeric_features=False``: LSEG Platform
 content (I/B/E/S, StarMine, Reuters, StreetEvents) is licence class L3 - only ranks and booleans may
 reach Claude until gate **G3** (written per-dataset AI-use confirmation) - and a Workspace desktop
-session is L4 (nothing leaves the workstation). Pass ``boundary=DataBoundary(provider='lseg', ...,
-note='G3: <confirmation reference>')`` to widen it; a widened boundary whose note does not cite G3 is
-rejected (a policy row without a citation evaluates as deny).
+session is L4 (nothing leaves the workstation). With a ``platform.*`` session, pass
+``boundary=DataBoundary(provider='lseg', ..., note='G3: <reference>, <YYYY-MM-DD>, reviewed by <lawyer>')``
+to widen it. The note must *start* with ``G3:`` and give the confirmation reference, its date (not in
+the future) and the reviewing lawyer, with no ``<placeholder>`` and no "pending"/"not received"
+wording; anything else - including this module's own ``BOUNDARY_NOTE`` - is rejected (a policy row
+without a citation evaluates as deny, ADR section 7). A desktop session's boundary cannot be widened
+at all (L4; G3 covers only L3 loosening).
 
 Field map overrides: ``$AITRADING_FIELDMAP_LSEG`` names a JSON file deep-merged over the default
 (a ``null`` value deletes a key), then the ``fieldmap=`` constructor argument (a mapping or a path) is
@@ -99,6 +121,7 @@ from aitrading.screen.compile_lseg import (
     SCREEN_MODES,
     VALID_STATUSES,
     CompiledQuery,
+    admitted_features,
     compile_screen,
     compile_universe,
     is_point_in_time,
@@ -114,29 +137,40 @@ __all__ = [
     "FIELDMAP_ENV",
     "DEFAULT_FIELDMAP_PATH",
     "BOUNDARY_NOTE",
+    "DEFAULT_SESSION",
 ]
 
 FIELDMAP_ENV = "AITRADING_FIELDMAP_LSEG"
 DEFAULT_FIELDMAP_PATH = Path(__file__).with_name("fieldmaps") / "lseg.json"
 CONFIG_FILENAME = "lseg-data.config.json"
+DEFAULT_SESSION = "platform.ldp"  # VENDOR_REFERENCE 2.1: the unattended/server session
+DESKTOP_LICENCE_CLASS = "L4"  # ADR section 7: LSEG Workspace is desktop-licensed
+DEFAULT_RIC_SUFFIXES = ("N", "O", "OQ", "A", "P", "K", "U", "PK", "Z")  # used when the field map lists none
 
 SDK_MISSING = (
     "The LSEG Data Library for Python is not installed. Install it with:  pip install lseg-data==2.1.1   "
     '(or: pip install -e ".[lseg]"). It also needs an LSEG entitlement: either LSEG Workspace running on '
     "this machine (desktop session, individual licence, never on a server; app key in $LSEG_APP_KEY) or an "
     "LSEG Data Platform service account configured in lseg-data.config.json ($LD_LIB_CONFIG_PATH, then the "
-    "working directory, then ~) used with session_name='platform.ldp'."
+    "working directory, then ~) used with session_name='platform.ldp' (the default)."
 )
 SESSION_HELP = (
-    "Desktop session: start LSEG Workspace on this machine and set the app key (App Key Generator) in "
-    "$LSEG_APP_KEY. Platform session: pass session_name='platform.ldp' and provide lseg-data.config.json "
-    "($LD_LIB_CONFIG_PATH, then the working directory, then ~) with the service-account credentials."
+    "Platform session (default, session_name='platform.ldp'): provide lseg-data.config.json "
+    "($LD_LIB_CONFIG_PATH, then the working directory, then ~) with the service-account credentials. "
+    "Desktop session (session_name='desktop.workspace', interactive use only, never on a server): start LSEG "
+    "Workspace on this machine and set the app key (App Key Generator) in $LSEG_APP_KEY."
+)
+DESKTOP_WARNING = (
+    "LSEG desktop session ({name}): licence class L4 (LSEG Workspace, individual use). It must not run on a server "
+    "or unattended (ADR section 7); nothing derived from it may reach an external model and its boundary cannot be "
+    "widened. Use session_name='platform.ldp' for scheduled runs."
 )
 BOUNDARY_NOTE = (
     "LSEG content is licence class L3 (Platform: I/B/E/S, StarMine, Reuters, StreetEvents) or L4 (Workspace "
     "desktop session): no LSEG text or values may reach an external LLM - only ranks and booleans for L3 - "
-    "until gate G3 (written per-dataset AI-use confirmation). Widen only with an explicit "
-    "boundary=DataBoundary(provider='lseg', ..., note='G3: <confirmation reference>')."
+    "until gate G3 (written per-dataset AI-use confirmation). Widen only for a platform session, with an explicit "
+    "boundary=DataBoundary(provider='lseg', ..., note='G3: <confirmation reference>, <YYYY-MM-DD>, reviewed by "
+    "<lawyer>')."
 )
 
 # Canonical columns each raw field-map section may map (vendor_id is always the RIC).
@@ -149,7 +183,24 @@ RAW_SECTIONS: dict[str, list[str]] = {
 }
 _DATE_COLUMNS = {F.PERIOD_END, F.REPORT_DATE, F.LAST_EARNINGS_DATE, F.NEXT_EARNINGS_DATE, F.SI_SETTLEMENT_DATE}
 _LABEL_COLUMNS = {F.NAME, F.GICS_SECTOR, F.GICS_INDUSTRY, F.EXCHANGE, F.COUNTRY, F.CURRENCY, F.SECURITY_TYPE, F.VENDOR_ID}
-_GATE_RE = re.compile(r"\bG3\b")
+
+# A widened boundary's note is a policy-table citation (ADR section 7): "G3: <reference>, <date>, reviewed by <lawyer>".
+_CITATION_RE = re.compile(r"^\s*G3\s*:\s*(?P<body>\S.*)$", re.S)
+_CITATION_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_CITATION_REVIEWER_RE = re.compile(r"\breview(?:ed\s+by|er\s*:)\s*[A-Za-z]", re.I)
+_CITATION_NOT_YET_RE = re.compile(
+    r"^(?:pending|awaiting|requested|request(?:ing)?\b|draft|tbd|todo|to\s+be\b|not\b|no\b|none\b|n/?a\b|\?|"
+    r"\(?\s*placeholder)", re.I)
+_CITATION_NOT_RECEIVED_RE = re.compile(
+    r"\b(?:pending|awaiting|tbd|todo|not\s+(?:yet\s+)?(?:received|signed|confirmed|obtained|granted)|"
+    r"to\s+be\s+(?:confirmed|received|signed|obtained))\b|\?\?", re.I)
+
+# Error classes that must not be retried request by request (they burn the vendor's request quota).
+_QUOTA_ERROR_RE = re.compile(r"quota|daily (?:request )?limit|requests? per day|limit of \d+ exceeded", re.I)
+_THROTTLE_ERROR_RE = re.compile(r"\b429\b|too many requests|rate[ -]?limit|throttl", re.I)
+_SESSION_ERROR_RE = re.compile(
+    r"session (?:is )?(?:closed|expired|not open(?:ed)?|invalid)|no (?:default |open )?session|session expired|"
+    r"unauthori[sz]ed|\b40[13]\b|forbidden|authenticat|invalid[_ ]grant|credential|access token|login", re.I)
 
 
 # =============================================================================================
@@ -243,6 +294,18 @@ def validate_fieldmap(fm: Mapping[str, Any]) -> list[str]:
                 errs.append(f"raw.{section}.{key}.to_canonical must be a number")
             if not (e.get("code") or e.get("codes")):
                 errs.append(f"raw.{section}.{key}: needs 'code' (or 'codes' + 'ric_template')")
+    for name, e in (fm.get("parameters") or {}).items():
+        if str(name).startswith("_"):
+            continue
+        if isinstance(e, Mapping) and e.get("status") == "unverifiable" and e.get("value") is not None \
+                and not isinstance(e.get("probe"), str):
+            errs.append(f"parameters.{name}: an unverifiable parameter needs a 'probe' field code (it is preflighted)")
+    suffixes = (fm.get("symbology") or {}).get("ric_suffixes")
+    if suffixes is not None and not (isinstance(suffixes, list) and all(isinstance(s, str) and s for s in suffixes)):
+        errs.append("symbology.ric_suffixes must be a list of non-empty strings")
+    sess = (fm.get("sessions") or {}).get("default")
+    if sess is not None and not (isinstance(sess, str) and sess.strip()):
+        errs.append("sessions.default must be a session name such as 'platform.ldp'")
     hist = fm.get("history") or {}
     for key, e in (hist.get("fields") or {}).items():
         if key not in F.PRICE_FIELDS:
@@ -312,8 +375,60 @@ def _ric_root(ric: str) -> str:
     return root or core
 
 
-def _looks_like_ric(s: str) -> bool:
-    return "." in str(s)
+def _looks_like_ric(s: str, suffixes: Iterable[str] = DEFAULT_RIC_SUFFIXES) -> bool:
+    """An index RIC ('.SPX') or ``<root>.<known exchange suffix>`` (optional '^' delisting tail).
+
+    Dotted share-class tickers such as 'BRK.B' are *not* RICs (the RIC is 'BRKb.N').
+    """
+    core = str(s).strip().split("^", 1)[0]
+    if len(core) > 1 and core.startswith(".") and "." not in core[1:]:
+        return True
+    root, dot, suffix = core.rpartition(".")
+    return bool(dot and root and not root.startswith(".") and suffix in set(suffixes))
+
+
+def _error_kind(e: BaseException) -> str | None:
+    """'quota' / 'throttle' / 'session' for errors that are systemic rather than per request, else None."""
+    msg = f"{type(e).__name__}: {e}"
+    if _QUOTA_ERROR_RE.search(msg):
+        return "quota"
+    if _THROTTLE_ERROR_RE.search(msg):
+        return "throttle"
+    if _SESSION_ERROR_RE.search(msg):
+        return "session"
+    return None
+
+
+def _error_signature(msg: str, ric: str) -> str:
+    """Error text with the RIC and numbers masked, to spot the same failure repeating across RICs."""
+    return re.sub(r"\d+", "#", str(msg).replace(ric, "<RIC>")).strip().lower()
+
+
+def _citation_problem(note: str, today: date) -> str | None:
+    """None when ``note`` is a structured G3 citation (reference, date <= today, reviewer), else the problem."""
+    m = _CITATION_RE.match(note or "")
+    if m is None:
+        return "the note must start with 'G3:' followed by the written AI-use confirmation it relies on"
+    body = m.group("body").strip()
+    if "<" in body or ">" in body:
+        return "the citation still contains a <placeholder>"
+    if _CITATION_NOT_YET_RE.match(body) or _CITATION_NOT_RECEIVED_RE.search(body):
+        return "the citation says the confirmation has not been received"
+    dates = []
+    for y, mo, d in _CITATION_DATE_RE.findall(body):
+        try:
+            dates.append(date(int(y), int(mo), int(d)))
+        except ValueError:
+            continue
+    if not any(d <= today for d in dates):
+        return "the citation must give the confirmation date as YYYY-MM-DD (not in the future)"
+    if not _CITATION_REVIEWER_RE.search(body):
+        return "the citation must name the reviewing lawyer ('reviewed by <name>')"
+    return None
+
+
+def _params_key(params: Mapping[str, Any] | None) -> str:
+    return json.dumps(sorted((str(k), str(v)) for k, v in (params or {}).items()))
 
 
 def _render(template: str, ctx: Mapping[str, Any]) -> str:
@@ -488,6 +603,11 @@ def _find_config(env: Mapping[str, str] | None = None) -> Path | None:
     return next((p for p in candidates if p.is_file()), None)
 
 
+class _StopRequests(ProviderError):
+    """A systemic request failure (daily cap, quota, session / authentication, persistent throttling):
+    never retried request by request and never swallowed as a failed preflight or a per-RIC failure."""
+
+
 # =============================================================================================
 # Field self-check result
 # =============================================================================================
@@ -526,25 +646,40 @@ class LSEGProvider:
         ld_module: Any | None = None,
         rics: Mapping[str, str] | None = None,
         today: Callable[[], date] | None = None,
+        admitted: Iterable[str] | None = None,
+        daily_request_cap: int | None = 10_000,
     ) -> None:
         """
         Args:
             boundary: licensing boundary; default denies all LSEG text and values (see module docs).
-                A widened boundary must have ``provider='lseg'`` and cite gate G3 in its ``note``.
+                A widened boundary needs a ``platform.*`` session, ``provider='lseg'`` and a structured
+                G3 citation in its ``note`` (``'G3: <reference>, <YYYY-MM-DD>, reviewed by <lawyer>'``).
             fieldmap: overrides merged over the default field map (+ ``$AITRADING_FIELDMAP_LSEG``): a
                 mapping or a path to a JSON file.
-            session_name: ``None`` (library default, desktop.workspace) or e.g. ``'platform.ldp'``.
+            session_name: ``None`` = the field map's ``sessions.default`` (``'platform.ldp'``, the
+                unattended session). A desktop session (``'desktop.workspace'``, licence class L4, never on
+                a server) is opened only when named here.
             app_key_env: environment variable holding the app key (never logged).
             benchmark: RIC for ``get_benchmark_history`` (default ``.SPX``; falls back to the field
                 map's ``benchmark.fallback_ric`` when unentitled).
             ld_module: inject an ``lseg.data``-compatible module (tests / custom sessions).
             rics: explicit ticker -> RIC table (symbology, ADR graft 6).
-            today: clock for the point-in-time and preflight rules (tests).
+            today: clock for the point-in-time, preflight, citation and request-cap rules (tests).
+            admitted: gate G5 admission set from the run's ``field_validation_log`` (catalog feature
+                names). Only admitted features - these plus any ``"admitted": true`` in the field map -
+                are pushed as SCREEN thresholds; the default admits nothing.
+            daily_request_cap: vendor requests this provider may make per day before it raises
+                ``ProviderError`` (Workspace allows 10k/day; Platform limits are UNVERIFIED). None = no cap.
         """
         self.fieldmap: dict[str, Any] = load_fieldmap(fieldmap)
-        self.session_name = session_name
+        default_session = str((self.fieldmap.get("sessions") or {}).get("default") or DEFAULT_SESSION)
+        self.session_name: str = str(session_name).strip() if session_name else default_session
         self.app_key_env = app_key_env
         self.benchmark = benchmark
+        self._today = today or date.today
+        if isinstance(admitted, str):
+            raise TypeError("admitted must be a collection of feature names, not a string")
+        self.admitted: frozenset[str] | None = frozenset(str(a) for a in admitted) if admitted is not None else None
         self.boundary = self._resolve_boundary(boundary)
         self.capabilities: set[Capability] = {
             Capability.PRICES, Capability.FUNDAMENTALS, Capability.ESTIMATES, Capability.SHORT_INTEREST,
@@ -563,32 +698,58 @@ class LSEGProvider:
         self.request_pause_s = 0.25  # between requests (Workspace allows ~5 req/s)
         self.max_points = 8000  # data points per get_data chunk (reference get_tr)
         self.history_batch_size = 50
+        self.daily_request_cap = daily_request_cap
+        self.request_count = 0  # vendor requests made today (reset at the first request of a new day)
+        self.throttle_retries = 3  # a throttled request is retried after 1 s, 2 s, 4 s (x backoff_base_s)
+        self.backoff_base_s = 1.0
+        self.circuit_breaker_threshold = 3  # identical single-RIC history failures in a row that stop the fallback
+        self._request_day: date | None = None
         self._ld = ld_module
         self._session: Any = None
-        self._today = today or date.today
         self._sleep = time.sleep
         self._ric_of: dict[str, str] = {}
         self._ticker_of: dict[str, str] = {}
         self._names: dict[str, str] = {}
-        self._preflight_memo: dict[tuple[str, str], bool] = {}
+        self._preflight_memo: dict[tuple[str, ...], bool] = {}
+        self._param_memo: dict[tuple[str, ...], bool] = {}
         self._preflight_day: date | None = None
         for t, r in (rics or {}).items():
             self._ric_of[str(t).strip()] = str(r).strip()
             self._ticker_of[str(r).strip()] = str(t).strip()
 
     # ------------------------------------------------------------------ housekeeping
-    @staticmethod
-    def _resolve_boundary(boundary: DataBoundary | None) -> DataBoundary:
+    @property
+    def is_desktop(self) -> bool:
+        """True unless the session is a ``platform.*`` session (desktop / unknown kinds are L4, deny by default)."""
+        return self.session_name.split(".", 1)[0].strip().lower() != "platform"
+
+    @property
+    def licence_class(self) -> str:
+        """Licence class of this session's content: L4 for a desktop (Workspace) session, else L3 (ADR section 7)."""
+        return DESKTOP_LICENCE_CLASS if self.is_desktop else "L3"
+
+    def _doc_licence_class(self, cfg: Mapping[str, Any]) -> str:
+        return DESKTOP_LICENCE_CLASS if self.is_desktop else str(cfg.get("licence_class", "L3"))
+
+    def _resolve_boundary(self, boundary: DataBoundary | None) -> DataBoundary:
         if boundary is None:
             return deny_all_text("lseg", note=BOUNDARY_NOTE).model_copy(update={"allow_numeric_features": False})
         if boundary.provider != "lseg":
             raise ValueError(f"boundary.provider must be 'lseg' (got {boundary.provider!r})")
         widened = boundary.allow_numeric_features or bool(boundary.allowed_document_kinds)
-        if widened and not _GATE_RE.search(boundary.note or ""):
+        if not widened:
+            return boundary
+        if self.is_desktop:
             raise ValueError(
-                "a widened LSEG boundary must cite gate G3 (written per-dataset AI-use confirmation) in its note, "
-                "e.g. note='G3: LSEG letter 2026-xx-xx, reviewed by <lawyer>'; a policy row without a citation "
-                "evaluates as deny")
+                f"the LSEG session '{self.session_name}' is a desktop (Workspace) session, licence class L4: nothing "
+                "derived from it may reach an external model, so its boundary cannot be widened (gate G3 covers only "
+                "L3 loosening; ADR section 7). Use session_name='platform.ldp' with a G3 citation.")
+        problem = _citation_problem(boundary.note or "", self._today())
+        if problem:
+            raise ValueError(
+                f"a widened LSEG boundary must cite gate G3 (written per-dataset AI-use confirmation): {problem}. "
+                "Expected note='G3: <confirmation reference>, <YYYY-MM-DD>, reviewed by <lawyer>'; a policy row "
+                "without a citation evaluates as deny (ADR section 7)")
         return boundary
 
     def _warn(self, msg: str) -> None:
@@ -598,6 +759,46 @@ class LSEGProvider:
     def _pause(self) -> None:
         if self.request_pause_s > 0:
             self._sleep(self.request_pause_s)
+
+    def _count_request(self, what: str) -> None:
+        today = self._today()
+        if self._request_day != today:
+            self._request_day, self.request_count = today, 0
+        cap = self.daily_request_cap
+        if cap is not None and self.request_count >= int(cap):
+            raise _StopRequests(
+                f"LSEG daily request cap reached ({self.request_count} of {int(cap)} requests today); {what} not sent. "
+                "Raise daily_request_cap only within the entitlement's limits (Workspace: 10k requests/day; "
+                "Platform limits are UNVERIFIED).")
+        self.request_count += 1
+
+    def _call(self, what: str, fn: Callable[..., Any], **kwargs: Any) -> Any:
+        """One counted vendor request.
+
+        Quota and session/authentication errors raise ``ProviderError`` at once (retrying them only burns
+        the request quota); throttling is retried with exponential backoff (``backoff_base_s`` x 1, 2, 4)
+        up to ``throttle_retries`` times. Any other exception propagates unchanged (a per-request failure).
+        """
+        attempt = 0
+        while True:
+            self._count_request(what)
+            try:
+                return fn(**kwargs)
+            except ProviderError:
+                raise
+            except Exception as e:  # noqa: BLE001 - classified below
+                kind = _error_kind(e)
+                if kind is None:
+                    raise
+                if kind == "throttle" and attempt < max(0, int(self.throttle_retries)):
+                    delay = float(self.backoff_base_s) * (2 ** attempt)
+                    attempt += 1
+                    self._warn(f"LSEG {what}: throttled by the vendor; backing off exponentially before retrying.")
+                    if delay > 0:
+                        self._sleep(delay)
+                    continue
+                how = f"still throttled after {attempt} retries" if kind == "throttle" else f"{kind} error, not retried"
+                raise _StopRequests(f"LSEG {what} stopped ({how}): {e}") from e
 
     def _ldm(self) -> Any:
         if self._ld is None:
@@ -611,9 +812,7 @@ class LSEGProvider:
         """The ``lseg.data`` module with a session open (opened once, lazily)."""
         ld = self._ldm()
         if self._session is None:
-            kwargs: dict[str, Any] = {}
-            if self.session_name:
-                kwargs["name"] = self.session_name
+            kwargs: dict[str, Any] = {"name": self.session_name}  # always explicit: never the library's desktop default
             key = os.environ.get(self.app_key_env) if self.app_key_env else None
             if key:
                 kwargs["app_key"] = key
@@ -621,11 +820,13 @@ class LSEGProvider:
                 ld.get_config().set_param("http.request-timeout", 300)
             except Exception:  # noqa: BLE001 - optional tuning; the library default (20 s) still works
                 pass
-            kind = self.session_name or "default (desktop.workspace)"
+            if self.is_desktop:
+                self._warn(DESKTOP_WARNING.format(name=self.session_name))
             try:
                 session = ld.open_session(**kwargs)
             except Exception as e:  # noqa: BLE001
-                raise ProviderUnavailable(f"Could not open an LSEG session ({kind}): {e}. {SESSION_HELP}") from e
+                raise ProviderUnavailable(f"Could not open an LSEG session ({self.session_name}): {e}. "
+                                          f"{SESSION_HELP}") from e
             self._session = session if session is not None else True
         return ld
 
@@ -646,13 +847,16 @@ class LSEGProvider:
         except ProviderUnavailable as e:
             problems.append(str(e))
         cfg = _find_config()
-        if (self.session_name or "").startswith("platform"):
+        if not self.is_desktop:
             if cfg is None:
                 problems.append(f"Platform session '{self.session_name}' needs {CONFIG_FILENAME} with the service-account "
                                 "credentials in $LD_LIB_CONFIG_PATH, the working directory or ~ (none found).")
-        elif cfg is None and not os.environ.get(self.app_key_env or ""):
-            problems.append(f"Desktop session: set ${self.app_key_env} to a Workspace app key (or provide {CONFIG_FILENAME}); "
-                            "LSEG Workspace must be running on this machine (individual licence, never on a server).")
+        else:
+            problems.append(DESKTOP_WARNING.format(name=self.session_name))
+            if cfg is None and not os.environ.get(self.app_key_env or ""):
+                problems.append(f"Desktop session: set ${self.app_key_env} to a Workspace app key (or provide "
+                                f"{CONFIG_FILENAME}); LSEG Workspace must be running on this machine (individual "
+                                "licence, never on a server).")
         return problems
 
     # ------------------------------------------------------------------ symbology
@@ -674,9 +878,17 @@ class LSEGProvider:
         return out
 
     def ric_for(self, ticker: str) -> str | None:
-        """The RIC this provider uses for ``ticker`` (None when unresolved)."""
+        """The RIC this provider uses for ``ticker`` (None when unresolved).
+
+        Known tickers (SCREEN results, ``rics=``) resolve through the symbology table; otherwise the
+        string itself is used only when it is RIC-shaped (``.SPX``, ``IBM.N``, ``XYZ.N^K20``). A dotted
+        share-class ticker such as ``BRK.B`` is not a RIC (that RIC is ``BRKb.N``) and stays unresolved.
+        """
         t = str(ticker).strip()
-        return self._ric_of.get(t) or (t if _looks_like_ric(t) else None)
+        if t in self._ric_of:
+            return self._ric_of[t]
+        suffixes = (self.fieldmap.get("symbology") or {}).get("ric_suffixes") or DEFAULT_RIC_SUFFIXES
+        return t if _looks_like_ric(t, suffixes) else None
 
     def _resolve(self, tickers: list[str], what: str) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -699,6 +911,7 @@ class LSEGProvider:
         return {"as_of": as_of.isoformat(), "as_of_1m": (as_of - timedelta(days=30)).isoformat()}
 
     def _params(self, as_of: date) -> dict[str, Any]:
+        """Request parameters exactly as configured in the field map (before parameter preflight)."""
         ctx = self._ctx(as_of)
         out: dict[str, Any] = {}
         for k, e in (self.fieldmap.get("parameters") or {}).items():
@@ -710,15 +923,95 @@ class LSEGProvider:
             out[k] = _render(v, ctx) if isinstance(v, str) else v
         return out
 
-    @staticmethod
-    def _get_data_raw(ld: Any, universe: Any, codes: list[str], params: Mapping[str, Any] | None) -> pd.DataFrame | None:
+    def _request_params(self, as_of: date) -> dict[str, Any]:
+        """Parameters for real snapshot requests: configured ones minus unverifiable ones that failed preflight.
+
+        Each ``unverifiable`` parameter (the global ``SDate``) is preflighted once a day per value on
+        ``test_ric``: its ``probe`` field is requested with and without it (both values go to
+        ``field_log['parameters.<name>']``). It is dropped (warned, logged) when the request with it
+        returns nothing while the request without it works.
+        """
+        params = self._params(as_of)
+        for name, entry in (self.fieldmap.get("parameters") or {}).items():
+            if name not in params or not isinstance(entry, Mapping) or entry.get("status") != "unverifiable":
+                continue
+            if not self._parameter_ok(str(name), entry, params, as_of):
+                params.pop(name, None)
+        return params
+
+    def _anchored(self, as_of: date, params: Mapping[str, Any]) -> bool:
+        """True when snapshot values requested with ``params`` are as of ``as_of``.
+
+        That needs a parameter flagged ``anchors_as_of`` in the field map (the global ``SDate``), unless
+        ``as_of`` is the latest completed session (then the latest values are as-of values).
+        """
+        anchors = [k for k, e in (self.fieldmap.get("parameters") or {}).items()
+                   if isinstance(e, Mapping) and e.get("anchors_as_of")]
+        return any(k in params for k in anchors) or is_point_in_time(as_of, self._today())
+
+    def _probe(self, ld: Any, ric: str, code: str, params: Mapping[str, Any] | None) -> tuple[bool, Any, str]:
+        """(passed, first non-empty value, why not) for ``get_data(ric, [code], params)``; systemic errors raise."""
+        try:
+            df = self._get_data_raw(ld, ric, [code], params)
+        except ProviderError:
+            raise
+        except Exception as e:  # noqa: BLE001 - any other failure is a failed probe
+            return False, None, f"request failed ({e})"
+        if not isinstance(df, pd.DataFrame) or df.shape[1] != 2:
+            return False, None, "no column returned"
+        vals = [v for v in df.iloc[:, 1] if not _missing(v)]
+        if not vals:
+            return False, None, "column returned but empty"
+        return True, _py(vals[0]), ""
+
+    def _parameter_ok(self, name: str, entry: Mapping[str, Any], params: Mapping[str, Any], as_of: date) -> bool:
+        self._reset_preflight_if_new_day()
+        value = params[name]
+        base = {k: v for k, v in params.items() if k != name}
+        probe = str(entry.get("probe") or "")
+        key = (self.test_ric, f"param:{name}", str(value), _params_key(base), probe)
+        if key in self._param_memo:
+            return self._param_memo[key]
+        log: dict[str, Any] = {"code": probe, "status": "unverifiable", "value": value, "preflight": None,
+                               "with": None, "without": None, "used": False, "reason": ""}
+        self.field_log[f"parameters.{name}"] = log
+        if not probe:  # validate_fieldmap requires a probe; an override could still delete it
+            keep, log["reason"] = False, "no 'probe' field configured: an unverifiable parameter is not sent unpreflighted"
+        else:
+            ld = self._open()
+            ok_with, v_with, why_with = self._probe(ld, self.test_ric, probe, {**base, name: value})
+            self._pause()
+            ok_without, v_without, why_without = self._probe(ld, self.test_ric, probe, base or None)
+            log.update({"preflight": ok_with, "with": v_with, "without": v_without})
+            if ok_with:
+                keep = True
+                if ok_without and v_with == v_without and not is_point_in_time(as_of, self._today()):
+                    self._warn(f"LSEG parameter {name}={value}: {probe} on {self.test_ric} returned the same value with and "
+                               f"without it ({v_with!r}) for a historical as_of; check that {name} is honoured before "
+                               "admitting snapshot values (G5).")
+            elif ok_without:
+                keep = False
+                log["reason"] = f"{probe} on {self.test_ric} returned nothing with {name}={value} ({why_with}) but works without it"
+            else:
+                keep = True  # inconclusive: the probe fails either way, so the parameter is not what is broken
+                log["reason"] = (f"inconclusive: {probe} on {self.test_ric} failed with ({why_with}) and without "
+                                 f"({why_without}) the parameter")
+                self._warn(f"LSEG parameter preflight for {name} inconclusive ({log['reason']}); {name} kept.")
+        log["used"] = keep
+        if not keep:
+            self._warn(f"LSEG parameter {name}={value} dropped: {log['reason']} (unverifiable parameter, preflight failed). "
+                       "Snapshots for a historical as_of are NOT EVALUATED without an as_of anchor.")
+        self._param_memo[key] = keep
+        return keep
+
+    def _get_data_raw(self, ld: Any, universe: Any, codes: list[str], params: Mapping[str, Any] | None) -> pd.DataFrame | None:
         kwargs: dict[str, Any] = {"universe": universe, "fields": list(codes)}
         if params:
             kwargs["parameters"] = dict(params)
         header = getattr(getattr(ld, "HeaderType", None), "NAME", None)
         if header is not None:
             kwargs["header_type"] = header
-        return ld.get_data(**kwargs)
+        return self._call("get_data", ld.get_data, **kwargs)
 
     def _get_data(self, ld: Any, universe: Any, codes: list[str], params: Mapping[str, Any] | None) -> pd.DataFrame | None:
         try:
@@ -729,7 +1022,12 @@ class LSEGProvider:
             raise ProviderError(f"LSEG get_data failed for {len(codes)} field(s) ({', '.join(codes[:5])}): {e}") from e
 
     def _get_tr(self, universe: str | list[str], fields: Mapping[str, str], params: Mapping[str, Any] | None) -> pd.DataFrame:
-        """Snapshot ``fields`` ({key: code}) for ``universe`` -> frame indexed by RIC, one column per key."""
+        """Snapshot ``fields`` ({key: code}) for ``universe`` -> frame indexed by RIC, one column per key.
+
+        Fields LSEG dropped in one chunk are not requested again for later chunks (NaN). An instrument
+        that comes back on several rows keeps its first row whole: values are never combined across
+        rows (a warning names the instruments).
+        """
         keys, codes = list(fields), list(fields.values())
         empty = pd.DataFrame({k: pd.Series(dtype="object") for k in keys}, index=pd.Index([], name="RIC"))
         if not codes:
@@ -741,28 +1039,48 @@ class LSEGProvider:
             step = max(1, self.max_points // len(codes))
             chunks = [list(universe[i:i + step]) for i in range(0, len(universe), step)]
         parts: list[pd.DataFrame] = []
+        dropped: set[str] = set()
         for i, chunk in enumerate(chunks):
+            live = [(k, c) for k, c in zip(keys, codes) if c not in dropped]
+            if not live:
+                break
             if i:
                 self._pause()
-            df = self._get_data(ld, chunk, codes, params)
+            lkeys, lcodes = [k for k, _ in live], [c for _, c in live]
+            df = self._get_data(ld, chunk, lcodes, params)
             if df is None or not isinstance(df, pd.DataFrame) or df.shape[1] == 0:
                 continue
-            if df.shape[1] == len(codes) + 1:
+            if df.shape[1] == len(lcodes) + 1:
                 part = df.copy()
-                part.columns = ["RIC", *keys]
+                part.columns = ["RIC", *lkeys]
             else:
-                part = self._field_by_field(ld, chunk, keys, codes, params, [str(c) for c in df.columns])
+                part, newly = self._field_by_field(ld, chunk, lkeys, lcodes, params, [str(c) for c in df.columns])
+                dropped |= newly
             parts.append(part)
         if not parts:
             return empty
         out = pd.concat(parts, ignore_index=True)
+        for k in keys:
+            if k not in out.columns:
+                out[k] = np.nan
+        out = out[["RIC", *keys]]
         ric = pd.Series([("" if _missing(v) else str(v).strip()) for v in out["RIC"]], index=out.index)
         out = out.assign(RIC=ric)
         out = out[out["RIC"] != ""]
-        return out.groupby("RIC", sort=False).first()
+        dup = out["RIC"].duplicated(keep="first")
+        if dup.any():
+            self._warn_duplicate_rows(sorted(set(out.loc[dup, "RIC"])))
+            out = out[~dup]
+        return out.set_index("RIC")
+
+    def _warn_duplicate_rows(self, rics: list[str]) -> None:
+        more = ", ..." if len(rics) > 20 else ""
+        self._warn(f"LSEG returned several rows for {len(rics)} instrument(s) ({', '.join(rics[:20])}{more}); the first "
+                   "row of each is kept whole (values are never combined across rows).")
 
     def _field_by_field(self, ld: Any, chunk: Any, keys: list[str], codes: list[str], params: Mapping[str, Any] | None,
-                        returned: list[str]) -> pd.DataFrame:
+                        returned: list[str]) -> tuple[pd.DataFrame, set[str]]:
+        """Re-request a chunk one field at a time -> (frame with a RIC column, codes LSEG dropped)."""
         self._warn(f"LSEG returned {max(0, len(returned) - 1)} of {len(codes)} requested field column(s) ({returned}); "
                    "re-requested one field at a time (LSEG drops bad or unentitled fields silently).")
         series: dict[str, pd.Series] = {}
@@ -774,74 +1092,141 @@ class LSEGProvider:
                 dropped.append(code)
                 continue
             s = pd.Series(list(d1.iloc[:, 1]), index=[str(v).strip() for v in d1.iloc[:, 0]], dtype="object")
+            if s.index.duplicated().any():
+                self._warn_duplicate_rows(sorted(set(s.index[s.index.duplicated()])))
             series[key] = s[~s.index.duplicated(keep="first")]
         if dropped:
             self._warn(f"LEG NOT EVALUATED: LSEG returned no column for {', '.join(dropped)} (unentitled or invalid "
-                       "field); those values are NaN.")
+                       "field); those values are NaN and the field is not requested again in this call.")
         index = pd.Index(sorted(set().union(*[set(s.index) for s in series.values()]))) if series else pd.Index([])
         frame = pd.DataFrame({k: (series[k].reindex(index) if k in series else pd.Series(np.nan, index=index, dtype="object"))
                               for k in keys}, index=index)
         frame.insert(0, "RIC", list(index))
-        return frame.reset_index(drop=True)
+        return frame.reset_index(drop=True), set(dropped)
 
     # ------------------------------------------------------------------ preflight / gating
     def _reset_preflight_if_new_day(self) -> None:
         today = self._today()
         if self._preflight_day != today:
             self._preflight_memo = {}
+            self._param_memo = {}
             self._preflight_day = today
 
-    def _preflight(self, codes: list[str], ric: str | None = None) -> dict[str, bool]:
-        """A code passes when ``get_data(ric, [code])`` returns exactly one non-empty column (reference 2.1)."""
+    def _preflight(self, codes: list[str], ric: str | None = None,
+                   params: Mapping[str, Any] | None = None) -> dict[str, bool]:
+        """A code passes when ``get_data(ric, [code], params)`` returns exactly one non-empty column.
+
+        ``params`` must be the parameters of the real request the code is preflighted for (a field can
+        work bare and fail under ``{'Curn': 'USD', 'SDate': as_of}``); the memo is per day, RIC, code and
+        parameters. Quota / session errors propagate instead of failing (and memoising) every field.
+        """
         self._reset_preflight_if_new_day()
         ric = ric or self.test_ric
-        todo = [c for c in dict.fromkeys(codes) if (ric, c) not in self._preflight_memo]
+        pkey = _params_key(params)
+        todo = [c for c in dict.fromkeys(codes) if (ric, c, pkey) not in self._preflight_memo]
         if todo:
             ld = self._open()
             for i, c in enumerate(todo):
                 if i:
                     self._pause()
-                try:
-                    df = self._get_data_raw(ld, ric, [c], None)
-                    ok = (isinstance(df, pd.DataFrame) and df.shape[1] == 2
-                          and any(not _missing(v) for v in df.iloc[:, 1]))
-                except Exception:  # noqa: BLE001 - any failure is a failed preflight
-                    ok = False
-                self._preflight_memo[(ric, c)] = bool(ok)
-        return {c: self._preflight_memo[(ric, c)] for c in codes}
+                ok, _value, _why = self._probe(ld, ric, c, params or None)
+                self._preflight_memo[(ric, c, pkey)] = bool(ok)
+        return {c: self._preflight_memo[(ric, c, pkey)] for c in codes}
 
-    def _history_kwargs(self, universe: list[str], codes: list[str], start: date, end: date) -> dict[str, Any]:
+    def _history_kwargs(self, universe: list[str], codes: list[str], start: date, end: date,
+                        adjustments: list[Any] | None) -> dict[str, Any]:
         hist = self.fieldmap.get("history") or {}
         kwargs: dict[str, Any] = {"universe": list(universe), "fields": list(codes), "interval": hist.get("interval", "daily"),
                                   "start": start.isoformat(), "end": end.isoformat()}
-        adj = hist.get("adjustments")
-        adj = adj.get("value") if isinstance(adj, Mapping) else adj
-        if adj:
-            kwargs["adjustments"] = list(adj)
+        if adjustments:
+            kwargs["adjustments"] = list(adjustments)
         return kwargs
 
-    def _preflight_history(self, codes: list[str]) -> dict[str, bool]:
+    def _configured_adjustments(self) -> tuple[list[Any] | None, Mapping[str, Any]]:
+        adj = (self.fieldmap.get("history") or {}).get("adjustments")
+        entry = adj if isinstance(adj, Mapping) else {}
+        value = adj.get("value") if isinstance(adj, Mapping) else adj
+        return (list(value) if value else None), entry
+
+    def _history_probe(self, ld: Any, code: str, adjustments: list[Any] | None) -> tuple[bool, str]:
+        today = self._today()
+        try:
+            raw = self._call("get_history", ld.get_history,
+                             **self._history_kwargs([self.test_ric], [code], today - timedelta(days=14), today, adjustments))
+            got = _split_history(raw, [self.test_ric], [code]).get(self.test_ric)
+        except ProviderError:
+            raise
+        except Exception as e:  # noqa: BLE001 - a failed probe
+            return False, f"request failed ({e})"
+        if got is None or not got[code].notna().any():
+            return False, "no daily values"
+        return True, ""
+
+    def _history_adjustments(self) -> list[Any] | None:
+        """The ``adjustments`` argument real history requests use.
+
+        Unverifiable adjustment values are preflighted once a day on ``test_ric``: the close history is
+        requested with and without them; when only the request without them works they are dropped
+        (library default adjustments), warned and logged in ``field_log['history.adjustments']``.
+        """
+        value, entry = self._configured_adjustments()
+        if not value or entry.get("status") != "unverifiable":
+            return value
+        self._reset_preflight_if_new_day()
+        close = str(((((self.fieldmap.get("history") or {}).get("fields")) or {}).get(F.CLOSE) or {}).get("code") or "")
+        key = (self.test_ric, "history-adjustments", json.dumps(value, default=str), close)
+        if key not in self._param_memo:
+            log: dict[str, Any] = {"code": close, "status": "unverifiable", "value": value, "preflight": None,
+                                   "used": True, "reason": ""}
+            self.field_log["history.adjustments"] = log
+            keep = True
+            if close:
+                ld = self._open()
+                ok_with, why_with = self._history_probe(ld, close, value)
+                self._pause()
+                ok_without, why_without = self._history_probe(ld, close, None)
+                log.update({"preflight": ok_with, "without": ok_without})
+                if not ok_with and ok_without:
+                    keep = False
+                    log["reason"] = (f"{close} history on {self.test_ric} failed with adjustments={value} ({why_with}) "
+                                     "but works without them")
+                    self._warn(f"LSEG history: adjustments {value} dropped ({log['reason']}; unverifiable parameter, "
+                               "preflight failed); the library default adjustments apply.")
+                elif not ok_with:
+                    log["reason"] = f"inconclusive: {close} history failed with ({why_with}) and without ({why_without})"
+            log["used"] = keep
+            self._param_memo[key] = keep
+        return value if self._param_memo[key] else None
+
+    def _preflight_history(self, codes: list[str], adjustments: list[Any] | None) -> dict[str, bool]:
+        """History fields pass when ``get_history(test_ric, [code], adjustments=...)`` returns daily values."""
         self._reset_preflight_if_new_day()
         ric = self.test_ric
-        todo = [c for c in dict.fromkeys(codes) if (ric, f"history:{c}") not in self._preflight_memo]
+        akey = json.dumps(adjustments, default=str)
+        todo = [c for c in dict.fromkeys(codes) if (ric, f"history:{c}", akey) not in self._preflight_memo]
         if todo:
             ld = self._open()
-            today = self._today()
             for i, c in enumerate(todo):
                 if i:
                     self._pause()
-                try:
-                    raw = ld.get_history(**self._history_kwargs([ric], [c], today - timedelta(days=14), today))
-                    got = _split_history(raw, [ric], [c]).get(ric)
-                    ok = got is not None and got[c].notna().any()
-                except Exception:  # noqa: BLE001
-                    ok = False
-                self._preflight_memo[(ric, f"history:{c}")] = bool(ok)
-        return {c: self._preflight_memo[(ric, f"history:{c}")] for c in codes}
+                ok, _why = self._history_probe(ld, c, adjustments)
+                self._preflight_memo[(ric, f"history:{c}", akey)] = bool(ok)
+        return {c: self._preflight_memo[(ric, f"history:{c}", akey)] for c in codes}
 
-    def _usable(self, section: str, as_of: date) -> dict[str, tuple[str, Mapping[str, Any]]]:
-        """Field-map entries of a raw section that may be requested now: {key: (rendered code, entry)}."""
+    @staticmethod
+    def _self_anchored(entry: Mapping[str, Any]) -> bool:
+        """The field code itself carries the as_of date (e.g. a ``{as_of}`` placeholder in its SDate)."""
+        return "{as_of" in str(entry.get("code", ""))
+
+    def _usable(self, section: str, as_of: date, params: Mapping[str, Any]) -> dict[str, tuple[str, Mapping[str, Any]]]:
+        """Field-map entries of a raw section that may be requested now: {key: (rendered code, entry)}.
+
+        Unverifiable entries are preflighted with ``params`` (the real request's parameters). For a
+        historical ``as_of`` without an as_of anchor in ``params`` only self-anchored entries (and, for
+        the universe, labels) are served: anything else would be today's value (look-ahead).
+        """
         ctx = self._ctx(as_of)
+        anchored = self._anchored(as_of, params)
         usable: dict[str, tuple[str, Mapping[str, Any]]] = {}
         skipped: dict[str, str] = {}
         need: dict[str, str] = {}
@@ -855,11 +1240,15 @@ class LSEGProvider:
                 skipped[key] = f"{code}: units UNVERIFIED in the field map (not served until admitted)"
                 log["reason"] = skipped[key]
                 continue
+            if not anchored and not self._self_anchored(e) and not (section == "universe" and e.get("kind") == "label"):
+                skipped[key] = f"{code}: no as_of anchor for the historical as_of {as_of} (it would be today's value)"
+                log["reason"] = skipped[key]
+                continue
             if e.get("status") == "unverifiable":
                 need[key] = code
             usable[key] = (code, e)
         if need:
-            pf = self._preflight(list(need.values()))
+            pf = self._preflight(list(need.values()), params=params)
             for key, code in need.items():
                 self.field_log[f"{section}.{key}"]["preflight"] = pf[code]
                 if not pf[code]:
@@ -879,10 +1268,11 @@ class LSEGProvider:
         if not tickers:
             return _assemble(columns, [], {}), {}
         ric_of = self._resolve(tickers, section)
-        usable = self._usable(section, as_of) if ric_of else {}  # no preflight requests without a resolved RIC
+        params = self._request_params(as_of) if ric_of else {}  # no preflight requests without a resolved RIC
+        usable = self._usable(section, as_of, params) if ric_of else {}
         data: dict[str, pd.Series] = {}
         if usable:
-            frame = self._get_tr(sorted(set(ric_of.values())), {k: c for k, (c, _) in usable.items()}, self._params(as_of))
+            frame = self._get_tr(sorted(set(ric_of.values())), {k: c for k, (c, _) in usable.items()}, params)
             for key, (_code, entry) in usable.items():
                 conv = _convert(frame[key] if key in frame.columns else pd.Series(np.nan, index=frame.index, dtype="object"), entry)
                 data[key] = pd.Series([conv.get(ric_of[t], np.nan) if t in ric_of else np.nan for t in tickers],
@@ -890,8 +1280,19 @@ class LSEGProvider:
         return _assemble(columns, tickers, data), ric_of
 
     def get_fundamentals(self, tickers: list[str], as_of: date) -> pd.DataFrame:
-        """Fundamentals snapshot as of ``as_of`` (SDate). A report date after as_of blanks the row."""
+        """Fundamentals snapshot as of ``as_of`` (SDate). A report date after as_of blanks the row.
+
+        The guard needs the report date of the same (FQ0) period as the values; a row with values but no
+        report date (leg NOT EVALUATED or no data) cannot be checked, and a warning says so.
+        """
         df, _ = self._snapshot("fundamentals", tickers, as_of, F.FUNDAMENTAL_COLUMNS)
+        values = df.drop(columns=[F.REPORT_DATE, F.PERIOD_END]).notna().any(axis=1)
+        unchecked = [str(t) for t in df.index[values & df[F.REPORT_DATE].isna()]]
+        if unchecked:
+            more = ", ..." if len(unchecked) > 20 else ""
+            self._warn(f"LSEG fundamentals: no report date for {len(unchecked)} ticker(s) ({', '.join(unchecked[:20])}"
+                       f"{more}): the look-ahead guard (report date after as_of blanks the row) could not run for them; "
+                       "their values rely on the SDate anchor alone.")
         late = df[F.REPORT_DATE].notna() & (df[F.REPORT_DATE] > pd.Timestamp(as_of))
         if late.any():
             names = [str(t) for t in df.index[late]]
@@ -928,22 +1329,26 @@ class LSEGProvider:
             ric_of = self._resolve(tickers, "options")
             ctx = self._ctx(as_of)
             codes = [_render(c, ctx) for c in entry["codes"]]
-            ok = True
-            if entry.get("units_verified") is False:
+            ok = bool(ric_of)  # no preflight requests without a resolved RIC
+            params = self._request_params(as_of) if ok else {}
+            if ok and entry.get("units_verified") is False:
                 ok = False
                 self._warn(f"LSEG options: LEG NOT EVALUATED for {F.IV_30D_ATM} (units UNVERIFIED in the field map).")
-            elif entry.get("status") == "unverifiable":
+            elif ok and not self._anchored(as_of, params) and not any("{as_of" in str(c) for c in entry["codes"]):
+                ok = False
+                self._warn(f"LSEG options: LEG NOT EVALUATED for {F.IV_30D_ATM} (no as_of anchor for the historical "
+                           f"as_of {as_of}: it would be today's value).")
+            elif ok and entry.get("status") == "unverifiable":
                 probe = str(entry["ric_template"]).format(root=_ric_root(self.test_ric), ticker=ric_to_ticker(self.test_ric),
                                                           ric=self.test_ric)
-                pf = self._preflight(codes, ric=probe)
+                pf = self._preflight(codes, ric=probe, params=params)
                 ok = all(pf.values())
                 if not ok:
                     self._warn(f"LSEG options: LEG NOT EVALUATED for {F.IV_30D_ATM} (preflight on {probe} failed).")
-            if ok and ric_of:
+            if ok:
                 iv_ric = {t: str(entry["ric_template"]).format(root=_ric_root(r), ticker=ric_to_ticker(r), ric=r)
                           for t, r in ric_of.items()}
-                frame = self._get_tr(sorted(set(iv_ric.values())), {f"c{i}": c for i, c in enumerate(codes)},
-                                     self._params(as_of))
+                frame = self._get_tr(sorted(set(iv_ric.values())), {f"c{i}": c for i, c in enumerate(codes)}, params)
                 num = pd.DataFrame({c: [_to_float(v) for v in frame[c]] for c in frame.columns}, index=frame.index)
                 comb = num.mean(axis=1, skipna=True) if entry.get("combine", "mean") == "mean" else num.iloc[:, 0]
                 comb = comb * float(entry.get("to_canonical", 1.0))
@@ -971,10 +1376,11 @@ class LSEGProvider:
         if not is_point_in_time(as_of, self._today()):
             self._warn(f"as_of {as_of} is historical: the LSEG SCREEN universe lists instruments active today "
                        "(survivorship bias); snapshot values are anchored with SDate.")
-        usable = self._usable("universe", as_of)
+        params = self._request_params(as_of)
+        usable = self._usable("universe", as_of, params)
         if not usable:
             raise ProviderError("the LSEG field map has no usable universe fields")
-        frame = self._get_tr(cq.expression, {k: c for k, (c, _) in usable.items()}, self._params(as_of))
+        frame = self._get_tr(cq.expression, {k: c for k, (c, _) in usable.items()}, params)
         rics = [str(r) for r in frame.index]
         if not rics:
             self._warn(f"LSEG universe SCREEN returned 0 instruments ({cq.expression}); check entitlements and field codes.")
@@ -1015,18 +1421,27 @@ class LSEGProvider:
     def pushdown_screen(self, spec: Any, as_of: date) -> PushdownResult:
         """Run the compiled SCREEN: ``ld.get_data(universe=<SCREEN expr>, fields=['TR.CommonName'])``.
 
-        Only confirmed/corrected predicates are pushed (see ``aitrading.screen.compile_lseg``); the rest are
-        returned as residual conditions for the local engine. The query is recorded verbatim.
+        Only admitted (gate G5: ``admitted=`` plus ``"admitted": true`` in the field map), confirmed/corrected
+        predicates are pushed, and time-varying ones only when ``as_of`` is the latest completed session
+        (see ``aitrading.screen.compile_lseg``); the rest are returned as residual conditions for the
+        local engine. The query is recorded verbatim; ``last_pushdown.to_audit()`` records the split, the
+        admission set and the as_of lag. Preflights use the SCREEN request's own form (no parameters).
         """
         today = self._today()
-        codes = preflight_codes(spec, self.fieldmap, as_of, today=today)
+        codes = preflight_codes(spec, self.fieldmap, as_of, today=today, admitted=self.admitted)
         pf = self._preflight(codes) if codes else {}
-        cq = compile_screen(spec, self.fieldmap, as_of, preflight=pf, today=today)
+        cq = compile_screen(spec, self.fieldmap, as_of, preflight=pf, today=today, admitted=self.admitted)
         self.last_pushdown = cq
         if not cq.point_in_time:
-            self._warn(f"as_of {as_of} is historical: SCREEN evaluates current values, so only static listing predicates "
-                       "were pushed (every time-varying condition is residual); the listing reflects today's active "
-                       "instruments (survivorship bias).")
+            self._warn(f"as_of {as_of} is historical (older than the latest completed session): SCREEN evaluates the "
+                       "latest values with no date anchor, so only static listing predicates were pushed (every "
+                       "time-varying condition is residual); the listing reflects today's active instruments "
+                       "(survivorship bias).")
+        not_admitted = [r.condition for r in cq.residual if r.reason.startswith("not admitted (G5)")]
+        if not_admitted:
+            self._warn(f"LSEG push-down: {len(not_admitted)} condition(s) not admitted under gate G5 stay local "
+                       f"({', '.join(not_admitted[:10])}); admit them with verify_fields() evidence in the "
+                       "field_validation_log, then pass admitted=[...].")
         name_entry = ((self.fieldmap.get("raw") or {}).get("universe") or {}).get(F.NAME) or {}
         name_code = str(name_entry.get("code") or "")
         if not name_code:
@@ -1056,8 +1471,9 @@ class LSEGProvider:
         )
 
     # ------------------------------------------------------------------ prices
-    def _history_fields(self) -> dict[str, str]:
-        """Usable history fields {canonical price field: code}; unverifiable ones are preflighted."""
+    def _history_fields(self, adjustments: list[Any] | None) -> dict[str, str]:
+        """Usable history fields {canonical price field: code}; unverifiable ones are preflighted with the
+        same ``adjustments`` the real request sends."""
         fields = ((self.fieldmap.get("history") or {}).get("fields") or {})
         usable: dict[str, str] = {}
         need: dict[str, str] = {}
@@ -1068,7 +1484,7 @@ class LSEGProvider:
             if e.get("status") == "unverifiable":
                 need[key] = str(e["code"])
         if need:
-            pf = self._preflight_history(list(need.values()))
+            pf = self._preflight_history(list(need.values()), adjustments)
             failed = [f"{k} ({c})" for k, c in need.items() if not pf[c]]
             for k, c in need.items():
                 self.field_log[f"history.{k}"] = {"code": c, "status": "unverifiable", "preflight": pf[c], "used": pf[c],
@@ -1082,33 +1498,68 @@ class LSEGProvider:
             raise ProviderError("the LSEG field map has no usable history close field")
         return usable
 
-    def _history(self, rics: list[str], fields: Mapping[str, str], start: date, end: date) -> dict[str, pd.DataFrame]:
-        """{canonical field: frame(date x RIC)} over [start, end]."""
+    def _history(self, rics: list[str], fields: Mapping[str, str], start: date, end: date,
+                 adjustments: list[Any] | None = None) -> dict[str, pd.DataFrame]:
+        """{canonical field: frame(date x RIC)} over [start, end].
+
+        Requests go in batches of ``history_batch_size``. A failed batch is retried one RIC at a time
+        (so one bad RIC does not sink the batch) until a circuit breaker sees ``circuit_breaker_threshold``
+        single-RIC failures in a row with the same error: then no further per-RIC retries are made in
+        this call (each later batch is still tried once). Quota / session errors stop at once.
+        """
         ld = self._open()
+        if adjustments is None:
+            adjustments = self._history_adjustments()
         codes = list(fields.values())
         per: dict[str, pd.DataFrame] = {}
         failed: dict[str, str] = {}
+        tripped: str | None = None
+        skipped: list[str] = []
         batches = [rics[i:i + self.history_batch_size] for i in range(0, len(rics), max(1, self.history_batch_size))]
+
+        def fetch(universe: list[str]) -> dict[str, pd.DataFrame]:
+            raw = self._call("get_history", ld.get_history, **self._history_kwargs(universe, codes, start, end, adjustments))
+            return _split_history(raw, universe, codes)
+
         for i, batch in enumerate(batches):
             if i:
                 self._pause()
             try:
-                raw = ld.get_history(**self._history_kwargs(batch, codes, start, end))
-                per.update(_split_history(raw, batch, codes))
-            except ProviderError:
+                per.update(fetch(batch))
+                continue
+            except _StopRequests:
                 raise
-            except Exception as e:  # noqa: BLE001 - retry one RIC at a time so one bad RIC does not sink the batch
-                if len(batch) == 1:
-                    failed[batch[0]] = str(e)
-                    continue
-                for r in batch:
-                    self._pause()
-                    try:
-                        per.update(_split_history(ld.get_history(**self._history_kwargs([r], codes, start, end)), [r], codes))
-                    except Exception as e1:  # noqa: BLE001
-                        failed[r] = str(e1)
+            except Exception as e:  # noqa: BLE001 - retried one RIC at a time below
+                batch_error = str(e)
+            if len(batch) == 1:
+                failed[batch[0]] = batch_error
+                continue
+            if tripped is not None:
+                skipped += batch
+                continue
+            last_sig, streak = None, 0
+            for j, r in enumerate(batch):
+                self._pause()
+                try:
+                    per.update(fetch([r]))
+                    last_sig, streak = None, 0
+                except _StopRequests:
+                    raise
+                except Exception as e1:  # noqa: BLE001
+                    failed[r] = str(e1)
+                    sig = _error_signature(str(e1), r)
+                    streak = streak + 1 if sig == last_sig else 1
+                    last_sig = sig
+                    if streak >= max(1, int(self.circuit_breaker_threshold)):
+                        tripped = str(e1)
+                        skipped += batch[j + 1:]
+                        break
         if failed:
             self._warn(f"LSEG get_history failed for {', '.join(list(failed)[:20])} ({next(iter(failed.values()))}).")
+        if tripped is not None:
+            self._warn(f"LSEG get_history: circuit breaker tripped after {int(self.circuit_breaker_threshold)} identical "
+                       f"single-RIC failures ({tripped}); {len(skipped)} RIC(s) were not retried one by one "
+                       "(their prices are NaN).")
         lo, hi = pd.Timestamp(start), pd.Timestamp(end)
         out: dict[str, pd.DataFrame] = {}
         for key, code in fields.items():
@@ -1126,8 +1577,9 @@ class LSEGProvider:
         ric_of = self._resolve(req, "prices")
         if not ric_of:
             raise ProviderError(f"No RIC for any of {len(req)} ticker(s); cannot request LSEG history.")
-        fields = self._history_fields()
-        frames = self._history(sorted(set(ric_of.values())), fields, start, end)
+        adjustments = self._history_adjustments()
+        fields = self._history_fields(adjustments)
+        frames = self._history(sorted(set(ric_of.values())), fields, start, end, adjustments)
         index = pd.DatetimeIndex(sorted(set().union(*[set(f.index) for f in frames.values()])), name="date")
         out: dict[str, pd.DataFrame] = {}
         for f in F.PRICE_FIELDS:
@@ -1147,11 +1599,11 @@ class LSEGProvider:
                                 f"{start} and {end}.")
         if failed:
             self._warn(f"No LSEG price history for {len(failed)} ticker(s) ({', '.join(failed[:20])}); their prices are NaN.")
-        hist = self.fieldmap.get("history") or {}
-        adj = hist.get("adjustments")
-        if isinstance(adj, Mapping) and adj.get("status") == "unverifiable":
-            self._warn("LSEG history: corporate-action adjustment of the price series is UNVERIFIED "
-                       f"(adjustments={adj.get('value')}); cross-check with crosscheck_adjustment() around splits.")
+        configured, entry = self._configured_adjustments()
+        if entry.get("status") == "unverifiable":
+            used = f"adjustments={adjustments}" if adjustments else f"library default adjustments ({configured} dropped)"
+            self._warn(f"LSEG history: corporate-action adjustment of the price series is UNVERIFIED ({used}); "
+                       "cross-check with crosscheck_adjustment() around splits.")
         return PricePanel(out[F.OPEN], out[F.HIGH], out[F.LOW], out[F.CLOSE], out[F.VOLUME])
 
     def get_benchmark_history(self, start: date, end: date, symbol: str | None = None) -> pd.Series:
@@ -1167,6 +1619,8 @@ class LSEGProvider:
         for i, ric in enumerate(candidates):
             try:
                 s = self._history([ric], {F.CLOSE: close_code}, start, end)[F.CLOSE]
+            except _StopRequests:
+                raise
             except ProviderError as e:
                 self._warn(f"LSEG benchmark {ric}: {e}")
                 continue
@@ -1190,7 +1644,14 @@ class LSEGProvider:
             raise ProviderError("the LSEG field map has no features.high_52w expression for the cross-check")
         tickers = _unique(tickers)
         ric_of = self._resolve(tickers, "adjustment cross-check")
-        vend = self._get_tr(sorted(set(ric_of.values())), {"v": str(code)}, self._params(as_of))
+        params = self._request_params(as_of) if ric_of else {}
+        if ric_of and self._anchored(as_of, params):
+            vend = self._get_tr(sorted(set(ric_of.values())), {"v": str(code)}, params)
+        else:
+            vend = pd.DataFrame({"v": pd.Series(dtype="object")})
+            if ric_of:
+                self._warn(f"LSEG adjustment cross-check: no as_of anchor for the historical as_of {as_of}, so the vendor "
+                           f"52-week high ({code}) would be today's value; NOT EVALUATED (NaN).")
         panel = self.get_price_history(list(ric_of), as_of - timedelta(days=365), as_of)
         local_hi = panel.high.max() if panel.high.notna().any().any() else panel.close.max()
         rows = {}
@@ -1206,7 +1667,11 @@ class LSEGProvider:
 
     # ------------------------------------------------------------------ documents
     def get_documents(self, ticker: str, kinds: set[DocumentKind], start: date, end: date, limit: int = 10) -> list[Document]:
-        """NEWS via ld.news (L3); FILING only when enabled in the field map; no TRANSCRIPT / RESEARCH. Newest first."""
+        """NEWS via ld.news; FILING only when enabled in the field map; no TRANSCRIPT / RESEARCH. Newest first.
+
+        Each document's metadata carries the session and its licence class: L3 through a platform
+        session, L4 through a desktop (Workspace) session (ADR section 7).
+        """
         kinds = set(kinds)
         docs_cfg = self.fieldmap.get("documents") or {}
         if DocumentKind.TRANSCRIPT in kinds:
@@ -1245,7 +1710,9 @@ class LSEGProvider:
         query = _render(cfg.get("query_template", "R:{ric}"), {"ric": ric, "ticker": ticker})
         t0, t1 = datetime.combine(start, dtime.min), datetime.combine(end, dtime.max)
         try:
-            hl = news.get_headlines(query=query, start=t0, end=t1, count=int(limit))
+            hl = self._call("news.get_headlines", news.get_headlines, query=query, start=t0, end=t1, count=int(limit))
+        except _StopRequests:
+            raise
         except Exception as e:  # noqa: BLE001
             self._warn(f"{ticker}: LSEG headlines unavailable ({e}).")
             return []
@@ -1273,10 +1740,13 @@ class LSEGProvider:
             if not (pd.Timestamp(t0) <= ts <= pd.Timestamp(t1)):
                 continue
             title = str(row[c_head]).strip()
-            meta = {"vendor": "lseg", "channel": "ld.news", "licence_class": str(cfg.get("licence_class", "L3")),
-                    "story_id": str(sid), "ric": ric, "query": query}
+            meta = {"vendor": "lseg", "channel": "ld.news", "session": self.session_name,
+                    "licence_class": self._doc_licence_class(cfg), "story_id": str(sid), "ric": ric, "query": query}
+            self._pause()  # one request per story body: paced like every other request
             try:
-                text = _html_to_text(news.get_story(str(sid)))
+                text = _html_to_text(self._call("news.get_story", news.get_story, story_id=str(sid)))
+            except _StopRequests:
+                raise
             except Exception:  # noqa: BLE001
                 text = ""
             if not text:
@@ -1303,8 +1773,10 @@ class LSEGProvider:
         ctx = {"ric": ric, "ticker": ticker, "start": start.isoformat(), "end": end.isoformat(), "limit": int(limit)}
         params = {k: (_render(v, ctx) if isinstance(v, str) else v) for k, v in (cfg.get("search_parameters") or {}).items()}
         try:
-            resp = mod.search.Definition(feed=feed, **params).get_data()
+            resp = self._call("filings.search", lambda: mod.search.Definition(feed=feed, **params).get_data())
             df = getattr(getattr(resp, "data", None), "df", None)
+        except _StopRequests:
+            raise
         except Exception as e:  # noqa: BLE001
             self._warn(f"{ticker}: LSEG filings search failed ({e}).")
             return []
@@ -1325,8 +1797,8 @@ class LSEGProvider:
             docs.append(Document(doc_id=f"lseg:filing:{fid}", ticker=ticker, kind=DocumentKind.FILING, title=title,
                                  published_at=ts.to_pydatetime(), source=f"LSEG Filings ({feed_name})", text=text,
                                  metadata={"vendor": "lseg", "channel": "lseg.data.content.filings",
-                                           "licence_class": str(cfg.get("licence_class", "L3")), "filename": fid,
-                                           "ric": ric, "text": "metadata only"}))
+                                           "session": self.session_name, "licence_class": self._doc_licence_class(cfg),
+                                           "filename": fid, "ric": ric, "text": "metadata only"}))
         return docs
 
     # ------------------------------------------------------------------ field self-check (gate G5 evidence)

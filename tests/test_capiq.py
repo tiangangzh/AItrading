@@ -23,7 +23,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -583,6 +582,17 @@ def test_responses_and_preflights_are_cached(fake):
     p.clear_cache()
     p.get_fundamentals(["ACME"], AS_OF)
     assert len(fake.input_requests) > n
+
+
+def test_gdspv_function_from_the_map_and_close(fake):
+    fake.point[("ACME:", "IQ_PRICE_TARGET")] = "77"
+    with make(fake, fieldmap={"raw": {"estimates": {"target_price_mean": {"function": "GDSPV"}}}}) as p:
+        assert p.get_estimates(["ACME"], AS_OF).loc["ACME", F.TARGET_PRICE_MEAN] == 77.0
+        assert fake.sent("IQ_PRICE_TARGET", "ACME:")[0]["function"] == "GDSPV"
+        assert p._http is not None  # noqa: SLF001
+    assert p._http is None and p._token is None  # noqa: SLF001 - closed on exit
+    with pytest.raises(FieldMapError, match="function"):
+        CapIQProvider(fieldmap={"raw": {"estimates": {"target_price_mean": {"function": "SCREEN"}}}})
 
 
 def test_usage_endpoint(fake):

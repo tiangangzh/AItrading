@@ -32,35 +32,55 @@ Every item, mnemonic, unit and scale comes from ``aitrading/data/fieldmaps/bloom
 * ``unverifiable`` entries are preflighted alone on ``test_security`` (VENDOR_REFERENCE section 5)
   before they enter a bulk request; a failure suspends that leg (``LEG NOT EVALUATED`` warning).
 * ``units_verified: false`` entries are not served (NaN + warning) until admitted.
-* BDP returns current values only, so for an ``as_of`` older than ``snapshot_staleness_days`` BDP
-  columns are left blank rather than leaking today's values; BQL items carry ``dates='<as_of>'``.
+* No value is ever assumed: a column without a usable item is NaN (never a default label or 0).
+* BDP returns current values only, so BDP columns are served only when ``as_of`` is today (default
+  ``snapshot_staleness_days=0``); for an older ``as_of`` they are left blank rather than leaking
+  values published after it. A tolerance > 0 is the caller's explicit choice and every use of it is
+  recorded in ``warnings`` (audit trail). BQL items carry ``dates='<as_of>'``.
 * Look-ahead guards: a short-interest settlement after ``as_of`` blanks the row; any other
   historical date after ``as_of`` is dropped.
-* Field exceptions that mean "invalid / unauthorised field" abort the whole leg (ADR risk table);
-  per-security exceptions blank that cell. A column that comes back missing for every requested
-  security is reported as ``LEG NOT EVALUATED``. Missing values are NaN, never 0.
+* Field exceptions are classified by ``errorInfo`` subcategory: an invalid field (``INVALID_FIELD``)
+  or a missing field entitlement (``NO_AUTH`` / ``FIELD_NOT_AUTHORIZED``) aborts the whole leg (ADR
+  risk table); "field not applicable to security" (``BAD_FLD`` / ``NOT_APPLICABLE_TO_REF_DATA``) and
+  other per-security exceptions blank only that cell. A column that comes back missing for every
+  requested security is reported as ``LEG NOT EVALUATED``. Missing values are NaN, never 0.
+* Gate G5 is deny-by-default for the push-down: only admitted features (``"admitted": true`` in a
+  field-map override, or ``admitted=[...]``) are pushed; see :mod:`aitrading.screen.compile_bql`.
 * :meth:`BloombergProvider.verify_fields` runs every mapped item alone on a known security and
   returns one :class:`FieldCheck` per item: the field-admission procedure (gate G5).
 
 Licensing boundary
 ------------------
-The default boundary is ``deny_all_text(provider='bloomberg', note=BOUNDARY_NOTE)`` with
-``allow_numeric_features=False``: Terminal / Desktop API / BQuant Desktop data is licence class L4,
-so nothing derived from it - text, values, even tickers or ranks - may reach an external model until
-gate G1 (written Bloomberg approval) clears, and even then only ids, ranks and booleans. EDF Textual
-News (L5) and broker research (L6) never do. ``get_documents`` therefore returns ``[]`` with a
-warning; if a wider boundary is passed it raises ``NotImplementedError`` because no Bloomberg text
-API is verified (transcripts: no BQL/BDP item; use SEC EDGAR for filings, Kensho after G2).
+Terminal / Desktop API / BQuant Desktop data is licence class L4 (ADR-001 section 7): it may reach
+an external model *nothing* before gate G1, and after G1 only survivor ids, ranks and booleans; EDF
+Textual News (L5) and broker research (L6) never. The default boundary is
+``deny_all_text(provider='bloomberg', note=BOUNDARY_NOTE)`` with ``allow_numeric_features=False``.
+A wider boundary is refused (``ValueError``) unless its note cites the gate (``"G1: <written
+approval reference>"``); ``allow_numeric_features=True`` and NEWS / RESEARCH kinds are refused
+always. ``get_documents`` returns ``[]`` with a warning; if a G1-cited boundary permits a kind it
+raises ``NotImplementedError`` because no Bloomberg text API is verified.
 
-Tickers are returned in canonical form (``'AAPL'`` from ``'AAPL US Equity'``, ``'BRK-B'`` from
-``'BRK/B US Equity'``); the Bloomberg id is kept in the ``vendor_id`` column and in an internal map
-used for later requests. ``query_log`` records every vendor request verbatim (BQL strings and
-blpapi request payloads) for the audit trail; ``warnings`` collects every degradation.
+What the boundary can NOT enforce: :class:`~aitrading.core.policy.DataBoundary` governs document
+text and numeric feature values only. It has no control over candidate tickers, names or ranks, which
+the pipeline still hands to the explainer. Until G1 clears, results from this provider must not be
+sent to an LLM-backed explainer or any other external model (``external_llm_allowed`` is False);
+use an offline / template explainer inside zone T.
+
+Identifiers: tickers are returned in canonical form (``'AAPL'`` from ``'AAPL US Equity'``, ``'BRK-B'``
+from ``'BRK/B UN Equity'``); the Bloomberg id as returned is kept in the ``vendor_id`` column. Every
+later data request uses the *composite* id (``'AAPL US Equity'``) for a home-market exchange code
+(UN, UW, ...), because volume on an exchange-level id is that venue's volume only.
+
+Audit: ``query_log`` records every vendor request verbatim (BQL strings and blpapi request
+payloads); ``warnings`` collects every degradation and is free of vendor values and security ids
+(it is persisted with the run). Ticker-level detail (which security failed, duplicate ids) goes to
+``zone_t_details``, which stays in zone T and must not be persisted firm-side before G1.
 """
 
 from __future__ import annotations
 
 import importlib
+import itertools
 import json
 import re
 from dataclasses import dataclass
@@ -102,10 +122,13 @@ VENDOR = "bloomberg"
 
 BOUNDARY_NOTE = (
     "Bloomberg Terminal / Desktop API / BQuant Desktop data is licence class L4 (ADR-001 section 7): it is computed "
-    "and kept in the vendor environment (zone T). Nothing derived from it - text, values, tickers or ranks - may be "
-    "sent to an external model until gate G1 (written Bloomberg approval for survivor ids, ranks and booleans to leave "
-    "zone T and be stored firm-side) clears, and even then only ids, ranks and booleans. EDF Textual News is L5 and "
-    "broker research L6: never. Widen this boundary only with the written approval recorded in the policy table."
+    "and kept in the vendor environment (zone T). Under the ADR nothing derived from it - text, values, tickers or "
+    "ranks - may reach an external model until gate G1 (written Bloomberg approval for survivor ids, ranks and "
+    "booleans to leave zone T and be stored firm-side) clears, and even then only ids, ranks and booleans; EDF Textual "
+    "News (L5) and broker research (L6) never. This boundary object withholds document text and numeric feature "
+    "values only; it CANNOT withhold candidate tickers, names or ranks, so until G1 clears do not use an LLM-backed "
+    "explainer (or any external model) on results from this provider. Widening requires a note citing "
+    "'G1: <written approval reference>' recorded in the policy table."
 )
 BQL_MISSING = (
     "The 'bql' package is not available. It ships only inside Bloomberg BQuant (BQNT<GO> on an entitled Terminal, or "
@@ -132,9 +155,16 @@ LABEL_COLUMNS = frozenset({F.NAME, F.GICS_SECTOR, F.GICS_INDUSTRY, F.EXCHANGE, F
 FORWARD_DATE_COLUMNS = frozenset({F.NEXT_EARNINGS_DATE})  # expected to be after as_of: no look-ahead guard
 _YELLOW_KEYS = ("Equity", "Index", "Comdty", "Curncy", "Corp", "Govt", "Mtge", "Muni", "Pfd", "M-Mkt")
 _YELLOW_LOWER = {k.lower(): k for k in _YELLOW_KEYS}
-_FATAL_CATEGORIES = {"BAD_FLD", "NO_AUTH"}
+# fieldExceptions errorInfo: fatality is decided by subcategory, not by category alone. BAD_FLD covers both an
+# invalid mnemonic (subcategory INVALID_FIELD: fatal for the leg) and "Field not applicable to security"
+# (subcategory NOT_APPLICABLE_TO_REF_DATA: per-security, blanks one cell).
+_FATAL_CATEGORIES = {"NO_AUTH"}
 _FATAL_SUBCATEGORIES = {"INVALID_FIELD", "NOT_AUTHORIZED", "NO_AUTH", "FIELD_NOT_AUTHORIZED"}
 _FATAL_TEXT = re.compile(r"invalid|not valid|unknown field|not authori|entitle", re.IGNORECASE)
+_PER_SECURITY_TEXT = re.compile(r"not applicable|n/a for this security", re.IGNORECASE)
+# A widened boundary must cite the gate with a reference, e.g. note="G1: Bloomberg letter 2026-11-03, reviewed by <lawyer>".
+_G1_CITATION = re.compile(r"\bG1\s*:\s*\S")
+_NEVER_TO_MODEL = frozenset({DocumentKind.NEWS, DocumentKind.RESEARCH})  # L5 EDF Textual News, L6 broker research
 
 
 # =============================================================================================
@@ -263,14 +293,25 @@ def _err_text(info: Any) -> str:
 
 
 def _is_fatal(info: Any) -> bool:
-    """Field exception meaning the field itself is invalid or not entitled (abort the leg)."""
+    """Field exception meaning the field itself is invalid or not entitled (abort the leg).
+
+    Decided by ``subcategory`` first: ``BAD_FLD`` / ``NOT_APPLICABLE_TO_REF_DATA`` ("Field not applicable
+    to security", e.g. an ETF or a recent IPO with no short interest) is per-security, while
+    ``INVALID_FIELD`` and the ``NO_AUTH`` / ``FIELD_NOT_AUTHORIZED`` family are fatal. A ``BAD_FLD``
+    with no recognised subcategory is fatal only if its message says the field is invalid; otherwise
+    it blanks one cell (a field missing for every security is still reported as LEG NOT EVALUATED).
+    """
     if not isinstance(info, Mapping):
-        return bool(_FATAL_TEXT.search(str(info)))
-    if str(info.get("category", "")).upper() in _FATAL_CATEGORIES:
+        text = str(info)
+        return not _PER_SECURITY_TEXT.search(text) and bool(_FATAL_TEXT.search(text))
+    category = str(info.get("category") or "").upper()
+    sub = str(info.get("subcategory") or "").upper()
+    message = str(info.get("message") or "")
+    if sub.startswith("NOT_APPLICABLE") or _PER_SECURITY_TEXT.search(message):
+        return False
+    if sub in _FATAL_SUBCATEGORIES or category in _FATAL_CATEGORIES:
         return True
-    if str(info.get("subcategory", "")).upper() in _FATAL_SUBCATEGORIES:
-        return True
-    return bool(_FATAL_TEXT.search(str(info.get("message", ""))))
+    return bool(_FATAL_TEXT.search(message))
 
 
 def _missing(v: Any) -> bool:
@@ -342,6 +383,7 @@ class FieldCheck:
     expression: str = ""  # exact item / mnemonic requested (dates rendered)
     test_security: str = ""
     as_of: date | None = None
+    failure: str = ""  # value-free reason when ok is False (safe for persisted warnings; ``note`` may hold values)
 
     def to_log_row(self, reviewer: str = "") -> dict[str, Any]:
         """Row for ``field_validation_log`` (VENDOR_REFERENCE section 5, step 4)."""
@@ -362,6 +404,9 @@ class BloombergProvider:
     """``MarketDataProvider`` + ``ScreenPushdown`` over Bloomberg BQL (BQuant) or the Desktop API."""
 
     name = VENDOR
+    #: Licence class L4: candidate ids / names / ranks from this provider must not reach an external model
+    #: before gate G1, and DataBoundary cannot enforce that (it covers text and feature values only).
+    external_llm_allowed = False
 
     def __init__(
         self,
@@ -384,13 +429,16 @@ class BloombergProvider:
         admitted: Iterable[str] | None = None,
         batch_size: int = 500,
         history_batch_size: int = 100,
-        snapshot_staleness_days: int = 5,
+        snapshot_staleness_days: int = 0,
         today: Callable[[], date] | None = None,
+        allow_unadmitted: bool = False,
     ) -> None:
         """
         Args:
             backend: ``'bql'`` (inside BQuant) or ``'blpapi'`` (Desktop / Server API).
-            boundary: licensing boundary; default denies all text AND numeric features (L4, gate G1).
+            boundary: licensing boundary; default denies all text AND numeric features (L4, gate G1). A wider
+                one must cite ``"G1: <reference>"`` in its note and may never allow numeric features or NEWS /
+                RESEARCH text (ValueError otherwise).
             fieldmap: override (mapping or JSON path) merged over the default map and
                 ``$AITRADING_FIELDMAP_BLOOMBERG``.
             universe_expr: ``bql``: BQL universe replacing ``equitiesuniv(['ACTIVE','PRIMARY'])``, placeholders
@@ -404,10 +452,13 @@ class BloombergProvider:
             host / port / timeout_ms: Desktop API connection (defaults from the map: localhost, 8194, 30000).
             preflight: preflight ``unverifiable`` items alone on ``test_security`` before bulk use.
             test_security: known security for preflights / ``verify_fields`` (default ``IBM US Equity``).
-            admitted: optional G5 admission set; when given only these features are pushed down.
+            admitted: gate G5 admission set (features with a field_validation_log entry), added to the field
+                map's ``"admitted": true`` flags. Deny-by-default: nothing else is pushed down.
             batch_size / history_batch_size: securities per BDP / BQL-snapshot and per history request.
-            snapshot_staleness_days: BDP (current-only) columns are blank for an as_of older than this.
+            snapshot_staleness_days: BDP (current-only) columns are served only for an as_of at most this
+                many days before today (default 0: as_of must be today); any tolerance used is warned.
             today: clock (tests).
+            allow_unadmitted: explicit G5 opt-out for BQLX experimentation (recorded in the warnings).
         """
         if backend not in ("bql", "blpapi"):
             raise ValueError("backend must be 'bql' or 'blpapi'")
@@ -424,10 +475,13 @@ class BloombergProvider:
         self.benchmark = benchmark
         self.test_security = test_security or str(self.fieldmap.get("test_security") or "IBM US Equity")
         self.preflight = bool(preflight)
+        if isinstance(admitted, (str, bytes)):
+            raise TypeError("admitted must be a collection of feature names, not a string")
         self.admitted = set(admitted) if admitted is not None else None
+        self.allow_unadmitted = bool(allow_unadmitted)
         self.batch_size = max(1, int(batch_size))
         self.history_batch_size = max(1, int(history_batch_size))
-        self.snapshot_staleness_days = int(snapshot_staleness_days)
+        self.snapshot_staleness_days = max(0, int(snapshot_staleness_days))
         self._today = today or date.today
         self._bql_mod = bql_module
         self._blp_mod = blpapi_module
@@ -439,12 +493,17 @@ class BloombergProvider:
         self._tickers = _dedupe(tickers) if tickers else None
         self._ids: dict[str, str] = {}
         self._preflight_cache: dict[tuple[str, str], tuple[bool, str]] = {}
-        self.warnings: list[str] = []
+        self._cid_seq = itertools.count(1)
+        self._with_clause_state: bool | None = None  # None = not preflighted yet
+        self.warnings: list[str] = []  # value-free and id-free: persisted with the run
+        self.zone_t_details: list[str] = []  # ticker-level detail; zone T only, never persisted firm-side before G1
         self.query_log: list[str] = []
         self.last_pushdown: CompiledQuery | None = None
         self.last_pushdown_frame: pd.DataFrame | None = None  # vendor values of the last push-down (zone T only)
         country_map = ((((self.fieldmap.get("raw") or {}).get("universe") or {}).get("country") or {}).get("derived") or {}).get("value_map") or {}
         self._home_codes = tuple(k for k, v in country_map.items() if v == "US") or ("US",)
+        comp = ((self.fieldmap.get("identifiers") or {}).get("composite_exchange") or {})
+        self._composite = str(comp.get("value") or "").strip().upper() if isinstance(comp, Mapping) else ""
         self.boundary = self._init_boundary(boundary)
         self.capabilities: set[Capability] = self._capabilities()
 

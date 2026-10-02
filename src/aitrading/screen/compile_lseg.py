@@ -35,17 +35,27 @@ A condition is pushed only when its feature's field-map entry has
 3. units not flagged ``"units_verified": false`` (unverified units enter only as z-scores, ADR);
 4. ``screen`` ``official`` (verified inside an official SCREEN), or ``preflight`` *and* a passing
    preflight for that code today (pass ``preflight={code: bool}``; see :func:`preflight_codes`).
-   ``screen: none`` marks a meaning-changing mapping that is never pushed.
+   ``screen: none`` marks a meaning-changing mapping that is never pushed;
+5. **admission (gate G5)**: the feature is admitted - it has a ``field_validation_log`` entry
+   (VENDOR_REFERENCE section 5: test ticker, value, units). Admission comes from ``"admitted": true``
+   on the feature in a field-map override and/or the ``admitted=`` collection passed by the caller
+   (the run's admission log). Unlike ``compile_bql``, ``admitted=None`` does **not** disable the gate:
+   it means "field-map flags only", and the default field map admits nothing, so by default only the
+   universe-definition listing predicates are pushed. The listing predicates (country, ``ORD``,
+   not ``OTCM``) define the universe rather than act as thresholds, so they are not feature-admitted.
 
 Everything else - ``other_feature`` comparisons, numeric ``==`` / ``!=``, ``any_of`` OR groups,
 unknown features - is a residual condition evaluated by the local engine. The local engine re-checks
 every condition on the pushed survivors, so a push-down can only narrow the universe; a missing value
 never passes either side (a NaN field inside SCREEN drops the instrument).
 
-Point in time: SCREEN evaluates today's values. When ``as_of`` is more than
-``max_as_of_lag_days`` before ``today`` only the static listing predicates are pushed and every
-time-varying condition is residual (``CompiledQuery.point_in_time`` is False); the listing itself
-still reflects today's active instruments (survivorship), which the provider warns about.
+Point in time: SCREEN evaluates the latest values and carries no date anchor, so a time-varying
+predicate is pushed only when ``as_of`` is the latest completed session (the last weekday before
+``today``) or later (``max_session_lag`` = 0 by default). Any older ``as_of`` pushes only the static
+listing predicates and every time-varying condition is residual (``CompiledQuery.point_in_time`` is
+False): pushing today's values for an older ``as_of`` would drop names that passed at ``as_of``
+(look-ahead), and the local engine cannot restore them. The lag is recorded in the audit. The listing
+itself still reflects today's active instruments (survivorship), which the provider warns about.
 """
 
 from __future__ import annotations
@@ -56,7 +66,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 from aitrading.screen.catalog import FeatureCatalog, default_catalog
 from aitrading.screen.spec import Condition, ScreenSpec, UniverseSpec
@@ -64,7 +74,7 @@ from aitrading.screen.spec import Condition, ScreenSpec, UniverseSpec
 __all__ = [
     "PUSHABLE_STATUSES",
     "VALID_STATUSES",
-    "MAX_AS_OF_LAG_DAYS",
+    "MAX_SESSION_LAG",
     "PushedPredicate",
     "ResidualCondition",
     "CompiledQuery",
@@ -74,13 +84,16 @@ __all__ = [
     "screen_expression",
     "format_number",
     "is_point_in_time",
+    "latest_completed_session",
+    "as_of_lag_sessions",
+    "admitted_features",
 ]
 
 VALID_STATUSES = frozenset({"confirmed", "corrected", "unverifiable"})
 PUSHABLE_STATUSES = frozenset({"confirmed", "corrected"})
 SCREEN_OFFICIAL, SCREEN_PREFLIGHT, SCREEN_NONE = "official", "preflight", "none"
 SCREEN_MODES = frozenset({SCREEN_OFFICIAL, SCREEN_PREFLIGHT, SCREEN_NONE})
-MAX_AS_OF_LAG_DAYS = 5
+MAX_SESSION_LAG = 0  # sessions as_of may trail the latest completed session and still push time-varying predicates
 
 _FLIP = {">": "<", ">=": "<=", "<": ">", "<=": ">="}
 _LIQUIDITY_FEATURE = "avg_dollar_volume_20d_usd_mn"
@@ -122,6 +135,10 @@ class CompiledQuery:
     fieldmap_version: str
     fieldmap_sha256: str
     preflight: tuple[tuple[str, bool], ...] = field(default_factory=tuple)  # code -> passed, as used
+    admitted: tuple[str, ...] = ()  # features admitted under gate G5 for this compile (sorted)
+    today: date | None = None  # clock used for the point-in-time rule
+    as_of_lag_sessions: int | None = None  # weekday sessions as_of trails the latest completed session
+    max_session_lag: int = MAX_SESSION_LAG
 
     @property
     def pushed_conditions(self) -> list[str]:
@@ -149,6 +166,10 @@ class CompiledQuery:
                         "status": p.status} for p in self.pushed],
             "residual": [{"condition": r.condition, "reason": r.reason} for r in self.residual],
             "preflight": dict(self.preflight),
+            "admitted_features": list(self.admitted),  # gate G5: only these features may be pushed
+            "today": self.today.isoformat() if self.today else None,
+            "as_of_lag_sessions": self.as_of_lag_sessions,
+            "max_session_lag": self.max_session_lag,
         }
 
 
@@ -182,10 +203,53 @@ def _decimal(x: Any) -> Decimal:
     return Decimal(str(x))
 
 
-def is_point_in_time(as_of: date, today: date | None = None, max_as_of_lag_days: int = MAX_AS_OF_LAG_DAYS) -> bool:
-    """True when SCREEN's current values can stand in for ``as_of`` (as_of within the allowed lag)."""
-    today = today or date.today()
-    return as_of >= today - timedelta(days=int(max_as_of_lag_days))
+def latest_completed_session(today: date | None = None) -> date:
+    """The last weekday strictly before ``today`` (today's own session is not complete yet).
+
+    Exchange holidays are not modelled: on the day after a holiday this returns the holiday, which is
+    later than the true last session, so the point-in-time rule errs towards *not* pushing.
+    """
+    d = (today or date.today()) - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def as_of_lag_sessions(as_of: date, today: date | None = None) -> int:
+    """Weekday sessions completed after ``as_of`` up to the latest completed session (0 = current)."""
+    latest = latest_completed_session(today)
+    if as_of >= latest:
+        return 0
+    d = as_of + timedelta(days=1)  # count the weekdays in (as_of, latest]
+    full_weeks, rest = divmod((latest - d).days + 1, 7)
+    lag = full_weeks * 5
+    d += timedelta(days=full_weeks * 7)
+    for _ in range(rest):
+        if d.weekday() < 5:
+            lag += 1
+        d += timedelta(days=1)
+    return lag
+
+
+def is_point_in_time(as_of: date, today: date | None = None, max_session_lag: int = MAX_SESSION_LAG) -> bool:
+    """True when SCREEN's latest values can stand in for ``as_of``.
+
+    That is the case only when ``as_of`` is the latest completed session or later (lag <=
+    ``max_session_lag``, default 0). SCREEN has no date anchor, so for an older ``as_of`` a pushed
+    time-varying predicate would select on values from after ``as_of``.
+    """
+    return as_of_lag_sessions(as_of, today) <= max(0, int(max_session_lag))
+
+
+def admitted_features(fieldmap: Mapping[str, Any] | None, admitted: Collection[str] | None = None) -> frozenset[str]:
+    """Features admitted under gate G5: ``"admitted": true`` in the field map plus the ``admitted`` collection."""
+    fm = _fm(fieldmap)
+    out = {str(f) for f, e in (fm.get("features") or {}).items() if isinstance(e, Mapping) and e.get("admitted") is True}
+    if admitted is not None:
+        if isinstance(admitted, str):
+            raise TypeError("admitted must be a collection of feature names, not a string")
+        out |= {str(a) for a in admitted}
+    return frozenset(out)
 
 
 def _fm(fieldmap: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -218,7 +282,8 @@ def _feature_entry(fm: Mapping[str, Any], feature: str) -> Mapping[str, Any] | N
     return entry if isinstance(entry, Mapping) else None
 
 
-def _unpushable_reason(entry: Mapping[str, Any] | None, preflight: Mapping[str, bool]) -> str | None:
+def _unpushable_reason(entry: Mapping[str, Any] | None, preflight: Mapping[str, bool], feature: str,
+                       admitted: Collection[str]) -> str | None:
     """None when the feature expression may be pushed, else the reason it stays local."""
     if entry is None:
         return "no LSEG expression in the field map"
@@ -237,6 +302,9 @@ def _unpushable_reason(entry: Mapping[str, Any] | None, preflight: Mapping[str, 
     if mode == SCREEN_NONE:
         note = str(entry.get("notes", "")).strip()
         return f"{expr} is not pushed (field map screen=none)" + (f": {note}" if note else "")
+    if feature not in admitted:
+        return (f"not admitted (G5): {expr} has no field_validation_log entry; record verify_fields() evidence, then "
+                "pass admitted= or set admitted=true on the feature in a field-map override")
     if mode == SCREEN_PREFLIGHT and not preflight.get(str(expr), False):
         return f"{expr} is not verified inside an official SCREEN and has no passing preflight today"
     return None
@@ -329,12 +397,12 @@ def _compile_category(cond: Condition, expr: str, entry: Mapping[str, Any]) -> t
 
 
 def _compile_condition(cond: Condition, fm: Mapping[str, Any], catalog: FeatureCatalog,
-                       preflight: Mapping[str, bool]) -> tuple[list[str], str, str | None]:
+                       preflight: Mapping[str, bool], admitted: Collection[str]) -> tuple[list[str], str, str | None]:
     """(SCREEN predicates, status, None) or ([], '', reason)."""
     if cond.feature not in catalog:
         return [], "", f"unknown feature '{cond.feature}'"
     entry = _feature_entry(fm, cond.feature)
-    reason = _unpushable_reason(entry, preflight)
+    reason = _unpushable_reason(entry, preflight, cond.feature, admitted)
     if reason:
         return [], "", reason
     assert entry is not None
@@ -385,27 +453,30 @@ def _listing(universe: UniverseSpec, fm: Mapping[str, Any], b: _Builder) -> None
 
 
 def _universe_time_varying(universe: UniverseSpec, fm: Mapping[str, Any], catalog: FeatureCatalog,
-                           preflight: Mapping[str, bool], b: _Builder, point_in_time: bool) -> None:
+                           preflight: Mapping[str, bool], admitted: Collection[str], b: _Builder,
+                           point_in_time: bool) -> None:
     """Price floor, liquidity floor and sector exclusions (labels match the local engine's funnel)."""
     if universe.min_price is not None:
         cond = Condition(feature=_PRICE_FEATURE, op=">=", value=universe.min_price)
-        _push_or_keep(f"{_PRICE_FEATURE} >= {universe.min_price:g}", cond, fm, catalog, preflight, b, point_in_time)
+        _push_or_keep(f"{_PRICE_FEATURE} >= {universe.min_price:g}", cond, fm, catalog, preflight, admitted, b,
+                      point_in_time)
     if universe.min_avg_dollar_volume_usd_mn is not None:
         cond = Condition(feature=_LIQUIDITY_FEATURE, op=">=", value=universe.min_avg_dollar_volume_usd_mn)
         _push_or_keep(f"{_LIQUIDITY_FEATURE} >= {universe.min_avg_dollar_volume_usd_mn:g}", cond, fm, catalog,
-                      preflight, b, point_in_time)
+                      preflight, admitted, b, point_in_time)
     if universe.exclude_sectors:
         cond = Condition(feature=_SECTOR_FEATURE, op="not_in", values=list(universe.exclude_sectors))
         _push_or_keep(f"{_SECTOR_FEATURE} not in [{', '.join(universe.exclude_sectors)}]", cond, fm, catalog,
-                      preflight, b, point_in_time)
+                      preflight, admitted, b, point_in_time)
 
 
 def _push_or_keep(label: str, cond: Condition, fm: Mapping[str, Any], catalog: FeatureCatalog,
-                  preflight: Mapping[str, bool], b: _Builder, point_in_time: bool) -> None:
+                  preflight: Mapping[str, bool], admitted: Collection[str], b: _Builder, point_in_time: bool) -> None:
     if not point_in_time:
-        b.keep_local(label, "as_of is historical: SCREEN evaluates current values only (no point-in-time)")
+        b.keep_local(label, "as_of is historical (older than the latest completed session): SCREEN evaluates the "
+                            "latest values with no date anchor, so time-varying predicates stay local (no look-ahead)")
         return
-    preds, status, why = _compile_condition(cond, fm, catalog, preflight)
+    preds, status, why = _compile_condition(cond, fm, catalog, preflight, admitted)
     if why:
         b.keep_local(label, why)
     else:
@@ -445,12 +516,17 @@ def compile_universe(universe: UniverseSpec | None, fieldmap: Mapping[str, Any] 
 
 
 def preflight_codes(spec: ScreenSpec, fieldmap: Mapping[str, Any] | None = None, as_of: date | None = None, *,
-                    today: date | None = None, max_as_of_lag_days: int = MAX_AS_OF_LAG_DAYS,
-                    catalog: FeatureCatalog | None = None) -> list[str]:
-    """SCREEN expressions that need a passing preflight today before they can be pushed for ``spec``."""
+                    today: date | None = None, max_session_lag: int = MAX_SESSION_LAG,
+                    catalog: FeatureCatalog | None = None, admitted: Collection[str] | None = None) -> list[str]:
+    """SCREEN expressions that need a passing preflight today before they can be pushed for ``spec``.
+
+    Only admitted (gate G5) features are listed: a non-admitted feature is never pushed, so it is never
+    preflighted either.
+    """
     fm = _fm(fieldmap)
     catalog = catalog or default_catalog()
-    if as_of is not None and not is_point_in_time(as_of, today, max_as_of_lag_days):
+    ok_features = admitted_features(fm, admitted)
+    if as_of is not None and not is_point_in_time(as_of, today, max_session_lag):
         return []
     feats: list[str] = [c.feature for c in spec.conditions if c.other_feature is None]
     u = spec.universe
@@ -463,7 +539,7 @@ def preflight_codes(spec: ScreenSpec, fieldmap: Mapping[str, Any] | None = None,
     out: list[str] = []
     for f in dict.fromkeys(feats):
         entry = _feature_entry(fm, f)
-        if (f in catalog and entry is not None and entry.get("expression") and _status_ok(entry)
+        if (f in catalog and f in ok_features and entry is not None and entry.get("expression") and _status_ok(entry)
                 and entry.get("units_verified") is not False
                 and entry.get("screen", SCREEN_PREFLIGHT) == SCREEN_PREFLIGHT):
             out.append(str(entry["expression"]))
@@ -472,7 +548,8 @@ def preflight_codes(spec: ScreenSpec, fieldmap: Mapping[str, Any] | None = None,
 
 def compile_screen(spec: ScreenSpec, fieldmap: Mapping[str, Any] | None, as_of: date, *,
                    preflight: Mapping[str, bool] | None = None, today: date | None = None,
-                   max_as_of_lag_days: int = MAX_AS_OF_LAG_DAYS, catalog: FeatureCatalog | None = None) -> CompiledQuery:
+                   max_session_lag: int = MAX_SESSION_LAG, catalog: FeatureCatalog | None = None,
+                   admitted: Collection[str] | None = None) -> CompiledQuery:
     """Compile ``spec`` to one LSEG ``SCREEN(...)`` expression plus the pushed / residual split.
 
     Args:
@@ -482,21 +559,28 @@ def compile_screen(spec: ScreenSpec, fieldmap: Mapping[str, Any] | None, as_of: 
         preflight: ``{expression: passed}`` from today's preflight on the test RIC; expressions marked
             ``screen: preflight`` are pushed only when they passed. None = nothing passed.
         today: clock for the point-in-time rule (default ``date.today()``).
-        max_as_of_lag_days: an ``as_of`` older than this pushes static listing predicates only.
+        max_session_lag: sessions ``as_of`` may trail the latest completed session and still push
+            time-varying predicates (default 0: only the latest completed session or later).
+        admitted: gate G5 admission set (feature names with a ``field_validation_log`` entry), added to
+            the field map's ``admitted: true`` flags. None = field-map flags only (the gate stays on).
     """
     fm = _fm(fieldmap)
     catalog = catalog or default_catalog()
+    ok_features = admitted_features(fm, admitted)
+    today = today or date.today()
     pf = {str(k): bool(v) for k, v in (preflight or {}).items()}
-    pit = is_point_in_time(as_of, today, max_as_of_lag_days)
+    lag = as_of_lag_sessions(as_of, today)
+    pit = is_point_in_time(as_of, today, max_session_lag)
     b = _Builder()
     _listing(spec.universe, fm, b)
-    _universe_time_varying(spec.universe, fm, catalog, pf, b, pit)
+    _universe_time_varying(spec.universe, fm, catalog, pf, ok_features, b, pit)
     for cond in spec.conditions:
-        _push_or_keep(cond.describe(), cond, fm, catalog, pf, b, pit)
+        _push_or_keep(cond.describe(), cond, fm, catalog, pf, ok_features, b, pit)
     for group in spec.any_of:
         label = "any of: " + " | ".join(c.describe() for c in group)
         b.keep_local(label, "any_of OR groups are evaluated locally (parenthesised OR form not shown in the reference)")
     version, digest = _fieldmap_meta(fm)
     used = tuple(sorted((k, v) for k, v in pf.items()))
     return CompiledQuery(screen_expression(b.predicates, fm), as_of, tuple(b.predicates), tuple(b.pushed),
-                         tuple(b.residual), pit, version, digest, used)
+                         tuple(b.residual), pit, version, digest, used, tuple(sorted(ok_features)), today, lag,
+                         max(0, int(max_session_lag)))

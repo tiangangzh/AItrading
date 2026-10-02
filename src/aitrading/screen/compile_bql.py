@@ -22,7 +22,7 @@ section 1.2:
   ``2000000000`` against ``cur_mkt_cap(currency='USD')``; ``drawdown_from_52w_high_pct`` -45 ->
   ``-0.45`` against the fractional ``px_last()/hi52 - 1``. Decimal arithmetic keeps literals exact.
 * No ranking: the query never contains ``groupzscore`` / ``grouprank`` / ``groupsort`` or a top-N.
-  Every pushed predicate, including short interest when its map entry is confirmed/corrected, sits
+  Every pushed predicate, including short interest when its map entry is confirmed/corrected and admitted, sits
   inside ``filter()``; the spec's residual predicates (short interest by default) then run locally
   on ALL survivors and only after that are names ranked and truncated (ADR graft 2: never filter
   after ``grouprank``).
@@ -32,8 +32,9 @@ What is pushed
 A condition is pushed only when every feature it uses has a field-map entry with a non-null
 ``expression`` whose status (and the status of every helper it references) is ``confirmed`` or
 ``corrected``, ``pushdown`` is not false, ``units_verified`` is not false (items with unverified
-units enter only as z-scores, ADR graft 1), the entry's ``catalog_unit`` matches the catalog, and
-the operator is expressible in the reference grammar:
+units enter only as z-scores, ADR graft 1), the entry's ``catalog_unit`` matches the catalog, the
+feature is admitted under gate G5 (see below), and the operator is expressible in the reference
+grammar:
 
 * numeric ``>``, ``>=``, ``<``, ``<=``, ``between`` (two inclusive bounds), including
   ``feature <op> multiplier x other_feature`` when both sides are pushable;
@@ -44,7 +45,16 @@ Everything else is *residual* (with a recorded reason) and is evaluated by the l
 numeric ``==`` / ``!=`` (tolerance semantics), ``not_in`` / ``!=`` / multi-label ``in`` (the
 reference grammar shows no ``or`` / ``!=`` in string form), boolean features, every ``any_of``
 group (pushing part of an OR group would drop names), and unmapped / unverifiable features.
-The optional ``admitted`` set enforces gate G5 strictly: only features listed there are pushed.
+
+Gate G5 is deny-by-default: a feature is pushed only when it is *admitted*, i.e. it has a
+``field_validation_log`` entry (VENDOR_REFERENCE section 5), signalled by ``"admitted": true`` on
+the feature in a field-map override and/or by the ``admitted=`` collection the caller passes (the
+run's admission log). ``admitted=None`` means "field-map flags only" - it never disables the gate.
+``allow_unadmitted=True`` is an explicit opt-out for BQLX experimentation only; every compile that
+uses it records a ``G5 OVERRIDE`` warning naming the unadmitted pushed features (audit trail).
+UniverseSpec country / the universe ``base`` define the vendor universe rather than act as feature
+thresholds, so (as in the LSEG compiler) they are not feature-admitted; ``min_price`` and the
+liquidity floor are features and need admission like any other.
 
 A missing value never passes: in BQL a NaN comparison inside ``filter()`` is false (the "silent
 drop"), and locally the engine treats missing as failing. Because the local engine re-evaluates
@@ -74,6 +84,7 @@ __all__ = [
     "render_template",
     "expand_refs",
     "feature_pushability",
+    "admitted_features",
     "bql_number",
     "bql_quote",
     "DEFAULT_UNIVERSE",
@@ -107,6 +118,8 @@ class CompiledQuery:
     warnings: list[str] = field(default_factory=list)  # VERIFY caveats of pushed items, survivorship notes
     as_of: date | None = None
     fieldmap_digest: str = ""
+    admitted: tuple[str, ...] = ()  # gate G5: features admitted for this compile (sorted), for the audit record
+    allow_unadmitted: bool = False  # True only when the caller explicitly opted out of G5 (recorded in warnings)
 
     @property
     def sha256(self) -> str:
@@ -272,13 +285,33 @@ def _dec(x: float) -> Decimal:
 # ------------------------------------------------------------------------------------------------
 
 
+def admitted_features(fieldmap: Mapping[str, Any] | None, admitted: Collection[str] | None = None) -> frozenset[str]:
+    """Features admitted under gate G5: ``"admitted": true`` in the field map plus the ``admitted`` collection.
+
+    Deny-by-default: with no flag and no collection the result is empty, so nothing is pushed.
+    """
+    fm = fieldmap or {}
+    out = {str(n) for n, e in (fm.get("features") or {}).items() if isinstance(e, Mapping) and e.get("admitted") is True}
+    if admitted is not None:
+        if isinstance(admitted, (str, bytes)):
+            raise TypeError("admitted must be a collection of feature names, not a string")
+        out |= {str(a) for a in admitted}
+    return frozenset(out)
+
+
 def feature_pushability(
     feature: str,
     fieldmap: Mapping[str, Any],
     catalog: FeatureCatalog | None = None,
     admitted: Collection[str] | None = None,
+    *,
+    allow_unadmitted: bool = False,
 ) -> tuple[bool, str]:
-    """``(True, "")`` if ``feature`` may be pushed into BQL, else ``(False, reason)``."""
+    """``(True, "")`` if ``feature`` may be pushed into BQL, else ``(False, reason)``.
+
+    ``admitted`` adds to the field map's ``"admitted": true`` flags (see :func:`admitted_features`);
+    a feature in neither is refused (gate G5) unless ``allow_unadmitted`` is True.
+    """
     catalog = catalog or default_catalog()
     if feature not in catalog:
         return False, f"unknown feature '{feature}'"
@@ -309,8 +342,10 @@ def feature_pushability(
         ts = entry.get("threshold_scale")
         if not isinstance(ts, (int, float)) or isinstance(ts, bool) or not math.isfinite(ts) or ts == 0:
             return False, "missing or invalid threshold_scale in the field map"
-    if admitted is not None and feature not in admitted:
-        return False, "not in the field-admission log (gate G5)"
+    if not allow_unadmitted and feature not in admitted_features(fieldmap, admitted):
+        return False, ("not admitted (gate G5): no entry in the field-admission log (field_validation_log); record "
+                       "BloombergProvider.verify_fields() evidence, then pass admitted= or set admitted=true on the "
+                       "feature in a field-map override")
     return True, ""
 
 
@@ -323,7 +358,12 @@ def feature_pushability(
 class _Ctx:
     fieldmap: Mapping[str, Any]
     catalog: FeatureCatalog
-    admitted: Collection[str] | None
+    admitted: frozenset[str]
+    allow_unadmitted: bool = False
+
+    def pushable(self, feature: str) -> tuple[bool, str]:
+        return feature_pushability(feature, self.fieldmap, self.catalog, self.admitted,
+                                   allow_unadmitted=self.allow_unadmitted)
 
     def entry(self, feature: str) -> Mapping[str, Any]:
         return (self.fieldmap.get("features") or {})[feature]
@@ -341,7 +381,7 @@ def _compile_condition(cond: Condition, ctx: _Ctx) -> tuple[str | None, str, str
     errs = [] if is_category else cond.structural_errors()  # the engine reads category '==' from 'values'
     if errs:
         return None, "structurally invalid: " + "; ".join(errs), "", []
-    ok, why = feature_pushability(cond.feature, ctx.fieldmap, ctx.catalog, ctx.admitted)
+    ok, why = ctx.pushable(cond.feature)
     if not ok:
         return None, why, "", []
     fdef = ctx.catalog[cond.feature]
@@ -394,7 +434,7 @@ def _compile_condition(cond: Condition, ctx: _Ctx) -> tuple[str | None, str, str
             return f"{var} >= {bql_number(lo)} and {var} <= {bql_number(hi)}", "", stage, [cond.feature]
         op = cond.op if ts > 0 else _FLIP[cond.op]
         if cond.other_feature is not None:
-            ok2, why2 = feature_pushability(cond.other_feature, ctx.fieldmap, ctx.catalog, ctx.admitted)
+            ok2, why2 = ctx.pushable(cond.other_feature)
             if not ok2:
                 return None, f"other feature '{cond.other_feature}': {why2}", "", []
             if ctx.catalog[cond.other_feature].dtype != "number":
@@ -420,6 +460,7 @@ def compile_screen(
     catalog: FeatureCatalog | None = None,
     admitted: Collection[str] | None = None,
     benchmark: str | None = None,
+    allow_unadmitted: bool = False,
 ) -> CompiledQuery:
     """Compile ``spec`` into one BQL request anchored to ``as_of`` (see module docstring).
 
@@ -430,14 +471,17 @@ def compile_screen(
         universe_expr: replaces ``equitiesuniv(['ACTIVE','PRIMARY'])`` (placeholders allowed, e.g.
             ``members('RAY Index', dates='{as_of}')`` for a point-in-time backtest universe).
         catalog: feature catalog (default catalog).
-        admitted: optional G5 admission set; when given, only these features are pushed.
+        admitted: gate G5 admission set (features with a ``field_validation_log`` entry), added to
+            the field map's ``"admitted": true`` flags. None = field-map flags only; the gate stays on.
         benchmark: security for ``{benchmark}`` placeholders (default: the map's benchmark).
+        allow_unadmitted: explicit G5 opt-out for BQLX experimentation; recorded as a warning.
 
     Raises :class:`CompileError` when nothing can wrap ``equitiesuniv`` in ``filter()``.
     """
     a = _as_date(as_of)
     catalog = catalog or default_catalog()
-    ctx = _Ctx(fieldmap, catalog, admitted)
+    ok_features = admitted_features(fieldmap, admitted)
+    ctx = _Ctx(fieldmap, catalog, ok_features, bool(allow_unadmitted))
     bench = benchmark or str((fieldmap.get("benchmark") or {}).get("security") or "SPX Index")
     uni = fieldmap.get("universe") or {}
 
@@ -545,9 +589,10 @@ def compile_screen(
         if banned in query:  # pragma: no cover - only reachable through a hostile field map
             raise CompileError(f"compiled query contains '{banned}': ranking must happen after every filter, locally")
 
-    if pushed or universe_conditions:
-        warnings.append("pushed items still need a field_validation_log entry (gate G5) before production use: "
-                        "run BloombergProvider.verify_fields() on a known security and record the values")
+    unadmitted = [n for n in let_names if n not in ok_features]
+    if unadmitted:  # only reachable with allow_unadmitted=True
+        warnings.append("G5 OVERRIDE: allow_unadmitted=True pushed feature(s) with no field_validation_log entry: "
+                        + ", ".join(unadmitted) + " (BQLX experimentation only; not for production runs)")
     helpers = fieldmap.get("helpers") or {}
     for n in let_names:
         notes = [str(v) for v in ctx.entry(n).get("verify") or []]
@@ -572,4 +617,6 @@ def compile_screen(
         warnings=warnings,
         as_of=a,
         fieldmap_digest=digest(fieldmap),
+        admitted=tuple(sorted(ok_features)),
+        allow_unadmitted=bool(allow_unadmitted),
     )

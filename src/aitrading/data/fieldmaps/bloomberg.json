@@ -9,6 +9,15 @@
     "unverifiable": "Could not be confirmed. Configurable only, never hard-coded; preflighted on test_security before use; a failure suspends the leg (LEG NOT EVALUATED); never pushed as a BQL threshold."
   },
   "test_security": "IBM US Equity",
+  "admission": "Gate G5 (VENDOR_REFERENCE section 5): a feature is pushed as a BQL filter predicate only when it is admitted - set \"admitted\": true on features.<name> in a field-map override (or pass admitted=[...] to BloombergProvider / compile_screen) after recording BloombergProvider.verify_fields() evidence in field_validation_log. Nothing in this default map is admitted, so by default only the universe definition is pushed.",
+
+  "identifiers": {
+    "composite_exchange": {
+      "value": "US",
+      "status": "confirmed",
+      "notes": "Bloomberg composite code for US equities ('IBM US Equity', 'AAPL US Equity' in the 1.1 examples). Universe / push-down / EQS results may carry exchange-level ids (UN, UW, ...); for every later data request (prices, BDP/BQL snapshots) the adapter uses the composite id, because PX_VOLUME / px_volume on an exchange-level id is that venue's volume only, not the consolidated volume the canonical 'volume' column means. Exchange-level codes are the keys of raw.universe.country.derived.value_map that map to 'US'. The exchange-level id is kept in the vendor_id column."
+    }
+  },
 
   "universe": {
     "base": {
@@ -303,9 +312,10 @@
       "catalog_unit": "%",
       "threshold_scale": 1,
       "stage": "series",
-      "status": "confirmed",
+      "status": "corrected",
       "units_verified": false,
-      "notes": "Realized vol row confirms volatility(calc_interval='252d'); an absolute calc_interval=range(...) is the grammar's form for risk items. Units unstated: z-score only until admitted. BDP VOLATILITY_30D unverifiable."
+      "verify": ["absolute calc_interval=range(start,end) form is not shown for volatility(): table 1.3 confirms only volatility(calc_interval='252d'); grammar 1.2 gives range() for return and risk items"],
+      "notes": "Realized vol row confirms only volatility(calc_interval='252d'); the absolute calc_interval=range(...) form (grammar 1.2: return and risk items) is therefore 'corrected' with a VERIFY item, not 'confirmed'. Units unstated: z-score only until admitted (G5). BDP VOLATILITY_30D unverifiable."
     },
     "volatility_60d_pct": {
       "expression": "volatility(calc_interval=range('{d90}','{as_of}'))",
@@ -313,8 +323,9 @@
       "catalog_unit": "%",
       "threshold_scale": 1,
       "stage": "series",
-      "status": "confirmed",
+      "status": "corrected",
       "units_verified": false,
+      "verify": ["absolute calc_interval=range(start,end) form is not shown for volatility(): table 1.3 confirms only volatility(calc_interval='252d'); grammar 1.2 gives range() for return and risk items"],
       "notes": "As volatility_20d_pct."
     },
     "iv_30d_pct": {
@@ -535,10 +546,9 @@
       "security_type": {
         "bql": {
           "expression": null,
-          "assume": "common_stock",
           "kind": "label",
           "status": "unverifiable",
-          "notes": "No BQL security-type item is verified and 'ADR/REIT exclusion not yet possible in BQL' (1.3). Members of equitiesuniv(['ACTIVE','PRIMARY']) are LABELLED with 'assume' (a warning says ADRs/REITs are not excluded) so the local common-stock filter does not empty the universe. Set expression to an admitted item to classify instead."
+          "notes": "No BQL security-type item is verified and 'ADR/REIT exclusion not yet possible in BQL' (1.3). No value is ever assumed (NaN never passes): under backend='bql' the BDP SECURITY_TYP entry below is used (preflighted) when the Desktop API is reachable; otherwise security_type is NaN and the security-type leg is NOT EVALUATED (set UniverseSpec.security_types=[] to screen without it). Set expression to an admitted BQL item to classify inside BQuant."
         },
         "bdp": {
           "code": "SECURITY_TYP",
@@ -555,19 +565,19 @@
     },
     "prices": {
       "open": {
-        "bql": {"expression": "px_open(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "px_open is not in VENDOR_REFERENCE. Preflighted; NaN when it fails."},
+        "bql": {"expression": "px_open(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "forward_filled": true, "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "px_open is not in VENDOR_REFERENCE. Preflighted; NaN when it fails."},
         "bdh": {"code": "PX_OPEN", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "Not in VENDOR_REFERENCE. Preflighted."}
       },
       "high": {
-        "bql": {"expression": "px_high(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "px_high is confirmed (52w high row) but ca_adj='full' on it is not shown; needed so OHLC share the close's adjustment. Preflighted."},
+        "bql": {"expression": "px_high(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "forward_filled": true, "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "px_high is confirmed (52w high row) but ca_adj='full' on it is not shown; needed so OHLC share the close's adjustment. Preflighted."},
         "bdh": {"code": "PX_HIGH", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "Not in VENDOR_REFERENCE. Preflighted."}
       },
       "low": {
-        "bql": {"expression": "px_low(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "As high."},
+        "bql": {"expression": "px_low(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "forward_filled": true, "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "As high."},
         "bdh": {"code": "PX_LOW", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "Not in VENDOR_REFERENCE. Preflighted."}
       },
       "close": {
-        "bql": {"expression": "px_last(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "unit": "USD (trading currency), split- and dividend-adjusted", "to_canonical": 1, "status": "confirmed", "notes": "Last price row, confirmed series form (ca_adj='full')."},
+        "bql": {"expression": "px_last(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "forward_filled": true, "unit": "USD (trading currency), split- and dividend-adjusted", "to_canonical": 1, "status": "confirmed", "notes": "Last price row, confirmed series form (ca_adj='full')."},
         "bdh": {"code": "PX_LAST", "unit": "USD (trading currency)", "to_canonical": 1, "status": "confirmed", "notes": "BDH example in 1.1. Adjustment depends on requests.history_adjustment."}
       },
       "volume": {
@@ -641,6 +651,12 @@
   },
 
   "requests": {
+    "bql_with_clause": {
+      "value": "with(mode=cached)",
+      "enabled": false,
+      "status": "unverifiable",
+      "notes": "ADR risk table: BQL capacity mitigation with_params={'mode':'cached'}. VENDOR_REFERENCE 1.2: mode='cached' is verified only through bql.Request(..., with_params=...); the string with(mode=cached) form is UNVERIFIED (ADR section 8 known unknown), and this adapter executes logged BQL strings. Opt-in: set enabled=true in an override to append this clause to every BQL string; it is preflighted once on test_security and dropped (with a warning) if that fails. The universe query is tranched regardless (ids first, label items in batch_size chunks)."
+    },
     "refdata_service": {"value": "//blp/refdata", "status": "confirmed", "notes": "Desktop API reference/history service (1.1). //blp/bqlsvc is PROHIBITED (ADR section 7) and never used."},
     "host": {"value": "localhost", "status": "confirmed", "notes": "Desktop API session host (1.1)."},
     "port": {"value": 8194, "status": "confirmed", "notes": "Desktop API session port (1.1)."},

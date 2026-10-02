@@ -8,7 +8,18 @@
     "corrected": "Verified only in the form shown here. Use exactly this form; parts noted VERIFY stay configurable.",
     "unverifiable": "Could not be confirmed. Configurable only, never hard-coded; preflighted on test_ric before every run; a failure suspends the leg (NOT EVALUATED); never pushed as a SCREEN threshold."
   },
+  "admission": {
+    "notes": "Gate G5 (VENDOR_REFERENCE section 5): a feature is pushed as a SCREEN threshold only after it is admitted, i.e. it has a field_validation_log entry (item, params, test ticker, as_of, value, units, sign, reviewer, date). This default map admits nothing. Admit a feature with \"admitted\": true on features.<name> in an AITRADING_FIELDMAP_LSEG override, or pass LSEGProvider(admitted=[...]) from the run's admission log. Non-admitted features stay residual (evaluated locally). The universe listing predicates under 'screen' define the universe and are not feature thresholds."
+  },
   "test_ric": "IBM.N",
+  "symbology": {
+    "ric_suffixes": ["N", "O", "OQ", "A", "P", "K", "U", "PK", "Z"],
+    "notes": "A ticker passed directly is used as a RIC only if it is an index RIC ('.SPX') or ends with one of these exchange suffixes (an optional '^' delisting tail is ignored); anything else ('BRK.B', 'BRK-B') must come from a SCREEN result or the rics= table, otherwise it is dropped and flagged as unresolved (ADR graft 6). Extend the list in an override for non-US listings."
+  },
+  "sessions": {
+    "default": "platform.ldp",
+    "notes": "VENDOR_REFERENCE 2.1: 'platform.ldp' is the unattended/server session (LSEG Platform content, licence class L3 until gate G3). 'desktop.workspace' (the library default) is licensed for individual use (licence class L4: nothing leaves the workstation) and must not run on a server (ADR section 7), so the adapter opens it only when named explicitly and never widens its boundary. Documents fetched through a desktop session are tagged L4."
+  },
 
   "parameters": {
     "Curn": {
@@ -19,7 +30,8 @@
     "SDate": {
       "value": "{as_of}",
       "status": "unverifiable",
-      "notes": "Anchors every snapshot to the absolute as_of (ADR graft 4: never '0D'). The global SDate parameter is not shown in VENDOR_REFERENCE: record in the admission log that values move with SDate."
+      "probe": "TR.PriceClose",
+      "notes": "Anchors every snapshot to the absolute as_of (ADR graft 4: never '0D'). The global SDate parameter is not shown in VENDOR_REFERENCE, so it is preflighted once a day per as_of on test_ric: 'probe' (a confirmed field) is requested with and without SDate and both values go to field_log (record in the admission log that values move with SDate). If the request with SDate fails, SDate is dropped (warned, logged); a historical as_of then has no anchor, so snapshots are NOT EVALUATED (NaN) instead of silently returning current values."
     }
   },
 
@@ -69,8 +81,8 @@
       "unit": "percent",
       "threshold_scale": 1,
       "status": "corrected",
-      "screen": "official",
-      "notes": "In SCREEN, percent. Window is 3 calendar months vs the catalog's 63 sessions: borderline names may be dropped by the push-down (the local engine re-checks every survivor). Set screen to 'none' in an override to keep it local."
+      "screen": "none",
+      "notes": "In SCREEN, percent (used in official SCREENs). Not pushed: the vendor window is 3 calendar months while the catalog's return_3m_pct is 63 sessions, so a pushed threshold is not a superset of the local predicate and could drop names the local definition passes (a push-down can only narrow; dropped names are never re-checked). A meaning-changing mapping (ADR): evaluated locally from history."
     },
     "return_1m_pct": {
       "expression": "TR.TotalReturn1Mo",
@@ -306,10 +318,10 @@
         "notes": "Free float / shares row; TR.CompanySharesOutstanding is third-party."
       },
       "report_date": {
-        "code": "TR.RevenueActReportDate",
+        "code": "TR.RevenueActReportDate(Period=FQ0)",
         "kind": "date",
-        "status": "corrected",
-        "notes": "Earnings events row. A report date after as_of blanks the row (look-ahead guard)."
+        "status": "unverifiable",
+        "notes": "Earnings events row lists the bare TR.RevenueActReportDate (corrected), whose default period is not documented (I/B/E/S actuals may default to the fiscal year, FY0) and so may not be the report date of the FQ0 values in this section. The period is pinned to FQ0 to match revenue_last_q; that parameterised form is not in VENDOR_REFERENCE, so it is unverifiable and preflighted. A report date after as_of blanks the row (look-ahead guard); while this leg is NOT EVALUATED the guard is inactive and the adapter warns."
       }
     },
     "estimates": {
@@ -329,10 +341,10 @@
         "notes": "Earnings events row. Units undocumented: not served until admitted (set units_verified=true in an override)."
       },
       "last_earnings_date": {
-        "code": "TR.RevenueActReportDate",
+        "code": "TR.RevenueActReportDate(Period=FQ0)",
         "kind": "date",
-        "status": "corrected",
-        "notes": "Report date of the latest revenue actual."
+        "status": "unverifiable",
+        "notes": "Report date of the latest quarterly (FQ0) revenue actual. The bare corrected form has an undocumented default period (possibly FY0, i.e. months stale), so the period is pinned; the pinned form is not in VENDOR_REFERENCE: unverifiable, preflighted."
       },
       "next_earnings_date": {
         "code": "TR.ExpectedReportDate",
@@ -344,24 +356,27 @@
     "short_interest": {
       "short_interest_shares": {
         "code": "TR.ShortInterest(SDate={as_of})",
-        "unit": "shares",
+        "unit": "shares (ASSUMED)",
         "to_canonical": 1,
         "status": "unverifiable",
-        "notes": "Reference form TR.ShortInterest(SDate=0D), anchored to the absolute as_of. Third-party evidence only. LSEG keeps short interest only for listed names (survivorship)."
+        "units_verified": false,
+        "notes": "Reference form TR.ShortInterest(SDate=0D), anchored to the absolute as_of. Third-party evidence only. LSEG keeps short interest only for listed names (survivorship). Scale UNVERIFIED: VENDOR_REFERENCE table 2.3 says '100*TR.ShortInterest(SDate=0D)/TR.SharesFreeFloat(SDate=0D) ... The exported expression returns a fraction', i.e. a factor-of-100 mismatch between this field and float_shares, and it is not known which one is off. Not served until verify_fields on IBM.N plus a second source fixes the scale; then admit it with units_verified=true (and the right to_canonical) in an override."
       },
       "short_interest_shares_1m_ago": {
         "code": "TR.ShortInterest(SDate={as_of_1m})",
-        "unit": "shares",
+        "unit": "shares (ASSUMED)",
         "to_canonical": 1,
         "status": "unverifiable",
-        "notes": "As short_interest_shares, 30 calendar days earlier."
+        "units_verified": false,
+        "notes": "As short_interest_shares, 30 calendar days earlier (same scale caveat)."
       },
       "float_shares": {
         "code": "TR.SharesFreeFloat(SDate={as_of})",
-        "unit": "shares",
+        "unit": "shares (ASSUMED)",
         "to_canonical": 1,
         "status": "unverifiable",
-        "notes": "TR.SharesFreeFloat is third-party (TR.FreeFloat / TR.FreeFloatPct are corrected but their units are undocumented)."
+        "units_verified": false,
+        "notes": "TR.SharesFreeFloat is third-party (TR.FreeFloat / TR.FreeFloatPct are corrected but their units are undocumented). Scale UNVERIFIED: see short_interest_shares (the reference's '100*SI/float ... returns a fraction' remark implies a 100x mismatch between the two legs). Not served until admitted."
       },
       "settlement_date": {
         "code": "TR.ShortInterest(SDate={as_of}).date",
@@ -391,7 +406,7 @@
     "adjustments": {
       "value": ["exchangeCorrection", "manualCorrection", "CCH", "CRE", "RTS", "RPO"],
       "status": "unverifiable",
-      "notes": "get_history(..., adjustments) is corrected, but corporate-action adjustment of TRDPRC_1 is UNVERIFIED: cross-check drawdown vs TR.Price52WeekHigh around splits (LSEGProvider.crosscheck_adjustment)."
+      "notes": "get_history(..., adjustments) is corrected, but these values and the corporate-action adjustment of TRDPRC_1 are UNVERIFIED: cross-check drawdown vs TR.Price52WeekHigh around splits (LSEGProvider.crosscheck_adjustment). Preflighted once a day on test_ric (the close history is requested with and without them); if the request with them fails they are dropped (library default adjustments), warned and logged."
     },
     "fields": {
       "close": {"code": "TRDPRC_1", "status": "confirmed", "notes": "Last price (history)."},
@@ -416,7 +431,7 @@
       "query_template": "R:{ric}",
       "status": "confirmed",
       "licence_class": "L3",
-      "notes": "ld.news.get_headlines / get_story confirmed; content is licence class L3 (Reuters copyright). The 'R:<RIC>' query syntax follows the LSEG-API-Samples news examples (not reproduced in VENDOR_REFERENCE)."
+      "notes": "ld.news.get_headlines / get_story confirmed; content is licence class L3 (Reuters copyright) through a platform session and L4 through a desktop (Workspace) session. The 'R:<RIC>' query syntax follows the LSEG-API-Samples news examples (not reproduced in VENDOR_REFERENCE)."
     },
     "filings": {
       "enabled": false,
