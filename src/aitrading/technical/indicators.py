@@ -1,8 +1,8 @@
 """Vectorised technical indicators.
 
 Every function accepts a ``pd.Series`` or a wide ``pd.DataFrame`` (dates x tickers, applied
-column-wise) and returns the same shape, index and columns. Windows count rows; what a row is is
-the caller's choice (the feature engine passes each ticker's own trading sessions, see
+column-wise) and returns the same shape, index and columns as float. Windows count rows; what a row
+is is the caller's choice (the feature engine passes each ticker's own trading sessions, see
 ``aitrading.technical.features``). Ratios are returned as fractions, not percentages.
 
 NaN conventions
@@ -17,16 +17,24 @@ NaN conventions
 * Prices <= 0 are treated as missing in return calculations (no division by zero, no log <= 0).
 * RSI is NaN when both average gain and average loss are zero (a constant series has no defined
   RSI); it is exactly 100 when the average loss is zero and 0 when the average gain is zero.
+
+Implementation: rolling statistics run as a single pandas (Cython) pass over the columns laid end
+to end with ``n`` NaN rows between them, so windows never mix tickers; recursions loop over rows
+with numpy operations across all columns. Both are O(rows x columns) and wide-frame friendly.
 """
 
 from __future__ import annotations
 
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 import numpy as np
 import pandas as pd
 
 P = TypeVar("P", pd.Series, pd.DataFrame)
+_Stat = Literal["sum", "mean", "std", "max", "min"]
+
+
+# --- array kernels (2-D float arrays, rows x columns) ----------------------------------------
 
 
 def _check_window(n: int, name: str = "n", minimum: int = 1) -> None:
@@ -34,14 +42,108 @@ def _check_window(n: int, name: str = "n", minimum: int = 1) -> None:
         raise ValueError(f"{name} must be an integer >= {minimum}, got {n!r}")
 
 
-def _wrap(like: P, values: np.ndarray) -> P:
-    if isinstance(like, pd.Series):
-        return pd.Series(values, index=like.index, name=like.name)
-    return pd.DataFrame(values, index=like.index, columns=like.columns)
+def _arr(x: pd.Series | pd.DataFrame) -> np.ndarray:
+    a = x.to_numpy(dtype="float64", na_value=np.nan)
+    return a.reshape(-1, 1) if a.ndim == 1 else a
 
 
-def _positive(x: P) -> P:
-    return x.where(x > 0)
+def _like(x: P, a: np.ndarray) -> P:
+    if isinstance(x, pd.Series):
+        return pd.Series(a[:, 0], index=x.index, name=x.name)
+    return pd.DataFrame(a, index=x.index, columns=x.columns)
+
+
+def _shift(a: np.ndarray, k: int) -> np.ndarray:
+    out = np.full(a.shape, np.nan)
+    if k < a.shape[0]:
+        out[k:] = a[: a.shape[0] - k]
+    return out
+
+
+def _window_diff(cum: np.ndarray, n: int) -> np.ndarray:
+    """Sums over windows of n rows ending at rows n-1 .. t-1, from a cumulative sum with a zero row."""
+    return cum[n:] - cum[:-n]
+
+
+def _rolling(a: np.ndarray, n: int, stat: _Stat) -> np.ndarray:
+    """Complete-window rolling statistic of every column (std is the sample stdev, ddof=1).
+
+    sum / mean / std use cumulative sums of values centred on each column's first valid value
+    (keeps the running sums small); a window holding any non-finite value is NaN. max / min run as
+    one pandas pass over the columns laid end to end, separated by n NaN rows.
+    """
+    t, k = a.shape
+    out = np.full((t, k), np.nan)
+    if t < n or k == 0:
+        return out
+    finite = np.isfinite(a)
+    if stat in ("max", "min"):
+        padded = np.full((t + n, k), np.nan)
+        padded[n:] = np.where(finite, a, np.nan)
+        r = getattr(pd.Series(padded.T.ravel()).rolling(n, min_periods=n), stat)()
+        return r.to_numpy().reshape(k, t + n).T[n:].copy()
+    first = np.argmax(finite, axis=0)
+    centre = np.where(finite.any(axis=0), a[first, np.arange(k)], 0.0)
+    x = np.where(finite, a - centre, 0.0)
+    cum = np.zeros((t + 1, k))
+    np.cumsum(x, axis=0, out=cum[1:])
+    s1 = _window_diff(cum, n)
+    bad = np.zeros((t + 1, k), dtype=np.int64)
+    np.cumsum(~finite, axis=0, out=bad[1:])
+    incomplete = _window_diff(bad, n) > 0
+    if stat == "sum":
+        res = s1 + n * centre
+    elif stat == "mean":
+        res = s1 / n + centre
+    elif stat == "std":
+        if n < 2:
+            raise ValueError("std needs a window of at least 2")
+        np.cumsum(x * x, axis=0, out=cum[1:])
+        var = (_window_diff(cum, n) - s1 * s1 / n) / (n - 1)
+        res = np.sqrt(np.maximum(var, 0.0))
+    else:  # pragma: no cover - guarded by _Stat
+        raise ValueError(f"unknown rolling statistic {stat!r}")
+    res[incomplete] = np.nan
+    out[n - 1 :] = res
+    return out
+
+
+def _ewm(a: np.ndarray, alpha: float, min_periods: int = 1) -> np.ndarray:
+    """``s_t = (1 - alpha) s_prev + alpha x_t`` seeded with the first valid value, skipping missing
+    rows; NaN on missing rows and until ``min_periods`` valid values have been seen."""
+    t, k = a.shape
+    out = np.empty((t, k))
+    ok = np.isfinite(a)
+    row_ok = ok.all(axis=1)
+    state = np.full(k, np.nan)
+    keep = 1.0 - alpha
+    ready = False  # every column seeded: complete rows take the cheap in-place update
+    for i in range(t):
+        x = a[i]
+        if ready and row_ok[i]:
+            state *= keep
+            state += alpha * x
+        else:
+            new = keep * state + alpha * x
+            fresh = ok[i] & np.isnan(state)
+            new[fresh] = x[fresh]
+            state = np.where(ok[i], new, state)
+            ready = not np.isnan(state).any()
+        out[i] = state
+    out[~ok] = np.nan
+    if min_periods > 1:
+        out[np.cumsum(ok, axis=0) < min_periods] = np.nan
+    return out
+
+
+def _wilder(a: np.ndarray, n: int) -> np.ndarray:
+    seed = _rolling(a, n, "mean")
+    started = np.maximum.accumulate(np.isfinite(seed), axis=0)
+    first = started.copy()
+    first[1:] &= ~started[:-1]
+    y = np.where(started & ~first, a, np.nan)
+    y[first] = seed[first]
+    return np.where(started & np.isfinite(a), _ewm(y, 1.0 / n), np.nan)
 
 
 # --- moving averages -------------------------------------------------------------------------
@@ -50,7 +152,7 @@ def _positive(x: P) -> P:
 def sma(x: P, n: int) -> P:
     """Simple moving average over ``n`` rows (complete window required)."""
     _check_window(n)
-    return x.rolling(n, min_periods=n).mean()
+    return _like(x, _rolling(_arr(x), n, "mean"))
 
 
 def ema(x: P, span: int, *, min_periods: int = 0) -> P:
@@ -59,20 +161,14 @@ def ema(x: P, span: int, *, min_periods: int = 0) -> P:
     ``min_periods`` masks the warm-up: output is NaN until that many valid inputs have been seen.
     """
     _check_window(span, "span")
-    out = x.ewm(span=span, adjust=False, ignore_na=True, min_periods=min_periods).mean()
-    return out.where(x.notna())
+    return _like(x, _ewm(_arr(x), 2.0 / (span + 1.0), max(int(min_periods), 1)))
 
 
 def wilder_smooth(x: P, n: int) -> P:
     """Wilder's running average: seed = mean of the first ``n`` consecutive valid values (placed on
     the n-th of them), then ``(prev * (n - 1) + x_t) / n``. NaN before the seed and where x is NaN."""
     _check_window(n)
-    seed = x.rolling(n, min_periods=n).mean()
-    started = seed.notna().cummax()
-    first = started & ~started.shift(1, fill_value=False)
-    y = x.where(started & ~first).mask(first, seed)
-    out = y.ewm(alpha=1.0 / n, adjust=False, ignore_na=True).mean()
-    return out.where(started & x.notna())
+    return _like(x, _wilder(_arr(x), n))
 
 
 # --- oscillators -----------------------------------------------------------------------------
@@ -83,11 +179,14 @@ def rsi_wilder(close: P, n: int = 14) -> P:
     for a gap-free series): first averages are simple means of the first n gains / losses, then
     Wilder-smoothed. NaN when average gain and loss are both zero (e.g. a constant series)."""
     _check_window(n)
-    delta = close.diff()
-    avg_gain = wilder_smooth(delta.clip(lower=0.0), n)
-    avg_loss = wilder_smooth((-delta).clip(lower=0.0), n)
+    c = _arr(close)
+    delta = c - _shift(c, 1)
+    avg_gain = _wilder(np.clip(delta, 0.0, None), n)
+    avg_loss = _wilder(np.clip(-delta, 0.0, None), n)
     total = avg_gain + avg_loss
-    return (100.0 * avg_gain / total).where(total > 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rsi = np.where(total > 0, 100.0 * avg_gain / total, np.nan)
+    return _like(close, rsi)
 
 
 def macd(close: P, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[P, P, P]:
@@ -99,61 +198,71 @@ def macd(close: P, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[P, 
     _check_window(signal, "signal")
     if fast >= slow:
         raise ValueError(f"fast ({fast}) must be < slow ({slow})")
-    line = ema(close, fast, min_periods=fast) - ema(close, slow, min_periods=slow)
-    sig = ema(line, signal, min_periods=signal)
-    return line, sig, line - sig
+    c = _arr(close)
+    line = _ewm(c, 2.0 / (fast + 1.0), fast) - _ewm(c, 2.0 / (slow + 1.0), slow)
+    sig = _ewm(line, 2.0 / (signal + 1.0), signal)
+    return _like(close, line), _like(close, sig), _like(close, line - sig)
 
 
 # --- range / volatility ----------------------------------------------------------------------
 
 
+def _true_range(h: np.ndarray, lo: np.ndarray, c: np.ndarray) -> np.ndarray:
+    prev = _shift(c, 1)
+    hl = h - lo
+    tr = np.fmax(hl, np.fmax(np.abs(h - prev), np.abs(lo - prev)))
+    return np.where(np.isnan(hl), np.nan, tr)
+
+
 def true_range(high: P, low: P, close: P) -> P:
     """max(high - low, |high - prev close|, |low - prev close|); high - low when there is no
     previous close (first row, or the previous close is missing). NaN if high or low is missing."""
-    prev = close.shift(1)
-    hl = high - low
-    hc = (high - prev).abs()
-    lc = (low - prev).abs()
-    tr = np.fmax(hl.to_numpy(dtype=float), np.fmax(hc.to_numpy(dtype=float), lc.to_numpy(dtype=float)))
-    return _wrap(hl, tr).where(hl.notna())
+    return _like(high, _true_range(_arr(high), _arr(low), _arr(close)))
 
 
 def atr_wilder(high: P, low: P, close: P, n: int = 14) -> P:
     """Wilder average true range: first value = mean of the first ``n`` true ranges (the first of
     which is high - low), then Wilder-smoothed."""
-    return wilder_smooth(true_range(high, low, close), n)
+    _check_window(n)
+    return _like(high, _wilder(_true_range(_arr(high), _arr(low), _arr(close)), n))
+
+
+def _positive(a: np.ndarray) -> np.ndarray:
+    with np.errstate(invalid="ignore"):
+        return np.where(np.isfinite(a) & (a > 0), a, np.nan)
 
 
 def log_returns(close: P) -> P:
     """ln(close_t / close_{t-1}); NaN on the first row and around non-positive / missing prices."""
-    c = _positive(close)
-    return np.log(c / c.shift(1))
+    c = _positive(_arr(close))
+    return _like(close, np.log(c / _shift(c, 1)))
 
 
 def realized_vol(close: P, n: int, periods_per_year: int = 252) -> P:
     """Annualised sample stdev (ddof=1) of the last ``n`` log returns, as a fraction (needs n + 1
     closes)."""
     _check_window(n, minimum=2)
-    return log_returns(close).rolling(n, min_periods=n).std(ddof=1) * np.sqrt(periods_per_year)
+    c = _positive(_arr(close))
+    return _like(close, _rolling(np.log(c / _shift(c, 1)), n, "std") * np.sqrt(periods_per_year))
 
 
 def total_return(close: P, n: int) -> P:
     """close_t / close_{t-n} - 1 as a fraction; NaN if either price is missing or <= 0."""
     _check_window(n)
-    c = _positive(close)
-    return c / c.shift(n) - 1.0
+    c = _positive(_arr(close))
+    return _like(close, c / _shift(c, n) - 1.0)
 
 
 def rolling_high(x: P, n: int) -> P:
     """Rolling maximum over ``n`` rows (complete window required)."""
     _check_window(n)
-    return x.rolling(n, min_periods=n).max()
+    return _like(x, _rolling(_arr(x), n, "max"))
 
 
 def rolling_low(x: P, n: int) -> P:
     """Rolling minimum over ``n`` rows (complete window required)."""
     _check_window(n)
-    return x.rolling(n, min_periods=n).min()
+    return _like(x, _rolling(_arr(x), n, "min"))
 
 
 # --- regression ------------------------------------------------------------------------------
@@ -167,29 +276,24 @@ def rolling_beta(asset_returns: P, bench_returns: pd.Series | pd.DataFrame, n: i
     pairs must be present; NaN when the benchmark variance is (numerically) zero.
     """
     _check_window(n, minimum=2)
-    a = asset_returns.to_frame() if isinstance(asset_returns, pd.Series) else asset_returns
+    a = _arr(asset_returns)
     if isinstance(bench_returns, pd.DataFrame):
-        bvals = bench_returns.reindex(index=a.index, columns=a.columns).to_numpy(dtype=float)
+        if isinstance(asset_returns, pd.Series):
+            raise TypeError("a DataFrame benchmark needs DataFrame asset returns")
+        b = _arr(bench_returns.reindex(index=asset_returns.index, columns=asset_returns.columns))
     elif isinstance(bench_returns, pd.Series):
-        bvals = np.broadcast_to(bench_returns.reindex(a.index).to_numpy(dtype=float)[:, None], a.shape)
+        b = np.broadcast_to(_arr(bench_returns.reindex(asset_returns.index)), a.shape)
     else:
         raise TypeError("bench_returns must be a pandas Series or DataFrame")
-    avals = a.to_numpy(dtype=float)
-    valid = np.isfinite(avals) & np.isfinite(bvals)
-    av = np.where(valid, avals, np.nan)
-    bv = np.where(valid, bvals, np.nan)
-
-    def rsum(v: np.ndarray) -> np.ndarray:
-        return pd.DataFrame(v).rolling(n, min_periods=n).sum().to_numpy()
-
-    sa, sb, sab, sbb = rsum(av), rsum(bv), rsum(av * bv), rsum(bv * bv)
+    valid = np.isfinite(a) & np.isfinite(b)
+    a, b = np.where(valid, a, np.nan), np.where(valid, b, np.nan)
+    sa, sb = _rolling(a, n, "sum"), _rolling(b, n, "sum")
+    sab, sbb = _rolling(a * b, n, "sum"), _rolling(b * b, n, "sum")
     with np.errstate(invalid="ignore", divide="ignore"):
         cov = sab - sa * sb / n
         var = sbb - sb * sb / n
         beta = np.where(var > 1e-12 * np.maximum(sbb, np.finfo(float).tiny), cov / var, np.nan)
-    if isinstance(asset_returns, pd.Series):
-        return pd.Series(beta[:, 0], index=asset_returns.index, name=asset_returns.name)
-    return pd.DataFrame(beta, index=a.index, columns=a.columns)
+    return _like(asset_returns, beta)
 
 
 # --- events ----------------------------------------------------------------------------------
@@ -201,11 +305,15 @@ def crossed_above_within(a: P, b: P | float, lookback: int) -> P:
     A crossing needs both rows' values present; missing data never counts as a crossing (the caller
     decides whether the look-back was fully observable)."""
     _check_window(lookback, "lookback")
-    if np.isscalar(b):
-        above = a > b
-        prev_at_or_below = a.shift(1) <= b
-    else:
-        above = a > b
-        prev_at_or_below = a.shift(1) <= b.shift(1)
-    event = (above & prev_at_or_below).astype(float)
-    return event.rolling(lookback, min_periods=1).max() > 0
+    av = _arr(a)
+    bv = np.full(av.shape, float(b)) if np.isscalar(b) else _arr(b)
+    with np.errstate(invalid="ignore"):
+        event = (av > bv) & (_shift(av, 1) <= _shift(bv, 1))
+    hits = np.cumsum(event, axis=0)
+    lagged = np.zeros_like(hits)
+    if lookback < hits.shape[0]:
+        lagged[lookback:] = hits[:-lookback]
+    within = hits - lagged > 0
+    if isinstance(a, pd.Series):
+        return pd.Series(within[:, 0], index=a.index, name=a.name)
+    return pd.DataFrame(within, index=a.index, columns=a.columns)
