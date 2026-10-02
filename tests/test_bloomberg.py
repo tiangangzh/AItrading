@@ -72,7 +72,8 @@ class FakeBQL:
     """
 
     def __init__(self, db: dict[str, Any] | None = None, universe: dict[str, list[str]] | None = None,
-                 hash_headers: bool = True):
+                 hash_headers: bool = True, reject_clauses: tuple[str, ...] = ()):
+        self.reject_clauses = set(reject_clauses)
         self.db = dict(db or {})
         self.universe = dict(universe or {})
         self.queries: list[str] = []
@@ -92,8 +93,10 @@ class FakeBQL:
 
     def execute(self, query: str) -> pd.DataFrame:
         self.queries.append(query)
-        m = re.fullmatch(r"let\((.*)\) get\((.*)\) for\((.*)\)", query)
+        m = re.fullmatch(r"let\((.*)\) get\((.*)\) for\((.*?)\)(?: (with\([^()]*\)))?", query)
         assert m, f"malformed BQL: {query}"
+        if m.group(4) and m.group(4) in self.reject_clauses:
+            raise RuntimeError(f"BQL error: unsupported clause {m.group(4)}")
         lets: dict[str, str] = {}
         for part in m.group(1).split(";"):
             part = part.strip()
@@ -136,18 +139,39 @@ class FakeBQL:
         return df.set_index("ID")
 
 
+class _Cid:
+    """Stand-in for ``blpapi.CorrelationId`` (value equality, like the real one)."""
+
+    def __init__(self, value: Any = None):
+        self._v = value
+
+    def value(self) -> Any:
+        return self._v
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Cid) and other._v == self._v
+
+    def __hash__(self) -> int:
+        return hash(self._v)
+
+
 class _Msg:
-    def __init__(self, d: dict[str, Any]):
+    def __init__(self, d: dict[str, Any], cid: _Cid | None = None):
         self._d = d
+        self._cid = cid
 
     def toPy(self) -> dict[str, Any]:  # noqa: N802 - blpapi naming
         return self._d
 
+    def correlationIds(self) -> list[_Cid]:  # noqa: N802
+        return [self._cid] if self._cid is not None else []
+
 
 class _Event:
-    def __init__(self, etype: int, msgs: list[dict[str, Any]]):
+    def __init__(self, etype: int, msgs: list[dict[str, Any]], cid: _Cid | None = None):
         self._t = etype
-        self._msgs = [_Msg(m) for m in msgs]
+        # session-status noise carries no correlation id; request replies carry the request's id
+        self._msgs = [_Msg(m, None if "sessionStatus" in m else cid) for m in msgs]
 
     def eventType(self) -> int:  # noqa: N802
         return self._t
@@ -161,18 +185,25 @@ class FakeBlp:
 
     ``bdp``: code -> {security: value}; ``bdp_errors``: code -> errorInfo for every security, or
     code -> {security: errorInfo}; ``bdh``: code -> {security: {date: value}}; ``beqs``: screen ->
-    securities; ``reject``: request element names that make ``fromPy`` raise.
+    securities; ``reject``: request element names that make ``fromPy`` raise; ``timeout``: every
+    request times out; ``late``: the first N requests time out and their replies arrive later, in
+    front of the next request's reply (as a real session would deliver them).
     """
 
     TIMEOUT, PARTIAL, RESPONSE = 10, 6, 5
 
-    def __init__(self, bdp=None, bdp_errors=None, bdh=None, beqs=None, reject=(), timeout=False, start_ok=True):
+    def __init__(self, bdp=None, bdp_errors=None, bdh=None, beqs=None, reject=(), timeout=False, start_ok=True,
+                 late=0):
         self.bdp = dict(bdp or {})
         self.bdp_errors = dict(bdp_errors or {})
         self.bdh = dict(bdh or {})
         self.beqs = dict(beqs or {})
         self.reject = set(reject)
         self.timeout = timeout
+        self.late = int(late)
+        self._late_events: list[_Event] = []
+        self.cancelled: list[_Cid] = []
+        self.cids: list[_Cid | None] = []
         self.start_ok = start_ok
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.services: list[str] = []
@@ -191,6 +222,7 @@ class FakeBlp:
         mod.SessionOptions = SessionOptions  # type: ignore[attr-defined]
         mod.Session = lambda opts: fake  # type: ignore[attr-defined]
         mod.Event = types.SimpleNamespace(TIMEOUT=self.TIMEOUT, PARTIAL_RESPONSE=self.PARTIAL, RESPONSE=self.RESPONSE)  # type: ignore[attr-defined]
+        mod.CorrelationId = _Cid  # type: ignore[attr-defined]
         self.module = mod
 
     # session API
@@ -222,18 +254,30 @@ class FakeBlp:
         assert name == "//blp/refdata"
         return Service()
 
-    def sendRequest(self, req) -> None:  # noqa: N802
+    def sendRequest(self, req, correlationId=None) -> None:  # noqa: N802, N803 - blpapi naming
         self.requests.append((req.rtype, req.payload))
+        self.cids.append(correlationId)
         if self.timeout:
             self._queue.append(_Event(self.TIMEOUT, []))
             return
         msgs = getattr(self, f"_{req.rtype}")(req.payload)
-        first, rest = msgs[:1], msgs[1:]
-        self._queue.append(_Event(self.PARTIAL, [{"sessionStatus": "noise"}, *first]))
-        self._queue.append(_Event(self.RESPONSE, rest))
+        # a real RESPONSE event always carries the final message; earlier ones arrive as PARTIAL_RESPONSE
+        first, rest = (msgs[:1], msgs[1:]) if len(msgs) > 1 else ([], msgs)
+        reply = [_Event(self.PARTIAL, [{"sessionStatus": "noise"}, *first], correlationId),
+                 _Event(self.RESPONSE, rest, correlationId)]
+        if self.late > 0:  # this reply is late: the caller sees a TIMEOUT, the reply comes with the next request
+            self.late -= 1
+            self._queue.append(_Event(self.TIMEOUT, []))
+            self._late_events += reply
+            return
+        self._queue += self._late_events + reply
+        self._late_events = []
 
     def nextEvent(self, timeout_ms: int) -> _Event:  # noqa: N802
         return self._queue.pop(0)
+
+    def cancel(self, cid) -> None:
+        self.cancelled.append(cid)
 
     def stop(self) -> None:
         pass
@@ -328,15 +372,19 @@ def fm() -> dict[str, Any]:
     return load_fieldmap("bloomberg")
 
 
+# BDP (current values only) is served only when as_of is today, so the provider helpers run "on" AS_OF.
+ADMITTED = {"price", "market_cap_usd_bn", "sma_50", "sma_200", "drawdown_from_52w_high_pct", "rel_volume_5d", "rsi_14"}
+
+
 def bql_provider(fake: FakeBQL, blp: FakeBlp | None = None, **kw) -> BloombergProvider:
-    kw.setdefault("today", lambda: TODAY)
+    kw.setdefault("today", lambda: AS_OF)
     if blp is not None:
         kw.setdefault("blpapi_module", blp.module)
     return BloombergProvider(backend="bql", bql_module=fake.module, **kw)
 
 
 def blp_provider(blp: FakeBlp, **kw) -> BloombergProvider:
-    kw.setdefault("today", lambda: TODAY)
+    kw.setdefault("today", lambda: AS_OF)
     return BloombergProvider(backend="blpapi", blpapi_module=blp.module, **kw)
 
 
@@ -410,6 +458,10 @@ def test_fieldmap_errors(tmp_path, monkeypatch):
         load_fieldmap("bloomberg")
     with pytest.raises(FieldMapError):
         load_fieldmap("no-such-vendor-xyz")
+    monkeypatch.delenv("AITRADING_FIELDMAP_BLOOMBERG")
+    with pytest.raises(FieldMapError, match="admitted must be true or false"):
+        load_fieldmap("bloomberg", {"features": {"rsi_14": {"admitted": "true"}}})
+    assert load_fieldmap("bloomberg", {"features": {"rsi_14": {"admitted": True}}})["features"]["rsi_14"]["admitted"] is True
 
 
 def test_merge_semantics():
@@ -452,7 +504,7 @@ def test_no_unverifiable_vendor_code_is_hard_coded_in_logic(fm):
 
 
 def test_compile_representative_screen_exact_query(fm):
-    cq = compile_screen(representative_spec(), fm, AS_OF)
+    cq = compile_screen(representative_spec(), fm, AS_OF, admitted=ADMITTED)
     assert cq.query == REPRESENTATIVE_QUERY
     assert [c.feature for c in cq.pushed] == ["market_cap_usd_bn", "sma_50", "drawdown_from_52w_high_pct",
                                              "rel_volume_5d", "rsi_14"]
@@ -464,7 +516,8 @@ def test_compile_representative_screen_exact_query(fm):
     assert cq.universe_conditions[1] == "price >= 5 (UniverseSpec.min_price)"
     assert set(cq.universe_residual) == {"security_type in [common_stock]", "avg_dollar_volume_20d_usd_mn >= 5"}
     assert cq.as_of == AS_OF and len(cq.sha256) == 64 and len(cq.fieldmap_digest) == 64
-    assert any("G5" in w for w in cq.warnings)
+    assert cq.admitted == tuple(sorted(ADMITTED)) and cq.allow_unadmitted is False
+    assert not any("G5 OVERRIDE" in w for w in cq.warnings)
     assert any(w.startswith("#rsi_14") and "VERIFY shape" in w for w in cq.warnings)
     assert any("today's universe" in w for w in cq.warnings)
 
@@ -472,14 +525,14 @@ def test_compile_representative_screen_exact_query(fm):
 def test_only_confirmed_or_corrected_features_are_ever_pushable(fm):
     seen = 0
     for name, entry in fm["features"].items():
-        ok, why = feature_pushability(name, fm)
+        ok, why = feature_pushability(name, fm, allow_unadmitted=True)
         if entry.get("status") not in PUSHABLE_STATUSES or not entry.get("expression"):
             assert not ok, name
             seen += 1
         if entry.get("units_verified") is False or entry.get("pushdown") is False:
             assert not ok, name
     assert seen >= 8
-    pushable = {n for n in fm["features"] if feature_pushability(n, fm)[0]}
+    pushable = {n for n in fm["features"] if feature_pushability(n, fm, allow_unadmitted=True)[0]}
     assert {"market_cap_usd_bn", "sma_50", "sma_200", "drawdown_from_52w_high_pct", "rsi_14", "rel_volume_5d",
             "price", "gics_sector"} <= pushable
     assert not pushable & {"fcf_yield_pct", "short_interest_pct_float", "revenue_growth_yoy_pct", "iv_30d_pct",
@@ -487,7 +540,7 @@ def test_only_confirmed_or_corrected_features_are_ever_pushable(fm):
 
 
 def test_compiled_query_obeys_grammar_rules(fm):
-    q = compile_screen(representative_spec(), fm, AS_OF).query
+    q = compile_screen(representative_spec(), fm, AS_OF, admitted=ADMITTED).query
     assert "'0D'" not in q.upper() and "-1Y" not in q.upper() and "0d" not in q  # absolute dates only
     assert re.findall(r"'(\d{4}-\d{2}-\d{2})'", q)
     assert "'2B'" not in q and "2e9" not in q  # plain-number literals
@@ -517,13 +570,14 @@ def test_compiled_query_obeys_grammar_rules(fm):
 ])
 def test_threshold_scaling_into_vendor_units(fm, cond, fragment):
     cq = compile_screen(_spec([cond], UniverseSpec(min_price=None, min_avg_dollar_volume_usd_mn=None,
-                                                   security_types=[])), fm, AS_OF)
+                                                   security_types=[])), fm, AS_OF, admitted=cond.features())
     assert cq.pushed == [cond], cq.reasons
     assert fragment in cq.query
 
 
 def test_market_cap_literal_is_exact_against_cur_mkt_cap(fm):
-    cq = compile_screen(_spec([Condition(feature="market_cap_usd_bn", op=">=", value=2)]), fm, AS_OF)
+    cq = compile_screen(_spec([Condition(feature="market_cap_usd_bn", op=">=", value=2)]), fm, AS_OF,
+                        admitted={"market_cap_usd_bn"})
     assert cq.lets["market_cap_usd_bn"] == "cur_mkt_cap(currency='USD', dates='2026-10-01', fill='prev')"
     assert "#market_cap_usd_bn >= 2000000000" in cq.query
     assert bql_number(0.1 + 0.2) == "0.30000000000000004"  # never rounds a threshold silently
@@ -546,7 +600,8 @@ def test_market_cap_literal_is_exact_against_cur_mkt_cap(fm):
     (Condition(feature="not_a_feature", op=">", value=1), "unknown feature"),
 ])
 def test_residual_conditions_and_reasons(fm, cond, reason):
-    cq = compile_screen(_spec([cond, Condition(feature="rsi_14", op="<", value=50)]), fm, AS_OF)
+    everything = set(compile_bql.default_catalog().names())  # admitted: the reasons below must still apply
+    cq = compile_screen(_spec([cond, Condition(feature="rsi_14", op="<", value=50)]), fm, AS_OF, admitted=everything)
     assert cond in cq.residual
     assert reason in cq.reasons[cond.describe()]
     assert "Health Care')" not in cq.query
@@ -568,9 +623,9 @@ def test_short_interest_is_filtered_before_any_ranking_when_mapped_confirmed(fm)
     """An admitted short-interest item is pushed INSIDE filter(); the query never ranks or truncates."""
     override = {"features": {"short_interest_pct_float": {
         "expression": "admitted_si_item(dates='{as_of}')", "status": "confirmed", "threshold_scale": 0.01,
-        "catalog_unit": "%", "stage": "series"}}}
+        "catalog_unit": "%", "stage": "series", "admitted": True}}}  # admitted through the field-map flag
     fm2 = merge(fm, override)
-    cq = compile_screen(representative_spec(), fm2, AS_OF)
+    cq = compile_screen(representative_spec(), fm2, AS_OF, admitted=ADMITTED)
     assert "short_interest_pct_float" in [c.feature for c in cq.pushed]
     assert "#short_interest_pct_float=admitted_si_item(dates='2026-10-01');" in cq.query
     outer = cq.query[cq.query.index("), #price >= 5") :]
@@ -587,9 +642,9 @@ def test_admitted_set_enforces_gate_g5(fm):
 
 def test_dependency_on_unverifiable_helper_blocks_push(fm):
     fm2 = merge(fm, {"helpers": {"px_2y": {"status": "unverifiable"}}})
-    ok, why = feature_pushability("sma_50", fm2)
+    ok, why = feature_pushability("sma_50", fm2, admitted={"sma_50"})
     assert not ok and "#px_2y" in why
-    ok, why = feature_pushability("market_cap_usd_bn", fm2)
+    ok, why = feature_pushability("market_cap_usd_bn", fm2, admitted={"market_cap_usd_bn"})
     assert ok and why == ""
 
 
@@ -601,7 +656,7 @@ def test_catalog_unit_drift_is_refused(fm):
 
 def test_universe_expr_members_for_backtests(fm):
     cq = compile_screen(_spec([Condition(feature="rsi_14", op="<", value=30)], UniverseSpec(country="", min_price=None)),
-                        fm, AS_OF, universe_expr="members('RAY Index', dates='{as_of}')")
+                        fm, AS_OF, universe_expr="members('RAY Index', dates='{as_of}')", admitted={"rsi_14"})
     assert cq.query.endswith("for(filter(members('RAY Index', dates='2026-10-01'), #rsi_14 < 30))")
     assert not any("today's universe" in w for w in cq.warnings)
 
@@ -622,7 +677,8 @@ def test_nothing_to_wrap_equitiesuniv_raises(fm):
 
 
 def test_bad_country_is_never_interpolated(fm):
-    cq = compile_screen(_spec([Condition(feature="rsi_14", op="<", value=30)], UniverseSpec(country="U'S")), fm, AS_OF)
+    cq = compile_screen(_spec([Condition(feature="rsi_14", op="<", value=30)], UniverseSpec(country="U'S")), fm, AS_OF,
+                        admitted={"rsi_14"})
     assert "U'S" not in cq.query and "country == U'S" in cq.universe_residual
 
 
@@ -665,7 +721,8 @@ def test_default_boundary_denies_text_and_values_until_g1():
 
 
 def test_wider_boundary_still_has_no_verified_text_api():
-    wide = DataBoundary(provider="bloomberg", allowed_document_kinds={DocumentKind.TRANSCRIPT}, note="G1 cleared (test)")
+    wide = DataBoundary(provider="bloomberg", allow_numeric_features=False, allowed_document_kinds={DocumentKind.TRANSCRIPT},
+                        note="G1: Bloomberg approval letter 2026-09-30, reviewed by counsel (test)")
     p = BloombergProvider(bql_module=FakeBQL().module, boundary=wide, today=lambda: TODAY)
     assert any("wider than the ADR-001 default" in w for w in p.warnings)
     with pytest.raises(NotImplementedError, match="transcript: No BQL/BDP item"):
@@ -750,18 +807,21 @@ def universe_fake(**overrides) -> FakeBQL:
     return FakeBQL(db, {UNIVERSE_CLAUSE: ids})
 
 
-def test_get_universe_bql_exact_query_and_canonical_tickers():
+def test_get_universe_bql_exact_query_and_canonical_tickers(monkeypatch):
+    monkeypatch.setitem(sys.modules, "blpapi", None)  # no Desktop API: the BDP security-type item is unavailable
     fake = universe_fake()
     p = bql_provider(fake)
     df = p.get_universe(UniverseSpec(), AS_OF)
-    bulk = fake.queries[-1]
-    assert bulk == ("let(#name=name(); #gics_sector=gics_sector_name(); #gics_industry=gics_industry_name(); "
-                    f"#exchange=exch_code(); #market_cap={MCAP};) "
-                    "get(#name, #gics_sector, #gics_industry, #exchange, #market_cap) "
-                    f"for({UNIVERSE_CLAUSE})")
-    # unverifiable items were preflighted alone on the test security first
-    assert fake.queries[:3] == [f"let(#v={item};) get(#v) for(['{IBM}'])"
-                                for item in ("name()", "gics_industry_name()", "exch_code()")]
+    # tranche 1: the universe ids, one item over the full universe clause
+    assert fake.queries[0] == f"let(#probe={MCAP};) get(#probe) for({UNIVERSE_CLAUSE})"
+    # unverifiable items are preflighted alone on the test security
+    assert fake.queries[1:4] == [f"let(#v={item};) get(#v) for(['{IBM}'])"
+                                 for item in ("name()", "gics_industry_name()", "exch_code()")]
+    # tranche 2: the label items for those ids (batch_size per request)
+    assert fake.queries[4:] == [("let(#name=name(); #gics_sector=gics_sector_name(); #gics_industry=gics_industry_name(); "
+                                 f"#exchange=exch_code(); #market_cap={MCAP};) "
+                                 "get(#name, #gics_sector, #gics_industry, #exchange, #market_cap) "
+                                 "for(['AAPL UW Equity','BRK/B UN Equity','XYZ US Equity','VOD LN Equity'])")]
     assert list(df.columns) == F.UNIVERSE_COLUMNS
     assert list(df.index) == ["AAPL", "BRK-B", "XYZ"]  # VOD: listing country LN is not US -> dropped
     assert df.index.name == "ticker"
@@ -769,14 +829,16 @@ def test_get_universe_bql_exact_query_and_canonical_tickers():
     assert df.loc["AAPL", F.EXCHANGE] == "NASDAQ" and df.loc["BRK-B", F.EXCHANGE] == "NYSE"
     assert df.loc["XYZ", F.EXCHANGE] == "ZZ"  # unmapped codes pass through
     assert (df[F.COUNTRY] == "US").all() and (df[F.CURRENCY] == "USD").all()
-    assert (df[F.SECURITY_TYPE] == "common_stock").all()
-    assert any("labelled 'common_stock'" in w for w in p.warnings)
+    # no security type is assumed: NaN, and the leg is suspended (not evaluated) rather than emptying the universe
+    assert df[F.SECURITY_TYPE].isna().all()
+    assert any(w.startswith("LEG NOT EVALUATED: bloomberg security_type") and "NOT excluded" in w for w in p.warnings)
+    assert not any("labelled" in w for w in p.warnings)
     assert df.loc["AAPL", F.MARKET_CAP] == 3.5e12 and df.loc["BRK-B", F.MARKET_CAP] == 1.0e12
     assert np.isnan(df.loc["XYZ", F.MARKET_CAP])  # non-finite -> NaN, never 0
     assert pd.isna(df.loc["XYZ", F.NAME]) and pd.isna(df.loc["XYZ", F.GICS_INDUSTRY])
     assert df[F.MARKET_CAP].dtype == "float64"
-    # later requests reuse the vendor id
-    assert p._vendor_id("BRK-B") == "BRK/B UN Equity"
+    # later data requests use the composite id (consolidated volume), not the exchange-level one
+    assert p._vendor_id("BRK-B") == "BRK/B US Equity" and p._vendor_id("AAPL") == "AAPL US Equity"
 
 
 def test_universe_preflight_failure_suspends_leg():
@@ -788,11 +850,16 @@ def test_universe_preflight_failure_suspends_leg():
     assert any(w.startswith("LEG NOT EVALUATED: bloomberg gics_industry") for w in p.warnings)
 
 
-def test_universe_security_type_filter_and_historical_warning():
+def test_universe_security_type_leg_and_historical_warning():
     fake = universe_fake()
-    p = bql_provider(fake)
+    blp = FakeBlp(bdp={"SECURITY_TYP": {IBM: "Common Stock", "AAPL UW Equity": "Common Stock"}})
+    p = bql_provider(fake, blp)
     df = p.get_universe(UniverseSpec(security_types=["adr"]), date(2025, 6, 30))
-    assert df.empty
+    # BDP is current-only, so for a historical as_of the type is unknown: the leg is NOT EVALUATED and no label is
+    # invented (the old 'assume' made every name 'common_stock' and the adr filter emptied the universe)
+    assert list(df.index) == ["AAPL", "BRK-B", "XYZ"] and df[F.SECURITY_TYPE].isna().all()
+    assert not [r for r in blp.requests if "SECURITY_TYP" in r[1].get("fields", [])]
+    assert any(w.startswith("LEG NOT EVALUATED: bloomberg security_type") for w in p.warnings)
     assert any("survivorship" in w for w in p.warnings)
 
 
@@ -803,7 +870,7 @@ def test_universe_expr_placeholder(monkeypatch):
                      fieldmap={"raw": {"universe": {"name": None, "gics_sector": None, "gics_industry": None,
                                                     "exchange": None}}})
     df = p.get_universe(UniverseSpec(), AS_OF)
-    assert fake.queries[-1].endswith(f"for({clause})")
+    assert fake.queries[0] == f"let(#probe={MCAP};) get(#probe) for({clause})"
     assert list(df.index) == ["AAPL"]
 
 
@@ -848,6 +915,10 @@ def test_price_history_bql_query_adjustment_and_sessions():
     assert panel.close.loc["2026-10-01", "AAPL"] == 13.5
     assert np.isnan(panel.close.loc["2026-09-30", "MSFT"])  # missing stays NaN
     assert np.isnan(panel.volume.loc["2026-09-28", "MSFT"])
+    # MSFT did not trade on 2026-09-28 (no own volume): its fill='prev' prices are not served as real prints
+    assert np.isnan(panel.close.loc["2026-09-28", "MSFT"]) and np.isnan(panel.open.loc["2026-09-28", "MSFT"])
+    assert panel.close.loc["2026-09-28", "AAPL"] == 11.5
+    assert any("forward-filled prices blanked" in w for w in p.warnings)
     assert panel.volume.loc["2026-10-01", "MSFT"] == 240
     assert panel.high.loc["2026-09-25", "MSFT"] == 21
     for f in (panel.open, panel.high, panel.low, panel.close, panel.volume):
@@ -1112,14 +1183,19 @@ def test_blpapi_universe_from_saved_eqs_screen():
                   bdp={"CUR_MKT_CAP": {"AAPL UW Equity": 3.5e12, "BRK/B UN Equity": 1.0e12},
                        "SECURITY_TYP": {IBM: "Common Stock", "AAPL UW Equity": "Common Stock", "BRK/B UN Equity": "REIT"}})
     p = blp_provider(blp, universe_expr="GLOBAL:Mid caps")
-    df = p.get_universe(UniverseSpec(security_types=[]), date(2026, 9, 30))
-    assert blp.requests[0] == ("BeqsRequest", {"screenName": "Mid caps", "screenType": "GLOBAL", "asOfDate": "20260930"})
+    df = p.get_universe(UniverseSpec(security_types=[]), AS_OF)
+    assert blp.requests[0] == ("BeqsRequest", {"screenName": "Mid caps", "screenType": "GLOBAL"})
     assert list(df.index) == ["AAPL", "BRK-B"]
     assert df.loc["BRK-B", F.SECURITY_TYPE] == "reit" and df.loc["AAPL", F.SECURITY_TYPE] == "common_stock"
     assert df.loc["AAPL", F.MARKET_CAP] == 3.5e12 and df[F.NAME].isna().all()
+    assert df.loc["AAPL", F.VENDOR_ID] == "AAPL UW Equity" and p._vendor_id("AAPL") == "AAPL US Equity"
     assert any("no blpapi-backend field-map entry for universe column(s) name" in w for w in p.warnings)
-    df2 = p.get_universe(UniverseSpec(), date(2026, 9, 30))
+    df2 = p.get_universe(UniverseSpec(), AS_OF)
     assert list(df2.index) == ["AAPL"]  # default UniverseSpec keeps common stock only
+    # a historical as_of runs the screen as of that date; BDP (current-only) columns are blank
+    df3 = p.get_universe(UniverseSpec(security_types=[]), date(2026, 9, 30))
+    assert ("BeqsRequest", {"screenName": "Mid caps", "screenType": "GLOBAL", "asOfDate": "20260930"}) in blp.requests
+    assert df3[F.MARKET_CAP].isna().all()
 
 
 def test_blpapi_universe_needs_tickers_or_screen_and_cannot_push_down():
@@ -1139,13 +1215,13 @@ def test_blpapi_universe_needs_tickers_or_screen_and_cannot_push_down():
 def test_pushdown_screen_runs_one_request_and_returns_canonical_tickers():
     fake = FakeBQL({"*": {"AAPL UW Equity": 1.0, "BRK/B UN Equity": 2.0}},
                    {REPRESENTATIVE_QUERY[REPRESENTATIVE_QUERY.index(" for(") + 5 : -1]: ["AAPL UW Equity", "BRK/B UN Equity"]})
-    p = bql_provider(fake)
+    p = bql_provider(fake, admitted=ADMITTED)
     res = p.pushdown_screen(representative_spec(), AS_OF)
     assert isinstance(res, PushdownResult)
     assert fake.queries == [REPRESENTATIVE_QUERY] and res.query == REPRESENTATIVE_QUERY
     assert p.query_log == [REPRESENTATIVE_QUERY]
     assert res.tickers == ["AAPL", "BRK-B"]
-    assert p._vendor_id("AAPL") == "AAPL UW Equity"
+    assert p._vendor_id("AAPL") == "AAPL US Equity"  # composite id for the later data requests
     assert "rsi_14 < 45" in res.pushed_conditions and "market_cap_usd_bn between 2 and 20" in res.pushed_conditions
     assert "short_interest_pct_float >= 5" in res.residual_conditions
     assert "universe: security_type in [common_stock]" in res.residual_conditions
@@ -1156,7 +1232,7 @@ def test_pushdown_screen_runs_one_request_and_returns_canonical_tickers():
 
 def test_pushdown_empty_result_warns_about_silent_drops():
     clause = REPRESENTATIVE_QUERY[REPRESENTATIVE_QUERY.index(" for(") + 5 : -1]
-    p = bql_provider(FakeBQL({"*": {}}, {clause: []}))
+    p = bql_provider(FakeBQL({"*": {}}, {clause: []}), admitted=ADMITTED)
     res = p.pushdown_screen(representative_spec(), AS_OF)
     assert res.tickers == [] and any("silently drops" in w for w in p.warnings)
 
@@ -1227,3 +1303,289 @@ def test_pushdown_and_universe_have_no_relative_dates():
     p.get_universe(UniverseSpec(), AS_OF)
     for q in fake.queries:
         assert "0D" not in q and "-1y" not in q.lower() and "-52W" not in q
+
+
+# =============================================================================================
+# Regressions for the review findings
+# =============================================================================================
+
+
+def test_not_applicable_field_exception_blanks_one_cell_not_the_leg():
+    """Real //blp/refdata shape: BAD_FLD / NOT_APPLICABLE_TO_REF_DATA is per-security (an ETF, ADR or new IPO)."""
+    a, m = "AAPL US Equity", "MSFT US Equity"
+    na = {"category": "BAD_FLD", "subcategory": "NOT_APPLICABLE_TO_REF_DATA", "message": "Field not applicable to security"}
+    blp = FakeBlp(
+        bdp={"SHORT_INT": {IBM: 1e7, a: 1e8}, "SHORT_INT_DT": {IBM: "2026-09-15", a: "2026-09-15", m: "2026-09-15"}},
+        bdp_errors={"SHORT_INT": {m: na}},
+    )
+    p = blp_provider(blp)
+    df = p.get_short_interest(["AAPL", "MSFT"], AS_OF)
+    assert df.loc["AAPL", F.SHORT_INTEREST_SHARES] == 1e8 and np.isnan(df.loc["MSFT", F.SHORT_INTEREST_SHARES])
+    assert not any(w.startswith("LEG NOT EVALUATED: bloomberg short_interest_shares") for w in p.warnings)
+    assert any("unavailable for 1 security" in w for w in p.warnings)
+    # classification by subcategory, not by category alone
+    assert not bbg._is_fatal(na)
+    assert bbg._is_fatal({"category": "BAD_FLD", "subcategory": "INVALID_FIELD", "message": "Field not valid"})
+    assert bbg._is_fatal({"category": "NO_AUTH", "subcategory": "FIELD_NOT_AUTHORIZED", "message": "Field not authorized"})
+    assert bbg._is_fatal({"category": "BAD_FLD", "message": "Field not valid"})
+    assert not bbg._is_fatal({"category": "BAD_FLD", "message": "Field not applicable to security"})
+    assert not bbg._is_fatal({"category": "BAD_FLD"})  # unknown shape: per-security (an all-missing leg is still flagged)
+
+
+def test_history_uses_composite_ids_for_exchange_level_universe_ids(monkeypatch):
+    """Volume on 'AAPL UW Equity' is one venue's; the canonical (consolidated) volume needs 'AAPL US Equity'."""
+    monkeypatch.setitem(sys.modules, "blpapi", None)
+    fake = universe_fake()
+    p = bql_provider(fake, preflight=False)
+    uni = p.get_universe(UniverseSpec(), AS_OF)
+    assert uni.loc["AAPL", F.VENDOR_ID] == "AAPL UW Equity"  # the id as returned stays in the vendor_id column
+    assert uni.loc["AAPL", F.EXCHANGE] == "NASDAQ"  # exchange label still derived from the exchange-level id
+    vol = {"AAPL US Equity": pd.Series({"2026-09-30": 5e7, "2026-10-01": 6e7}),
+           "BRK/B US Equity": pd.Series({"2026-09-30": 3e6, "2026-10-01": 4e6}),
+           "AAPL UW Equity": pd.Series({"2026-09-30": 1e7, "2026-10-01": 1.2e7})}  # venue-only volume
+    px = {k: pd.Series({"2026-09-30": 1.0, "2026-10-01": 2.0}) for k in vol}
+    fake.db.update({"px_last(*": px, "px_volume(*": vol, "px_open(*": px, "px_high(*": px, "px_low(*": px})
+    panel = p.get_price_history(["AAPL", "BRK-B"], date(2026, 9, 30), AS_OF)
+    assert fake.queries[-1].endswith("for(['AAPL US Equity','BRK/B US Equity'])")
+    assert panel.volume.loc["2026-10-01", "AAPL"] == 6e7
+    # BDP snapshots use the composite id too
+    blp = FakeBlp(bdp={"SHORT_INT": {IBM: 1e7, "AAPL US Equity": 1e8}, "SHORT_INT_DT": {IBM: "2026-09-15", "AAPL US Equity": "2026-09-15"}})
+    p._blp_mod = blp.module
+    monkeypatch.setitem(sys.modules, "blpapi", blp.module)
+    p.get_short_interest(["AAPL"], AS_OF)
+    assert {"securities": ["AAPL US Equity"], "fields": ["SHORT_INT", "SHORT_INT_DT"], "overrides": []} in [r[1] for r in blp.requests]
+    # non-home listings and non-equity ids are unchanged
+    assert p._data_id("VOD LN Equity") == "VOD LN Equity" and p._data_id("SPX Index") == "SPX Index"
+
+
+def test_security_type_is_never_assumed_and_bdp_classifies_under_bql():
+    fm = load_fieldmap("bloomberg")
+
+    def keys(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                yield k
+                yield from keys(v)
+
+    assert "assume" not in set(keys(fm))
+    # BQL backend + Desktop API: the preflighted BDP SECURITY_TYP entry classifies, the REIT is excluded
+    fake = universe_fake()
+    blp = FakeBlp(bdp={"SECURITY_TYP": {IBM: "Common Stock", "AAPL UW Equity": "Common Stock", "BRK/B UN Equity": "REIT",
+                                        "XYZ US Equity": "Common Stock"}})
+    p = bql_provider(fake, blp)
+    df = p.get_universe(UniverseSpec(), AS_OF)
+    assert list(df.index) == ["AAPL", "XYZ"]
+    assert ("ReferenceDataRequest", {"securities": [IBM], "fields": ["SECURITY_TYP"], "overrides": []}) in blp.requests
+    assert not any("security_type" in w and "LEG NOT EVALUATED" in w for w in p.warnings)
+    # a NaN type for one security never passes a filter that IS evaluated
+    blp2 = FakeBlp(bdp={"SECURITY_TYP": {IBM: "Common Stock", "AAPL UW Equity": "Common Stock"}})
+    df2 = bql_provider(universe_fake(), blp2).get_universe(UniverseSpec(), AS_OF)
+    assert list(df2.index) == ["AAPL"]
+    # an override re-adding an 'assume' value is ignored: an entry without an item is skipped
+    p3 = bql_provider(universe_fake(), FakeBlp(), fieldmap={"raw": {"universe": {"security_type": {
+        "bql": {"assume": "common_stock"}, "bdp": None}}}})
+    assert p3._choose(p3.fieldmap["raw"]["universe"]["security_type"], "universe") is None
+
+
+def test_gate_g5_is_deny_by_default(fm):
+    spec = representative_spec()
+    cq = compile_screen(spec, fm, AS_OF)
+    assert cq.pushed == [] and cq.admitted == ()
+    assert "not admitted (gate G5)" in cq.reasons["rsi_14 < 45"]
+    assert "field-admission log" in cq.reasons["market_cap_usd_bn between 2 and 20"]
+    assert "price >= 5" in cq.universe_residual and "not admitted" in cq.reasons["price >= 5"]
+    # the universe definition (country) is not a feature threshold, so it is still pushed
+    assert cq.query == (f"let(#probe={MCAP};) get(#probe) for(filter(equitiesuniv(['ACTIVE','PRIMARY']), "
+                        "cntry_of_risk()=='US'))")
+    assert not feature_pushability("rsi_14", fm)[0]
+    # admission through the field-map flag (an override after verify_fields evidence)
+    fm2 = merge(fm, {"features": {"rsi_14": {"admitted": True}}})
+    cq2 = compile_screen(spec, fm2, AS_OF)
+    assert [c.feature for c in cq2.pushed] == ["rsi_14"] and cq2.admitted == ("rsi_14",)
+    assert compile_bql.admitted_features(fm2, ["sma_50"]) == {"rsi_14", "sma_50"}
+    with pytest.raises(TypeError):
+        compile_bql.admitted_features(fm, "rsi_14")
+    # explicit opt-out is recorded for the audit trail
+    cq3 = compile_screen(spec, fm, AS_OF, allow_unadmitted=True)
+    assert cq3.query == REPRESENTATIVE_QUERY and cq3.allow_unadmitted
+    assert any(w.startswith("G5 OVERRIDE") and "rsi_14" in w for w in cq3.warnings)
+    # the provider follows the same default
+    clause = "filter(equitiesuniv(['ACTIVE','PRIMARY']), cntry_of_risk()=='US')"
+    fake = FakeBQL({MCAP: {"AAPL US Equity": 3e12}}, {clause: ["AAPL US Equity"]})
+    res = bql_provider(fake).pushdown_screen(spec, AS_OF)
+    assert res.pushed_conditions and all(c.startswith("universe: country == US") for c in res.pushed_conditions)
+    assert "rsi_14 < 45" in res.residual_conditions
+    with pytest.raises(TypeError):
+        bql_provider(FakeBQL(), admitted="rsi_14")
+    p = bql_provider(FakeBQL(), allow_unadmitted=True)
+    assert any(w.startswith("G5 OVERRIDE") for w in p.compile_pushdown(spec, AS_OF).warnings)
+
+
+def test_delisted_security_prices_are_not_forward_filled():
+    def ser(vals):
+        return pd.Series(dict(zip(PX_DATES, vals)))
+
+    nan = np.nan
+    fake = FakeBQL({
+        "px_last(*": {"AAPL US Equity": ser([10, 11, 12, 13, 14]), "DEAD US Equity": ser([5, 4, 3, 3, 3])},
+        "px_volume(*": {"AAPL US Equity": ser([100, 110, 120, 130, 140]), "DEAD US Equity": ser([50, 60, 70, nan, nan])},
+    }, {})
+    p = bql_provider(fake, preflight=False, fieldmap={"raw": {"prices": {c: None for c in ("open", "high", "low")}}})
+    panel = p.get_price_history(["AAPL", "DEAD"], date(2026, 9, 25), AS_OF)
+    assert panel.close.loc["2026-09-29", "DEAD"] == 3
+    assert panel.close.loc[["2026-09-30", "2026-10-01"], "DEAD"].isna().all()  # stale fill='prev' prices withheld
+    assert panel.close.loc["2026-10-01", "AAPL"] == 14
+    assert any("forward-filled prices blanked" in w and "1 security" in w for w in p.warnings)
+    assert p._filled_columns(list(F.PRICE_FIELDS)) == {"close"}  # open/high/low removed by the override above
+    # BDH rows are real prints (no fill): nothing is masked on that backend
+    q = blp_provider(FakeBlp())
+    assert q._filled_columns(["open", "high", "low", "close"]) == set()
+
+
+def test_bdp_snapshot_needs_as_of_today_and_tolerance_is_audited():
+    a = "AAPL US Equity"
+    bdp = {"SHORT_INT": {IBM: 1e7, a: 1e8}, "SHORT_INT_DT": {IBM: "2026-09-15", a: "2026-09-15"}}
+    # as_of one day before today: BDP current values would include information published after as_of
+    blp = FakeBlp(bdp=bdp)
+    p = blp_provider(blp, today=lambda: TODAY)
+    assert p.snapshot_staleness_days == 0
+    df = p.get_short_interest(["AAPL"], AS_OF)
+    assert df.isna().all().all() and blp.requests == []
+    assert any("current values only" in w for w in p.warnings)
+    # an explicit tolerance serves them, and every use is recorded
+    blp2 = FakeBlp(bdp=bdp)
+    p2 = blp_provider(blp2, today=lambda: TODAY, snapshot_staleness_days=1)
+    df2 = p2.get_short_interest(["AAPL"], AS_OF)
+    assert df2.loc["AAPL", F.SHORT_INTEREST_SHARES] == 1e8
+    assert any("look-ahead risk" in w and "snapshot_staleness_days=1" in w for w in p2.warnings)
+
+
+def test_volatility_range_form_is_not_labelled_confirmed(fm):
+    for name in ("volatility_20d_pct", "volatility_60d_pct"):
+        e = fm["features"][name]
+        assert e["status"] == "corrected" and e["units_verified"] is False
+        assert any("calc_interval='252d'" in v for v in e["verify"])
+    # once admitted with verified units it is pushed, and the VERIFY item travels with the compiled query
+    fm2 = merge(fm, {"features": {"volatility_20d_pct": {"units_verified": True}}})
+    cq = compile_screen(_spec([Condition(feature="volatility_20d_pct", op=">", value=30)]), fm2, AS_OF,
+                        admitted={"volatility_20d_pct"})
+    assert any(w.startswith("#volatility_20d_pct") and "calc_interval='252d'" in w for w in cq.warnings)
+
+
+def test_widened_boundary_is_deny_unless_g1_cited():
+    mod = FakeBQL().module
+    # the natural constructor default is the widest boundary: refused
+    with pytest.raises(ValueError, match="numeric features"):
+        BloombergProvider(bql_module=mod, boundary=DataBoundary(provider="bloomberg"))
+    # values never leave, even with a citation (L4)
+    with pytest.raises(ValueError, match="numeric features"):
+        BloombergProvider(bql_module=mod, boundary=DataBoundary(provider="bloomberg", allow_numeric_features=True,
+                                                                 allowed_document_kinds=set(), note="G1: letter 1"))
+    # L5 news and L6 research never, even with a citation
+    for kind in (DocumentKind.NEWS, DocumentKind.RESEARCH):
+        with pytest.raises(ValueError, match="never"):
+            BloombergProvider(bql_module=mod, boundary=DataBoundary(
+                provider="bloomberg", allow_numeric_features=False, allowed_document_kinds={kind}, note="G1: letter 1"))
+    # an uncited widening (the default note merely mentions G1) evaluates as deny
+    for note in ("", "approved", bbg.BOUNDARY_NOTE, "G1: <written approval reference>"):
+        with pytest.raises(ValueError, match="cite gate G1"):
+            BloombergProvider(bql_module=mod, boundary=DataBoundary(
+                provider="bloomberg", allow_numeric_features=False, allowed_document_kinds={DocumentKind.TRANSCRIPT},
+                note=note))
+    # the ADR default passes untouched
+    ok = DataBoundary(provider="bloomberg", allow_numeric_features=False, allowed_document_kinds=set(), note="x")
+    assert BloombergProvider(bql_module=mod, boundary=ok).boundary is ok
+
+
+def test_boundary_note_does_not_claim_enforcement_it_cannot_provide():
+    note = bbg.BOUNDARY_NOTE
+    assert "CANNOT withhold candidate tickers, names or ranks" in note and "LLM-backed explainer" in note
+    assert "G1" in note and "L4" in note
+    p = BloombergProvider(bql_module=FakeBQL().module, today=lambda: TODAY)
+    assert p.external_llm_allowed is False and BloombergProvider.external_llm_allowed is False
+
+
+def test_diagnostics_flag_the_unevaluable_security_type_leg(monkeypatch):
+    monkeypatch.setitem(sys.modules, "blpapi", None)
+    p = BloombergProvider(bql_module=FakeBQL().module, today=lambda: TODAY)
+    diag = " | ".join(p.diagnostics())
+    assert "security_type" in diag and "security_types=[]" in diag
+
+
+def test_late_reply_of_a_timed_out_request_is_never_consumed():
+    """Each request carries its own CorrelationId; a stale reply cannot answer the next request."""
+    a = "AAPL US Equity"
+    blp = FakeBlp(bdh={"PX_LAST": {a: {"2026-09-01": 1.0, "2026-09-02": 2.0, "2026-09-30": 30.0, "2026-10-01": 31.0}},
+                       "PX_VOLUME": {a: {"2026-09-01": 1e6, "2026-09-02": 1e6, "2026-09-30": 1e6, "2026-10-01": 1e6}}},
+                  late=1)
+    p = blp_provider(blp, preflight=False,
+                     fieldmap={"raw": {"prices": {c: None for c in ("open", "high", "low")}}})
+    with pytest.raises(ProviderError, match="timed out"):
+        p.get_price_history(["AAPL"], date(2026, 9, 1), date(2026, 9, 2))
+    first = blp.cids[0]
+    assert isinstance(first, type(blp.module.CorrelationId(0))) and blp.cancelled == [first]
+    panel = p.get_price_history(["AAPL"], date(2026, 9, 30), AS_OF)
+    # the window asked for, not the late 2026-09-01..02 reply that arrived first on the session
+    assert list(panel.close.index) == [pd.Timestamp("2026-09-30"), pd.Timestamp("2026-10-01")]
+    assert panel.close.loc["2026-10-01", "AAPL"] == 31.0
+    assert len(set(blp.cids)) == 2
+
+
+def test_universe_is_tranched_and_cached_mode_is_opt_in_and_preflighted(monkeypatch):
+    monkeypatch.setitem(sys.modules, "blpapi", None)
+    fake = universe_fake()
+    p = bql_provider(fake, preflight=False, batch_size=2)
+    p.get_universe(UniverseSpec(), AS_OF)
+    assert fake.queries[0] == f"let(#probe={MCAP};) get(#probe) for({UNIVERSE_CLAUSE})"
+    assert [q[q.index(" for(") :] for q in fake.queries[1:]] == [
+        " for(['AAPL UW Equity','BRK/B UN Equity'])", " for(['XYZ US Equity','VOD LN Equity'])"]
+    assert not any("with(" in q for q in fake.queries)  # the unverified string form is off by default
+    # opt-in: the clause is preflighted on the test security, then appended to every BQL string
+    on = {"requests": {"bql_with_clause": {"enabled": True}}}
+    fake2 = universe_fake(**{MCAP: {IBM: 2.2e11, "AAPL UW Equity": 3.5e12}})
+    p2 = bql_provider(fake2, preflight=False, fieldmap=on)
+    p2.get_universe(UniverseSpec(), AS_OF)
+    assert fake2.queries[0] == f"let(#v={MCAP};) get(#v) for(['{IBM}']) with(mode=cached)"
+    assert all(q.endswith(" with(mode=cached)") for q in fake2.queries)
+    # a failing preflight drops the clause with a warning instead of breaking every request
+    fake3 = FakeBQL(dict(universe_fake().db), {UNIVERSE_CLAUSE: ["AAPL UW Equity"]}, reject_clauses=("with(mode=cached)",))
+    p3 = bql_provider(fake3, preflight=False, fieldmap=on)
+    df3 = p3.get_universe(UniverseSpec(), AS_OF)
+    assert list(df3.index) == ["AAPL"] and not any("with(" in q for q in fake3.queries[1:])
+    assert any("failed its preflight" in w and "no cached mode" in w for w in p3.warnings)
+    # push-down: the executed string (with the clause) is what the result records
+    clause = "filter(equitiesuniv(['ACTIVE','PRIMARY']), cntry_of_risk()=='US')"
+    fake4 = FakeBQL({MCAP: {IBM: 2.2e11, "AAPL US Equity": 3e12}}, {clause: ["AAPL US Equity"]})
+    res = bql_provider(fake4, fieldmap=on).pushdown_screen(representative_spec(), AS_OF)
+    assert res.query.endswith(" with(mode=cached)") and res.query == fake4.queries[-1]
+
+
+def test_warnings_carry_no_vendor_values_or_security_ids():
+    a, m, x = "AAPL US Equity", "MSFT US Equity", "XYZ US Equity"
+    secs = [f"S{i} US Equity" for i in range(3)]
+    bdp = {"SHORT_INT": {IBM: 1e7, a: 1e8, **{s: 2e6 for s in secs}},
+           "EQY_FLOAT": {IBM: 900.0, **{s: 40.0 for s in secs}},
+           "SHORT_INT_DT": {IBM: "2026-09-15", a: "2026-09-15", **{s: "2026-09-15" for s in secs}}}
+    errs = {"SHORT_INT": {m: {"category": "BAD_FLD", "subcategory": "NOT_APPLICABLE_TO_REF_DATA",
+                              "message": "Field not applicable to security"}}}
+    admitted = {"raw": {"short_interest": {"float_shares": {"bdp": {"units_verified": True}}}}}
+    p = blp_provider(FakeBlp(bdp=bdp, bdp_errors=errs), fieldmap=admitted)
+    p.get_short_interest(["AAPL", "MSFT", "S0", "S1", "S2"], AS_OF)
+    p1 = blp_provider(FakeBlp(bdp=bdp), fieldmap=admitted, preflight=False)
+    p1.get_short_interest(["S0", "S1", "S2"], AS_OF)
+    fake = price_fake()
+    p2 = bql_provider(fake)
+    p2.get_price_history(["AAPL", "NOPE"], date(2026, 9, 25), AS_OF)
+    with pytest.raises(ProviderError) as ei:
+        p2.get_price_history(["NOPE", "GONE"], date(2026, 9, 25), AS_OF)
+    assert "NOPE" not in str(ei.value)
+    for prov in (p, p1, p2):
+        text = " | ".join(prov.warnings)
+        for ident in ("AAPL", "MSFT", "S0 US", "NOPE", x, IBM):
+            assert ident not in text, (ident, text)
+        assert "900" not in text and "median 4" not in text and "canonical 900" not in text
+    assert any("unavailable for 1 security" in w for w in p.warnings)
+    assert any("MSFT US Equity" in d for d in p.zone_t_details)  # the detail stays in zone T
+    assert any("canonical 900" in d for d in p.zone_t_details)  # the preflight evidence (value) stays in zone T
+    assert any("NOPE" in d for d in p2.zone_t_details)
+    assert any("no prices for 1 of 2 security" in w for w in p2.warnings)

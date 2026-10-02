@@ -142,14 +142,27 @@ def evaluate_condition(cond: Condition, frame: pd.DataFrame, *, catalog: Feature
 def _universe_steps(universe: UniverseSpec, frame: pd.DataFrame) -> list[_Step]:
     steps: list[_Step] = []
 
+    def not_evaluated(label: str, missing: pd.Series) -> bool:
+        """A universe leg with no data for ANY name is suspended (and labelled), not applied: an
+        implicit default filter must not silently empty the screen because a provider lacks a field."""
+        if len(missing) and bool(missing.all()):
+            steps.append((f"{label} - NOT EVALUATED (no data from the provider for any name)", pd.Series(True, index=frame.index), missing))
+            return True
+        return False
+
     def labels_step(label: str, column: str, wanted: list[str], keep_if_in: bool) -> None:
         text, missing = _labels(_column(frame, column))
+        if not_evaluated(label, missing):
+            return
         hit = text.isin(_norm(wanted))
         steps.append((label, (hit if keep_if_in else ~hit) & ~missing, missing))
 
     def floor_step(column: str, floor: float) -> None:
         x = _numeric(_column(frame, column))
-        steps.append((f"{column} >= {floor:g}", x.ge(floor), x.isna()))
+        label = f"{column} >= {floor:g}"
+        if not_evaluated(label, x.isna()):
+            return
+        steps.append((label, x.ge(floor), x.isna()))
 
     if universe.country:
         labels_step(f"{COUNTRY_COLUMN} == {universe.country}", COUNTRY_COLUMN, [universe.country], True)

@@ -121,7 +121,6 @@ from aitrading.screen.compile_lseg import (
     SCREEN_MODES,
     VALID_STATUSES,
     CompiledQuery,
-    admitted_features,
     compile_screen,
     compile_universe,
     is_point_in_time,
@@ -145,7 +144,9 @@ DEFAULT_FIELDMAP_PATH = Path(__file__).with_name("fieldmaps") / "lseg.json"
 CONFIG_FILENAME = "lseg-data.config.json"
 DEFAULT_SESSION = "platform.ldp"  # VENDOR_REFERENCE 2.1: the unattended/server session
 DESKTOP_LICENCE_CLASS = "L4"  # ADR section 7: LSEG Workspace is desktop-licensed
-DEFAULT_RIC_SUFFIXES = ("N", "O", "OQ", "A", "P", "K", "U", "PK", "Z")  # used when the field map lists none
+# Exchange suffixes accepted on a bare RIC when the field map lists none. 'A' (NYSE American) and 'U' are left out:
+# they collide with dotted share-class / unit tickers ('BRK.A', 'XYZ.U'), which must never be sent as RICs.
+DEFAULT_RIC_SUFFIXES = ("N", "O", "OQ", "P", "K", "PK", "Z")
 
 SDK_MISSING = (
     "The LSEG Data Library for Python is not installed. Install it with:  pip install lseg-data==2.1.1   "
@@ -200,7 +201,8 @@ _QUOTA_ERROR_RE = re.compile(r"quota|daily (?:request )?limit|requests? per day|
 _THROTTLE_ERROR_RE = re.compile(r"\b429\b|too many requests|rate[ -]?limit|throttl", re.I)
 _SESSION_ERROR_RE = re.compile(
     r"session (?:is )?(?:closed|expired|not open(?:ed)?|invalid)|no (?:default |open )?session|session expired|"
-    r"unauthori[sz]ed|\b40[13]\b|forbidden|authenticat|invalid[_ ]grant|credential|access token|login", re.I)
+    r"unauthori[sz]ed|\b401\b|authenticat|invalid[_ ]grant|credential|access token|login", re.I)
+# (a 403 / "forbidden" is usually one unentitled dataset, not the session: it is bounded by the circuit breaker)
 
 
 # =============================================================================================
@@ -275,6 +277,8 @@ def validate_fieldmap(fm: Mapping[str, Any]) -> list[str]:
             errs.append(f"features.{feat}.threshold_scale must be a non-zero number")
         if "labels" in e and not (isinstance(e["labels"], list) and all(isinstance(x, str) for x in e["labels"])):
             errs.append(f"features.{feat}.labels must be a list of strings")
+        if "admitted" in e and not isinstance(e["admitted"], bool):
+            errs.append(f"features.{feat}.admitted must be true or false (gate G5 admission flag)")
     for section, entries in (fm.get("raw") or {}).items():
         allowed = RAW_SECTIONS.get(section)
         if allowed is None:
@@ -711,7 +715,7 @@ class LSEGProvider:
         self._ticker_of: dict[str, str] = {}
         self._names: dict[str, str] = {}
         self._preflight_memo: dict[tuple[str, ...], bool] = {}
-        self._param_memo: dict[tuple[str, ...], bool] = {}
+        self._param_memo: dict[tuple[str, ...], tuple[bool, dict[str, Any]]] = {}
         self._preflight_day: date | None = None
         for t, r in (rics or {}).items():
             self._ric_of[str(t).strip()] = str(r).strip()
@@ -971,7 +975,9 @@ class LSEGProvider:
         probe = str(entry.get("probe") or "")
         key = (self.test_ric, f"param:{name}", str(value), _params_key(base), probe)
         if key in self._param_memo:
-            return self._param_memo[key]
+            keep, log = self._param_memo[key]
+            self.field_log[f"parameters.{name}"] = log
+            return keep
         log: dict[str, Any] = {"code": probe, "status": "unverifiable", "value": value, "preflight": None,
                                "with": None, "without": None, "used": False, "reason": ""}
         self.field_log[f"parameters.{name}"] = log
@@ -999,9 +1005,11 @@ class LSEGProvider:
                 self._warn(f"LSEG parameter preflight for {name} inconclusive ({log['reason']}); {name} kept.")
         log["used"] = keep
         if not keep:
-            self._warn(f"LSEG parameter {name}={value} dropped: {log['reason']} (unverifiable parameter, preflight failed). "
-                       "Snapshots for a historical as_of are NOT EVALUATED without an as_of anchor.")
-        self._param_memo[key] = keep
+            tail = (" Snapshots for a historical as_of are NOT EVALUATED without this as_of anchor."
+                    if entry.get("anchors_as_of") else "")
+            self._warn(f"LSEG parameter {name}={value} dropped: {log['reason']} (unverifiable parameter, preflight "
+                       f"failed).{tail}")
+        self._param_memo[key] = (keep, log)
         return keep
 
     def _get_data_raw(self, ld: Any, universe: Any, codes: list[str], params: Mapping[str, Any] | None) -> pd.DataFrame | None:
@@ -1195,8 +1203,10 @@ class LSEGProvider:
                 elif not ok_with:
                     log["reason"] = f"inconclusive: {close} history failed with ({why_with}) and without ({why_without})"
             log["used"] = keep
-            self._param_memo[key] = keep
-        return value if self._param_memo[key] else None
+            self._param_memo[key] = (keep, log)
+        keep, log = self._param_memo[key]
+        self.field_log["history.adjustments"] = log
+        return value if keep else None
 
     def _preflight_history(self, codes: list[str], adjustments: list[Any] | None) -> dict[str, bool]:
         """History fields pass when ``get_history(test_ric, [code], adjustments=...)`` returns daily values."""
@@ -1806,8 +1816,11 @@ class LSEGProvider:
         """Request every mapped field alone for one known security (VENDOR_REFERENCE section 5).
 
         ``sample_ticker`` defaults to the field map's ``test_ric`` (``IBM.N``). A field passes when one
-        non-empty column (or history series) comes back. Record the passing rows (item, test ticker,
-        date, value, units) in ``field_validation_log`` before admitting any item as a predicate.
+        non-empty column (or history series) comes back. Requests use the real request parameters, after
+        the unverifiable parameters (``SDate``, history ``adjustments``) have been preflighted on
+        ``test_ric``; those preflights are reported first (``parameters.<name>``, ``history.adjustments``,
+        with the values seen with and without them). Record the passing rows (item, test ticker, date,
+        value, units) in ``field_validation_log`` before admitting any item as a predicate.
         """
         as_of = as_of or self._today()
         sample = str(sample_ticker or self.test_ric).strip()
@@ -1815,8 +1828,27 @@ class LSEGProvider:
         if ric is None:
             raise ProviderError(f"cannot resolve {sample!r} to a RIC: pass a RIC such as {self.test_ric!r}")
         ld = self._open()
-        ctx, params = self._ctx(as_of), self._params(as_of)
+        ctx, params = self._ctx(as_of), self._request_params(as_of)  # unverifiable parameters preflighted first
+        adjustments = self._history_adjustments()
         checks: list[FieldCheck] = []
+        for name, e in (self.fieldmap.get("parameters") or {}).items():
+            log = self.field_log.get(f"parameters.{name}")
+            if not isinstance(e, Mapping) or e.get("status") != "unverifiable" or not log:
+                continue
+            checks.append(FieldCheck(
+                f"parameters.{name}", "unverifiable", log.get("with"), log.get("preflight") is True,
+                f"{log.get('code')} on {self.test_ric} with {name}={log.get('value')!r}: {log.get('with')!r}; without it: "
+                f"{log.get('without')!r}" + (f" ({log['reason']})" if log.get("reason") else "")
+                + ("" if log.get("used") else f" - {name} DROPPED from requests"), str(log.get("code") or "")))
+        adj_log = self.field_log.get("history.adjustments")
+        if adj_log and self._configured_adjustments()[1].get("status") == "unverifiable":
+            checks.append(FieldCheck(
+                "history.adjustments", "unverifiable", adj_log.get("value"), adj_log.get("preflight") is True,
+                f"{adj_log.get('code')} history on {self.test_ric} with adjustments={adj_log.get('value')}: "
+                f"{'values' if adj_log.get('preflight') else 'no values'}; without them: "
+                f"{'values' if adj_log.get('without') else 'no values'}"
+                + (f" ({adj_log['reason']})" if adj_log.get("reason") else "")
+                + ("" if adj_log.get("used") else " - adjustments DROPPED from requests"), str(adj_log.get("code") or "")))
         first = [True]
 
         def pause() -> None:
@@ -1828,6 +1860,8 @@ class LSEGProvider:
             pause()
             try:
                 df = self._get_data_raw(ld, universe, [code], params)
+            except _StopRequests:
+                raise
             except Exception as e:  # noqa: BLE001
                 checks.append(FieldCheck(name, status, None, False, f"{code}: request failed ({e})", code))
                 return
@@ -1871,9 +1905,12 @@ class LSEGProvider:
             code, status = str(e["code"]), str(e.get("status", ""))
             pause()
             try:
-                raw = ld.get_history(**self._history_kwargs([ric], [code], as_of - timedelta(days=14), as_of))
+                raw = self._call("get_history", ld.get_history,
+                                 **self._history_kwargs([ric], [code], as_of - timedelta(days=14), as_of, adjustments))
                 got = _split_history(raw, [ric], [code]).get(ric)
                 series = got[code].dropna() if got is not None else pd.Series(dtype="float64")
+            except _StopRequests:
+                raise
             except Exception as ex:  # noqa: BLE001
                 checks.append(FieldCheck(f"history.{key}", status, None, False, f"{code}: get_history failed ({ex})", code))
                 continue

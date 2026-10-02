@@ -8,7 +8,7 @@
     "corrected": "Verified only in the form shown here. Use exactly this form; parts noted VERIFY stay configurable.",
     "unverifiable": "Could not be confirmed. Configurable only, never hard-coded; preflighted alone on test_identifier before every bulk use; a failure suspends the leg (LEG NOT EVALUATED, NaN); never a threshold until admitted."
   },
-  "units_convention": "canonical value = vendor value x to_canonical (raw sections) or x to_catalog (features section). CapIQ amounts default to millions (VENDOR_REFERENCE 3.2 SQL: 'assumes millions: VERIFY units'; 3.3 market cap: 'Units (millions?) UNVERIFIED'), so monetary items and share counts carry x1e6 and units_verified=false until admitted (G5). Values outside 'plausible' (canonical units) are blanked: that catches a wrong 1e6 scale or a flipped sign.",
+  "units_convention": "canonical value = vendor value x to_canonical (raw sections) or x to_catalog (features section). CapIQ amounts default to millions (VENDOR_REFERENCE 3.2 SQL: 'assumes millions: VERIFY units'; 3.3 market cap: 'Units (millions?) UNVERIFIED'), so monetary items and share counts carry x1e6 and units_verified=false until admitted (G5): set units_verified=true, or \"admitted\": true, in an override once verify_fields() and a second source agree. Values outside 'plausible' (canonical units) are blanked: that catches a wrong 1e6 scale or a flipped sign.",
   "test_identifier": "IBM:NYSE",
 
   "api": {
@@ -42,6 +42,13 @@
       "value": "%m/%d/%Y",
       "status": "confirmed",
       "notes": "startDate/endDate as MM/DD/YYYY in the 3.1 example ('09/01/2025'). asOfDate is rendered the same way (its format is not shown: VERIFY)."
+    },
+    "as_of_property": {
+      "value": "asOfDate",
+      "status": "unverifiable",
+      "admitted": false,
+      "probe": {"mnemonic": "IQ_MARKETCAP", "properties": {"currencyId": "USD"}, "status": "confirmed"},
+      "notes": "The GDSP point-in-time property. VENDOR_REFERENCE 3.3 lists asOfDate only for the (unverifiable) estimate-revisions row; whether GDS honours it on other items, and its date format, are UNVERIFIED. Until it is admitted: a historical as_of suspends every numeric and date point item (LEG NOT EVALUATED, NaN) instead of risking today's values in a past run, and a lagged item (asOfDate other than as_of, e.g. the 3-month-ago estimates) is served only when a lag check on test_identifier shows the lagged value differing from the as_of value (and is suspended at serve time when every name's lagged value equals its as_of value). Admission (gate G5): verify_fields(as_of=<past date>) runs the probe item at as_of and at as_of - 91 days (check 'api.as_of_property': they must differ); compare the as_of value with a second source or a filing, record it in field_validation_log, then set \"admitted\": true in an override."
     },
     "max_requests_per_call": {
       "value": 100,
@@ -93,8 +100,9 @@
       "page_size": 600,
       "max_pages": 10,
       "value_index": 0,
+      "end_messages": [],
       "status": "corrected",
-      "notes": "Index constituents row (corrected): IQ_CONSTITUENTS via GDSHV (not GDSHE) + StartRank/EndRank, exactly as in the 3.1 example (^SPX, 1..600). ^SPX / Russell coverage untested. Paged in page_size blocks until a short page. The members are TODAY's (a historical as_of is survivorship-biased). Values that are not 'TICKER:EXCH' identifiers (e.g. IQ<id>) need the identifiers= symbology table, otherwise they are dropped and flagged (ADR graft 6)."
+      "notes": "Index constituents row (corrected): IQ_CONSTITUENTS via GDSHV (not GDSHE) + StartRank/EndRank, exactly as in the 3.1 example (^SPX, 1..600). ^SPX / Russell coverage untested. Paged in page_size blocks until a short page. An ErrMsg on a later page is reported as a possibly truncated list unless it contains one of 'end_messages' (vendor texts meaning 'no more rows'; none is verified, so the list is empty). The members are TODAY's (a historical as_of is survivorship-biased). Values that are not 'TICKER:EXCH' identifiers (e.g. IQ<id>) need the identifiers= symbology table, otherwise they are dropped and flagged (ADR graft 6)."
     }
   },
 
@@ -115,14 +123,18 @@
       "gics_sector": {
         "mnemonic": "IQ_INDUSTRY_SECTOR",
         "kind": "label",
+        "value_map": {"Energy": "Energy", "Materials": "Materials", "Industrials": "Industrials", "Consumer Discretionary": "Consumer Discretionary", "Consumer Staples": "Consumer Staples", "Health Care": "Health Care", "Financials": "Financials", "Information Technology": "Information Technology", "Communication Services": "Communication Services", "Utilities": "Utilities", "Real Estate": "Real Estate", "Healthcare": "Health Care"},
+        "unmapped": "nan",
         "status": "unverifiable",
-        "notes": "GICS / industry row (unverifiable; the Kensho tickers(gics=...) route is the verified one). This is CapIQ's industry classification and may not spell or cut sectors like GICS: check the labels with verify_fields() before using it in a sector filter."
+        "notes": "GICS / industry row (unverifiable; the Kensho tickers(gics=...) route is the verified one). This is CapIQ's industry classification and may not spell or cut sectors like GICS. value_map keeps only the 11 GICS sector names (case-, whitespace- and '&'/'and'-insensitive; 'Healthcare' is a spelling of 'Health Care'); any other label is NaN (unmapped='nan'), so the local engine treats it as missing data - an excluded sector spelt differently never passes as 'some other sector'. No mapping that changes the cut (e.g. pre-2018 'Telecommunication Services') is made. The adapter does not pre-apply UniverseSpec.exclude_sectors on it until it is admitted (G5): check the labels with verify_fields(), then set \"admitted\": true in an override."
       },
       "gics_industry": {
         "mnemonic": "IQ_INDUSTRY",
         "kind": "label",
+        "value_map": {"Energy Equipment & Services": "Energy Equipment & Services", "Oil, Gas & Consumable Fuels": "Oil, Gas & Consumable Fuels", "Chemicals": "Chemicals", "Construction Materials": "Construction Materials", "Containers & Packaging": "Containers & Packaging", "Metals & Mining": "Metals & Mining", "Paper & Forest Products": "Paper & Forest Products", "Aerospace & Defense": "Aerospace & Defense", "Building Products": "Building Products", "Construction & Engineering": "Construction & Engineering", "Electrical Equipment": "Electrical Equipment", "Industrial Conglomerates": "Industrial Conglomerates", "Machinery": "Machinery", "Trading Companies & Distributors": "Trading Companies & Distributors", "Commercial Services & Supplies": "Commercial Services & Supplies", "Professional Services": "Professional Services", "Air Freight & Logistics": "Air Freight & Logistics", "Passenger Airlines": "Passenger Airlines", "Marine Transportation": "Marine Transportation", "Ground Transportation": "Ground Transportation", "Transportation Infrastructure": "Transportation Infrastructure", "Automobile Components": "Automobile Components", "Automobiles": "Automobiles", "Household Durables": "Household Durables", "Leisure Products": "Leisure Products", "Textiles, Apparel & Luxury Goods": "Textiles, Apparel & Luxury Goods", "Hotels, Restaurants & Leisure": "Hotels, Restaurants & Leisure", "Diversified Consumer Services": "Diversified Consumer Services", "Distributors": "Distributors", "Broadline Retail": "Broadline Retail", "Specialty Retail": "Specialty Retail", "Consumer Staples Distribution & Retail": "Consumer Staples Distribution & Retail", "Beverages": "Beverages", "Food Products": "Food Products", "Tobacco": "Tobacco", "Household Products": "Household Products", "Personal Care Products": "Personal Care Products", "Health Care Equipment & Supplies": "Health Care Equipment & Supplies", "Health Care Providers & Services": "Health Care Providers & Services", "Health Care Technology": "Health Care Technology", "Biotechnology": "Biotechnology", "Pharmaceuticals": "Pharmaceuticals", "Life Sciences Tools & Services": "Life Sciences Tools & Services", "Banks": "Banks", "Financial Services": "Financial Services", "Consumer Finance": "Consumer Finance", "Capital Markets": "Capital Markets", "Mortgage Real Estate Investment Trusts (REITs)": "Mortgage Real Estate Investment Trusts (REITs)", "Insurance": "Insurance", "IT Services": "IT Services", "Software": "Software", "Communications Equipment": "Communications Equipment", "Technology Hardware, Storage & Peripherals": "Technology Hardware, Storage & Peripherals", "Electronic Equipment, Instruments & Components": "Electronic Equipment, Instruments & Components", "Semiconductors & Semiconductor Equipment": "Semiconductors & Semiconductor Equipment", "Diversified Telecommunication Services": "Diversified Telecommunication Services", "Wireless Telecommunication Services": "Wireless Telecommunication Services", "Media": "Media", "Entertainment": "Entertainment", "Interactive Media & Services": "Interactive Media & Services", "Electric Utilities": "Electric Utilities", "Gas Utilities": "Gas Utilities", "Multi-Utilities": "Multi-Utilities", "Water Utilities": "Water Utilities", "Independent Power and Renewable Electricity Producers": "Independent Power and Renewable Electricity Producers", "Diversified REITs": "Diversified REITs", "Industrial REITs": "Industrial REITs", "Hotel & Resort REITs": "Hotel & Resort REITs", "Office REITs": "Office REITs", "Health Care REITs": "Health Care REITs", "Residential REITs": "Residential REITs", "Retail REITs": "Retail REITs", "Specialized REITs": "Specialized REITs", "Real Estate Management & Development": "Real Estate Management & Development"},
+        "unmapped": "nan",
         "status": "unverifiable",
-        "notes": "GICS / industry row (unverifiable). IQ_PRIMARY_INDUSTRY is the other listed candidate. Same GICS caveat as gics_sector."
+        "notes": "GICS / industry row (unverifiable). IQ_PRIMARY_INDUSTRY is the other listed candidate. value_map keeps only the 74 GICS industry names (GICS structure effective March 2023: VERIFY against the current GICS release); CapIQ's own industry labels (which may be finer, sub-industry-like) are NaN rather than passed off as GICS industries. Add verified mappings in an override after verify_fields()."
       },
       "exchange": {
         "mnemonic": "IQ_EXCHANGE",
@@ -166,10 +178,10 @@
         "notes": "Trading currency of a US listing, derived from the exchange. Every amount is requested with currencyId=USD regardless."
       },
       "security_type": {
-        "assume": "common_stock",
+        "available": false,
         "kind": "label",
         "status": "unverifiable",
-        "notes": "No GDS security-type mnemonic is verified (Xpressfeed securitySubTypeId=1 is SQL-only). Explicit tickers and index members are LABELLED common_stock with a warning: ADRs, REITs and funds are NOT excluded. Replace with an admitted mnemonic in an override to classify instead."
+        "notes": "No GDS security-type mnemonic is verified (Xpressfeed securitySubTypeId=1 is SQL-only). No label is assumed (NaN never passes): security_type is NaN and a UniverseSpec.security_types filter is reported LEG NOT EVALUATED. To classify, add an admitted mnemonic in an override ({\"available\": null, \"mnemonic\": \"...\", \"status\": ...}); a caller who has checked the list may instead assert a label with {\"available\": null, \"assume\": \"common_stock\"} (warned on every use, recorded in the field-map digest)."
       },
       "market_cap": {
         "mnemonic": "IQ_MARKETCAP",
@@ -179,7 +191,7 @@
         "units_verified": false,
         "plausible": [1000000, 10000000000000],
         "status": "confirmed",
-        "notes": "Market cap row: IQ_MARKETCAP confirmed; 'Units (millions?) UNVERIFIED. Pass currencyId=USD.' (also an ADR known unknown). x1e6 -> USD absolute. asOfDate anchors the value to as_of (asOfDate on GDSP is listed only in the estimate-revisions row: VERIFY)."
+        "notes": "Market cap row: IQ_MARKETCAP confirmed; 'Units (millions?) UNVERIFIED. Pass currencyId=USD.' (also an ADR known unknown). x1e6 -> USD absolute. asOfDate anchors the value to as_of (asOfDate on GDSP is listed only in the estimate-revisions row: see api.as_of_property; a historical as_of is suspended until it is admitted)."
       }
     },
 
@@ -358,7 +370,7 @@
         "units_verified": false,
         "plausible": [0, 2000000000000],
         "status": "unverifiable",
-        "notes": "Estimate revisions row (unverifiable): IQ_REVENUE_EST with asOfDate = as_of - 91 days."
+        "notes": "Estimate revisions row (unverifiable): IQ_REVENUE_EST with asOfDate = as_of - 91 days. Until api.as_of_property is admitted it is served only after a lag check (the value at as_of - 91 days must differ from the value at as_of on test_identifier, and not equal it for every name at serve time): if GDS ignored asOfDate the revision would be a fabricated 0%. Listed in provider.unverified_columns: not a threshold until admitted (G5)."
       },
       "eps_ntm_est": {
         "mnemonic": "IQ_EPS_EST",
@@ -376,7 +388,7 @@
         "to_canonical": 1,
         "plausible": [-10000, 100000],
         "status": "unverifiable",
-        "notes": "Estimate revisions row (unverifiable): IQ_EPS_EST with asOfDate = as_of - 91 days (Kensho has no as-of date)."
+        "notes": "Estimate revisions row (unverifiable): IQ_EPS_EST with asOfDate = as_of - 91 days (Kensho has no as-of date). Lag-checked like revenue_ntm_est_3m_ago until api.as_of_property is admitted."
       },
       "eps_ttm": {"available": false, "status": "unverifiable", "notes": "No trailing-EPS mnemonic in VENDOR_REFERENCE: NaN."},
       "num_analysts": {"available": false, "status": "unverifiable", "notes": "No analyst-count mnemonic in VENDOR_REFERENCE: NaN."},
@@ -443,12 +455,14 @@
       },
       "volume": {
         "mnemonic": "IQ_VOLUME",
-        "unit": "millions of shares (ASSUMED)",
+        "unit": "millions of shares (ASSUMED; split adjustment UNVERIFIED)",
         "to_canonical": 1000000,
         "units_verified": false,
-        "plausible": [0, 20000000000],
+        "plausible": [0, 5000000000],
+        "plausible_dollar_volume": [0, 100000000000],
+        "plausible_turnover": [0, 1],
         "status": "confirmed",
-        "notes": "Daily volume row (confirmed); 'Avg volume 20d: compute from IQ_VOLUME'. Scale and split adjustment UNVERIFIED (x1e6 assumes CapIQ's millions default)."
+        "notes": "Daily volume row (confirmed); 'Avg volume 20d: compute from IQ_VOLUME'. Scale and split adjustment UNVERIFIED (x1e6 assumes CapIQ's millions default; adjusted close x unadjusted volume would misstate dollar volume around a split). Per-ticker scale checks on the window's medians (a series failing one is blanked): shares/day within 'plausible', close x volume (USD/day) within 'plausible_dollar_volume', and - when get_universe already fetched the market cap - daily turnover (dollar volume / market cap) within 'plausible_turnover'. A thin name whose raw value is really in shares would otherwise be inflated x1e6 and pass a liquidity floor. Listed in provider.unverified_columns until admitted (G5): z-scores only, not thresholds."
       },
       "open": {
         "mnemonic": "IQ_OPENPRICE_ADJ",
@@ -510,13 +524,13 @@
       "notes": "Enterprise value row (confirmed). CapIQ TEV includes items (minorities, preferred) the catalog's market cap + debt - cash does not: a reconciliation value, not a substitute."
     },
     "price": {
-      "mnemonic": "IQ_CLOSEPRICE",
+      "mnemonic": "IQ_CLOSEPRICE_ADJ",
       "properties": {"asOfDate": "{as_of}"},
       "unit": "USD per share",
       "to_catalog": 1,
       "plausible": [0.0001, 5000000],
       "status": "confirmed",
-      "notes": "Last price row (confirmed). Unadjusted close; equals the adjusted close on the latest day."
+      "notes": "Last price row (confirmed): the adjusted close, the same series as history.close and the catalog's 'price' (latest adjusted close). The unadjusted IQ_CLOSEPRICE would differ from the back-adjusted local value after any later split or dividend and raise spurious reconciliation flags for a historical as_of."
     },
     "ev_to_ebitda": {
       "mnemonic": "IQ_TEV_EBITDA",
@@ -611,8 +625,10 @@
     "gics_sector": {
       "mnemonic": "IQ_INDUSTRY_SECTOR",
       "kind": "label",
+      "value_map": {"Energy": "Energy", "Materials": "Materials", "Industrials": "Industrials", "Consumer Discretionary": "Consumer Discretionary", "Consumer Staples": "Consumer Staples", "Health Care": "Health Care", "Financials": "Financials", "Information Technology": "Information Technology", "Communication Services": "Communication Services", "Utilities": "Utilities", "Real Estate": "Real Estate", "Healthcare": "Health Care"},
+      "unmapped": "nan",
       "status": "unverifiable",
-      "notes": "GICS / industry row (unverifiable). CapIQ classification; may differ from GICS."
+      "notes": "GICS / industry row (unverifiable). CapIQ classification; may differ from GICS. Same GICS-name value_map as raw.universe.gics_sector (other labels are NaN)."
     },
     "sma_50": {"compute": "local", "status": "corrected", "notes": "SMA 50/200 row (corrected): compute from IQ_CLOSEPRICE_ADJ, never from raw prices."},
     "sma_200": {"compute": "local", "status": "corrected", "notes": "SMA 50/200 row (corrected): compute from IQ_CLOSEPRICE_ADJ."},
@@ -639,9 +655,10 @@
       "latest_earnings_method": "get_latest_earnings_from_identifiers",
       "transcript_method": "get_transcript_from_key_dev_id",
       "licence_class": "L1",
+      "mnpi_class": "public",
       "gate": "G2",
       "status": "corrected",
-      "notes": "Transcripts row (corrected): Kensho get_latest_earnings_from_identifiers -> get_transcript_from_key_dev_id; de-duplicate versions per keyDevId. ADR step 7 object route: Client(...).ticker(sym).company.latest_earnings (.name, .key_dev_id) then .transcript.raw ('Speaker: text'; requires TranscriptsPermission). Licence class L1 pending gate G2: served only when the boundary permits TRANSCRIPT text with a note citing G2."
+      "notes": "Transcripts row (corrected): Kensho get_latest_earnings_from_identifiers -> get_transcript_from_key_dev_id; de-duplicate versions per keyDevId. ADR step 7 object route: Client(...).ticker(sym).company.latest_earnings (.name, .key_dev_id) then .transcript.raw ('Speaker: text'; requires TranscriptsPermission). Licence class L1 pending gate G2: served only when the boundary permits TRANSCRIPT text with a structured 'G2: <reference>, <YYYY-MM-DD>, reviewed by <lawyer>' citation. mnpi_class 'public': earnings calls are public events (expert-network / data-room sources are never routed here)."
     },
     "news": {
       "available": false,

@@ -764,3 +764,26 @@ def test_malformed_pushdown_result_falls_back(provider, offline):
     assert r.pushdown_query is None
     assert any("push-down failed" in w for w in r.warnings)
     assert r.survivors == ref.survivors and r.funnel == ref.funnel
+
+
+def test_llm_explanations_skipped_when_provider_forbids_external_llm(provider):
+    from aitrading.agent.explain import Explainer
+    from aitrading.llm.base import ScriptedLLM
+    from aitrading.pipeline import ResearchPipeline
+    from aitrading.screen.nl import HeuristicScreenTranslator
+
+    class Gated:
+        external_llm_allowed = False
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    llm = ScriptedLLM({})
+    pipe = ResearchPipeline(Gated(provider), HeuristicScreenTranslator(), Explainer(llm), out_dir=None, explain_top_k=3)
+    r = pipe.run(OBS, AS_OF)
+    assert r.survivors > 0 and all(i.thesis is None and i.error is None for i in r.ideas)
+    assert any("explanations skipped" in w for w in r.warnings)
+    assert llm.calls == []

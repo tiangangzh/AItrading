@@ -41,8 +41,10 @@ from aitrading.screen import compile_lseg
 from aitrading.screen.compile_lseg import compile_screen, compile_universe, format_number, preflight_codes
 from aitrading.screen.spec import Condition, RankFactor, ScreenSpec, UniverseSpec
 
-TODAY = date(2026, 10, 2)
-AS_OF = date(2026, 10, 1)
+TODAY = date(2026, 10, 2)  # a Friday
+AS_OF = date(2026, 10, 1)  # the latest completed session on TODAY
+ADMITTED = frozenset({"market_cap_usd_bn", "price", "return_3m_pct"})  # a G5 admission set (field_validation_log)
+G3_NOTE = "G3: LSEG letter AI-2026-014 (Reuters news, per-dataset AI use), 2026-09-15, reviewed by J. Smith (Legal)"
 UNIVERSE = 'U(IN(Equity(active,public,primary))/*UNV:Public*/)'
 LISTING = 'IN(TR.ExchangeCountryCode,"US"), IN(TR.InstrumentTypeCode,"ORD"), NOT_IN(TR.ExchangeMarketIdCode,"OTCM")'
 LISTING_EXPR = f"SCREEN({UNIVERSE}, {LISTING}, CURN=USD)"
@@ -73,6 +75,8 @@ class FakeLD(types.ModuleType):
         self.screens: dict[str, list[str]] = {}  # SCREEN expression -> RICs
         self.history: dict[tuple[str, str], pd.Series] = {}  # (RIC, code) -> daily series
         self.history_errors: set[str] = set()
+        self.reject_params: set[str] = set()  # get_data raises when one of these parameters is sent
+        self.reject_adjustments = False  # get_history raises when adjustments are sent
         self.headlines: dict[str, pd.DataFrame] = {}
         self.stories: dict[str, str] = {}
         self.config = FakeConfig()
@@ -98,6 +102,9 @@ class FakeLD(types.ModuleType):
     def get_data(self, universe, fields, parameters=None, header_type=None):
         self.calls.append(("get_data", {"universe": universe, "fields": list(fields), "parameters": parameters,
                                         "header_type": header_type}))
+        bad = [k for k in (parameters or {}) if k in self.reject_params]
+        if bad:
+            raise RuntimeError(f"Invalid parameter {bad[0]}")
         if isinstance(universe, str) and universe.startswith("SCREEN("):
             if universe not in self.screens:
                 raise RuntimeError(f"unexpected SCREEN {universe}")
@@ -116,6 +123,8 @@ class FakeLD(types.ModuleType):
         rics = list(universe)
         if any(r in self.history_errors for r in rics):
             raise RuntimeError("history request failed")
+        if adjustments and self.reject_adjustments:
+            raise RuntimeError("Unknown adjustments value")
         lo, hi = pd.Timestamp(start), pd.Timestamp(end)
         frames = {}
         for r in rics:
@@ -236,6 +245,19 @@ def test_default_fieldmap_valid_and_statuses_match_reference(monkeypatch):
     assert raw["short_interest"]["float_shares"]["status"] == "unverifiable"
     assert raw["universe"]["gics_industry"]["status"] == "unverifiable"
     assert raw["universe"]["market_cap"]["to_canonical"] == 1_000_000
+    # the report date is pinned to the FQ0 period of the values it guards (pinned form not in the reference)
+    assert raw["fundamentals"]["report_date"]["code"] == "TR.RevenueActReportDate(Period=FQ0)"
+    assert raw["fundamentals"]["report_date"]["status"] == "unverifiable"
+    assert raw["estimates"]["last_earnings_date"]["code"] == "TR.RevenueActReportDate(Period=FQ0)"
+    # short interest / free float scale is unverified: not served until admitted
+    for key in ("short_interest_shares", "short_interest_shares_1m_ago", "float_shares"):
+        assert raw["short_interest"][key]["units_verified"] is False, key
+    # TR.TotalReturn3Mo (3 calendar months) is not the catalog's 63-session return: never pushed
+    assert feat["return_3m_pct"]["screen"] == "none"
+    # gate G5: the default map admits nothing
+    assert not any(e.get("admitted") for e in feat.values())
+    assert fm["sessions"]["default"] == "platform.ldp"
+    assert fm["parameters"]["SDate"]["status"] == "unverifiable" and fm["parameters"]["SDate"]["probe"] == "TR.PriceClose"
     close = fm["history"]["fields"]["close"]
     assert (close["code"], close["status"]) == ("TRDPRC_1", "confirmed")
     assert fm["history"]["adjustments"]["status"] == "unverifiable"
@@ -290,6 +312,9 @@ def test_env_override_is_deep_merged(tmp_path, monkeypatch):
     ({"raw": {"fundamentals": {"bogus_col": {"code": "TR.X", "status": "confirmed"}}}}, "canonical column"),
     ({"features": {"price": {"screen": "always"}}}, "screen"),
     ({"features": {"price": {"threshold_scale": 0}}}, "threshold_scale"),
+    ({"features": {"price": {"admitted": "yes"}}}, "admitted"),
+    ({"symbology": {"ric_suffixes": "N"}}, "ric_suffixes"),
+    ({"parameters": {"SDate": {"probe": None}}}, "probe"),
 ])
 def test_invalid_overrides_are_rejected(bad, msg, monkeypatch):
     monkeypatch.delenv(FIELDMAP_ENV, raising=False)
@@ -316,26 +341,28 @@ def fm(monkeypatch):
 
 def test_compile_representative_screen_exact_string(fm):
     spec = _representative_spec()
-    assert preflight_codes(spec, fm, AS_OF, today=TODAY) == ["TR.PriceClose"]
-    cq = compile_screen(spec, fm, AS_OF, preflight={"TR.PriceClose": True}, today=TODAY)
+    assert preflight_codes(spec, fm, AS_OF, today=TODAY, admitted=ADMITTED) == ["TR.PriceClose"]
+    cq = compile_screen(spec, fm, AS_OF, preflight={"TR.PriceClose": True}, today=TODAY, admitted=ADMITTED)
     assert cq.expression == (
         f"SCREEN({UNIVERSE}, {LISTING}, TR.PriceClose>=5, TR.CompanyMarketCap(Scale=6)>=2000, "
-        "TR.CompanyMarketCap(Scale=6)<=20000, TR.TotalReturn3Mo<0, CURN=USD)"
+        "TR.CompanyMarketCap(Scale=6)<=20000, CURN=USD)"
     )
     assert cq.point_in_time
     assert cq.pushed_conditions == [
         "country == US", "security_type in [common_stock]",
         "universe: exchange market not OTCM (OTC Markets excluded from the LSEG universe)",
-        "price >= 5", "market_cap_usd_bn between 2 and 20", "return_3m_pct < 0",
+        "price >= 5", "market_cap_usd_bn between 2 and 20",
     ]
     assert cq.residual_conditions == [
         "avg_dollar_volume_20d_usd_mn >= 5", "sma_50_vs_sma_200_pct > 0",
         "drawdown_from_52w_high_pct between -45 and -20", "rsi_14 < 45", "rel_volume_5d > 1.5",
-        "fcf_yield_pct >= 5", "revenue_growth_yoy_pct >= 10", "short_interest_pct_float >= 5",
+        "fcf_yield_pct >= 5", "revenue_growth_yoy_pct >= 10", "short_interest_pct_float >= 5", "return_3m_pct < 0",
     ]
     reasons = {r.condition: r.reason for r in cq.residual}
     assert "UNVERIFIED" in reasons["drawdown_from_52w_high_pct between -45 and -20"]
     assert "computed locally" in reasons["rsi_14 < 45"]
+    # 3 calendar months is not 63 sessions: a pushed bound could drop names the local definition passes
+    assert "screen=none" in reasons["return_3m_pct < 0"] and "63 sessions" in reasons["return_3m_pct < 0"]
     # every pushed predicate maps to a confirmed / corrected expression
     assert {p.status for p in cq.pushed} <= {"confirmed", "corrected"}
     mcap = next(p for p in cq.pushed if p.feature == "market_cap_usd_bn")
@@ -344,12 +371,12 @@ def test_compile_representative_screen_exact_string(fm):
 
 def test_preflight_gates_unofficial_predicates(fm):
     spec = _spec([Condition(feature="market_cap_usd_bn", op=">=", value=2)], universe=UniverseSpec())
-    no_pf = compile_screen(spec, fm, AS_OF, today=TODAY)
+    no_pf = compile_screen(spec, fm, AS_OF, today=TODAY, admitted=ADMITTED)
     assert "TR.PriceClose" not in no_pf.expression
     assert "price >= 5" in no_pf.residual_conditions
-    failed = compile_screen(spec, fm, AS_OF, preflight={"TR.PriceClose": False}, today=TODAY)
+    failed = compile_screen(spec, fm, AS_OF, preflight={"TR.PriceClose": False}, today=TODAY, admitted=ADMITTED)
     assert "TR.PriceClose" not in failed.expression
-    ok = compile_screen(spec, fm, AS_OF, preflight={"TR.PriceClose": True}, today=TODAY)
+    ok = compile_screen(spec, fm, AS_OF, preflight={"TR.PriceClose": True}, today=TODAY, admitted=ADMITTED)
     assert "TR.PriceClose>=5" in ok.predicates and dict(ok.preflight) == {"TR.PriceClose": True}
 
 
@@ -358,7 +385,8 @@ def test_unverifiable_or_unadmitted_features_are_never_pushed(fm):
                   Condition(feature="return_6m_pct", op=">", value=10)])
     over = load_fieldmap({"features": {"market_cap_usd_bn": {"status": "unverifiable"},
                                        "return_6m_pct": {"screen": "official"}}})
-    cq = compile_screen(spec, over, AS_OF, preflight={"TR.TotalReturn6Mo": True}, today=TODAY)
+    cq = compile_screen(spec, over, AS_OF, preflight={"TR.TotalReturn6Mo": True}, today=TODAY,
+                        admitted={"market_cap_usd_bn", "return_6m_pct"})  # admission never overrides the status
     assert cq.expression == LISTING_EXPR
     assert cq.residual_conditions == ["market_cap_usd_bn >= 2", "return_6m_pct > 10"]
     assert all("unverifiable" in r.reason for r in cq.residual)
@@ -367,18 +395,21 @@ def test_unverifiable_or_unadmitted_features_are_never_pushed(fm):
 def test_admitted_units_override_pushes_and_negative_scale_flips(fm):
     spec = _spec([Condition(feature="drawdown_from_52w_high_pct", op="between", value=-45, value_high=-20)])
     pf = {"TR.PricePctChg52WkHigh": True}
-    assert compile_screen(spec, fm, AS_OF, preflight=pf, today=TODAY).expression == LISTING_EXPR
+    g5 = {"drawdown_from_52w_high_pct"}
+    assert compile_screen(spec, fm, AS_OF, preflight=pf, today=TODAY, admitted=g5).expression == LISTING_EXPR
     admitted = load_fieldmap({"features": {"drawdown_from_52w_high_pct": {"units_verified": True}}})
-    assert preflight_codes(spec, admitted, AS_OF, today=TODAY) == ["TR.PricePctChg52WkHigh"]
-    cq = compile_screen(spec, admitted, AS_OF, preflight=pf, today=TODAY)
+    assert preflight_codes(spec, admitted, AS_OF, today=TODAY, admitted=g5) == ["TR.PricePctChg52WkHigh"]
+    cq = compile_screen(spec, admitted, AS_OF, preflight=pf, today=TODAY, admitted=g5)
     assert cq.predicates[-2:] == ("TR.PricePctChg52WkHigh>=-45", "TR.PricePctChg52WkHigh<=-20")
-    positive = load_fieldmap({"features": {"drawdown_from_52w_high_pct": {"units_verified": True, "threshold_scale": -1}}})
+    positive = load_fieldmap({"features": {"drawdown_from_52w_high_pct": {"units_verified": True, "threshold_scale": -1,
+                                                                          "admitted": True}}})  # admitted in the map
     cq2 = compile_screen(spec, positive, AS_OF, preflight=pf, today=TODAY)
     assert cq2.predicates[-2:] == ("TR.PricePctChg52WkHigh<=45", "TR.PricePctChg52WkHigh>=20")
 
 
 def test_category_predicates_single_value_forms_only(fm):
     pf = {"TR.GICSSector": True}
+    fm = load_fieldmap({"features": {"gics_sector": {"admitted": True}}})
     uni = UniverseSpec(min_price=None, min_avg_dollar_volume_usd_mn=None, exclude_sectors=["Energy", "Utilities"])
     one = Condition(feature="gics_sector", op="in", values=["Information Technology"])
     two = Condition(feature="gics_sector", op="in", values=["Energy", "Materials"])
@@ -423,7 +454,7 @@ def test_historical_as_of_pushes_static_listing_only(fm):
 def test_threshold_scaling_is_exact_decimal(fm):
     cond = [Condition(feature="market_cap_usd_bn", op=">=", value=1.1), Condition(feature="market_cap_usd_bn", op="<", value=0.3),
             Condition(feature="market_cap_usd_bn", op="<=", value=12345.678)]
-    cq = compile_screen(_spec(cond), fm, AS_OF, today=TODAY)
+    cq = compile_screen(_spec(cond), fm, AS_OF, today=TODAY, admitted=ADMITTED)
     assert cq.predicates[3:] == ("TR.CompanyMarketCap(Scale=6)>=1100", "TR.CompanyMarketCap(Scale=6)<300",
                                  "TR.CompanyMarketCap(Scale=6)<=12345678")
     assert [format_number(x) for x in (2000.0, -20, 0.5, 1e-7, 1e10, -0.0)] == ["2000", "-20", "0.5", "0.0000001",
@@ -433,10 +464,12 @@ def test_threshold_scaling_is_exact_decimal(fm):
 
 
 def test_compiled_query_audit_record(fm):
-    cq = compile_screen(_representative_spec(), fm, AS_OF, today=TODAY)
+    cq = compile_screen(_representative_spec(), fm, AS_OF, today=TODAY, admitted=ADMITTED)
     rec = cq.to_audit()
     json.dumps(rec)  # serialisable
     assert rec["query"] == cq.expression and len(rec["query_sha256"]) == 64 and rec["as_of"] == "2026-10-01"
+    assert rec["admitted_features"] == sorted(ADMITTED) and rec["today"] == "2026-10-02"
+    assert rec["as_of_lag_sessions"] == 0 and rec["max_session_lag"] == 0
     assert rec["fieldmap_version"] == "2026-10-02" and len(rec["fieldmap_sha256"]) == 64
     assert compile_screen(_representative_spec(), fm, AS_OF, today=TODAY).fieldmap_sha256 == cq.fieldmap_sha256
 
@@ -478,9 +511,40 @@ def test_default_boundary_denies_text_and_values(fake):
         _provider(boundary=DataBoundary(provider="lseg", note="legal said ok"))
     with pytest.raises(ValueError, match="provider"):
         _provider(boundary=DataBoundary(provider="bloomberg", allowed_document_kinds=set(), allow_numeric_features=False))
-    widened = DataBoundary(provider="lseg", allowed_document_kinds={DocumentKind.NEWS},
-                           note="G3: LSEG written AI-use confirmation for Reuters news, 2026-11-01")
+    widened = DataBoundary(provider="lseg", allowed_document_kinds={DocumentKind.NEWS}, note=G3_NOTE)
     assert _provider(boundary=widened).boundary is widened
+    narrow = DataBoundary(provider="lseg", allowed_document_kinds=set(), allow_numeric_features=False, note="")
+    assert _provider(boundary=narrow, session_name="desktop.workspace").boundary is narrow  # not widened: no citation
+
+
+@pytest.mark.parametrize("note, why", [
+    (BOUNDARY_NOTE, "start with 'G3:'"),  # the module's own default note mentions G3 but cites nothing
+    ("pending G3", "start with 'G3:'"),
+    ("G3 not yet received", "start with 'G3:'"),
+    ("G3: pending", "not been received"),
+    ("G3: LSEG letter AI-2026-014, 2026-09-15, reviewed by J. Smith - countersignature not yet received", "not been received"),
+    ("G3: <confirmation reference>, <YYYY-MM-DD>, reviewed by <lawyer>", "placeholder"),
+    ("G3: LSEG letter AI-2026-014, reviewed by J. Smith", "YYYY-MM-DD"),
+    ("G3: LSEG letter AI-2026-014, 2026-11-01, reviewed by J. Smith", "YYYY-MM-DD"),  # dated after today
+    ("G3: LSEG letter AI-2026-014, 2026-09-15", "reviewing lawyer"),
+])
+def test_widened_boundary_needs_structured_g3_citation(fake, note, why):
+    """Regression: a bare 'G3' token anywhere in the note used to widen the boundary."""
+    b = DataBoundary(provider="lseg", allowed_document_kinds={DocumentKind.NEWS, DocumentKind.FILING}, note=note)
+    with pytest.raises(ValueError, match=re.escape(why)):
+        _provider(boundary=b)
+
+
+def test_desktop_session_boundary_cannot_be_widened(fake):
+    """Regression: a Workspace (L4) session accepted a G3-widened boundary; G3 covers only L3 loosening."""
+    widened = DataBoundary(provider="lseg", allowed_document_kinds={DocumentKind.NEWS}, note=G3_NOTE)
+    for name in ("desktop.workspace", "workspace"):  # anything but platform.* is treated as L4
+        with pytest.raises(ValueError, match="L4"):
+            _provider(boundary=widened, session_name=name)
+    assert _provider(boundary=widened, session_name="platform.ldp").boundary is widened
+    numbers = DataBoundary(provider="lseg", allowed_document_kinds=set(), allow_numeric_features=True, note=G3_NOTE)
+    with pytest.raises(ValueError, match="cannot be widened"):
+        _provider(boundary=numbers, session_name="desktop.workspace")
 
 
 def test_protocols_and_capabilities(fake):
@@ -503,9 +567,28 @@ def test_session_opened_lazily_once(fake, monkeypatch):
     monkeypatch.delenv("LSEG_APP_KEY")
     p2 = _provider(ld_module=fake)
     p2.get_universe(UniverseSpec(), AS_OF)
-    assert fake.call_list("open_session")[-1] == {}  # library default (desktop.workspace)
+    assert fake.call_list("open_session")[-1] == {"name": "platform.ldp"}
     p2.close()
     assert fake.closed
+
+
+def test_default_session_is_platform_and_desktop_is_opt_in(fake, monkeypatch, tmp_path):
+    """Regression: LSEGProvider() used to open the library default desktop.workspace session (L4, never on a server)."""
+    p = _provider()
+    assert p.session_name == "platform.ldp" and not p.is_desktop and p.licence_class == "L3"
+    fake.screens[LISTING_EXPR] = ["IBM.N"]
+    p.get_universe(UniverseSpec(), AS_OF)
+    assert fake.call_list("open_session")[-1]["name"] == "platform.ldp"
+    assert not any("L4" in w for w in p.warnings)
+    d = _provider(session_name="desktop.workspace")
+    assert d.is_desktop and d.licence_class == "L4"
+    d.get_universe(UniverseSpec(), AS_OF)
+    assert fake.call_list("open_session")[-1]["name"] == "desktop.workspace"
+    assert any("L4" in w and "must not run on a server" in w for w in d.warnings)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("LD_LIB_CONFIG_PATH", raising=False)
+    assert any("L4" in x and "server" in x for x in d.diagnostics())
 
 
 def test_session_failure_is_provider_unavailable(fake):
@@ -527,7 +610,9 @@ def test_diagnostics_platform_needs_config(fake, monkeypatch, tmp_path):
     (cfgdir / "lseg-data.config.json").write_text("{}")
     monkeypatch.setenv("LD_LIB_CONFIG_PATH", str(cfgdir))
     assert _provider(session_name="platform.ldp").diagnostics() == []
-    assert _provider().diagnostics() == []  # desktop: app key set by the fixture
+    assert _provider().diagnostics() == []  # default: platform.ldp
+    desk = _provider(session_name="desktop.workspace").diagnostics()  # app key set by the fixture
+    assert len(desk) == 1 and "L4" in desk[0]
 
 
 # =============================================================================================
@@ -555,9 +640,14 @@ def test_get_universe_request_and_canonical_units(fake):
     _universe_values(fake)
     p = _provider()
     df = p.get_universe(UniverseSpec(exclude_sectors=["Energy"]), AS_OF)
-    # one preflight for the unverifiable TR.GICSIndustry on the test RIC (reference form, no parameters)
+    # the unverifiable SDate parameter is probed with and without it, then the unverifiable
+    # TR.GICSIndustry is preflighted with the same parameters as the real request
     pf = [c for c in fake.call_list("get_data") if c["universe"] == "IBM.N"]
-    assert pf == [{"universe": "IBM.N", "fields": ["TR.GICSIndustry"], "parameters": None, "header_type": "name"}]
+    real = {"Curn": "USD", "SDate": "2026-10-01"}
+    assert pf == [{"universe": "IBM.N", "fields": ["TR.PriceClose"], "parameters": real, "header_type": "name"},
+                  {"universe": "IBM.N", "fields": ["TR.PriceClose"], "parameters": {"Curn": "USD"}, "header_type": "name"},
+                  {"universe": "IBM.N", "fields": ["TR.GICSIndustry"], "parameters": real, "header_type": "name"}]
+    assert p.field_log["parameters.SDate"]["used"] is True and p.field_log["parameters.SDate"]["with"] == 250.0
     main = [c for c in fake.call_list("get_data") if c["universe"] == LISTING_EXPR]
     assert main == [{"universe": LISTING_EXPR,
                      "fields": ["TR.CommonName", "TR.GICSSector", "TR.ExchangeMarketIdCode", "TR.ExchangeCountryCode",
@@ -583,9 +673,9 @@ def test_get_universe_request_and_canonical_units(fake):
 def test_pushdown_screen_exact_call_and_ticker_mapping(fake):
     spec = _representative_spec()
     expr = (f"SCREEN({UNIVERSE}, {LISTING}, TR.PriceClose>=5, TR.CompanyMarketCap(Scale=6)>=2000, "
-            "TR.CompanyMarketCap(Scale=6)<=20000, TR.TotalReturn3Mo<0, CURN=USD)")
+            "TR.CompanyMarketCap(Scale=6)<=20000, CURN=USD)")
     fake.screens[expr] = ["MSFT.O", "BRKb.N", "XYZ.N^K20"]
-    p = _provider()
+    p = _provider(admitted=ADMITTED)
     res = p.pushdown_screen(spec, AS_OF)
     assert isinstance(res, PushdownResult)
     assert res.query == expr  # recorded verbatim
@@ -597,6 +687,7 @@ def test_pushdown_screen_exact_call_and_ticker_mapping(fake):
     assert p.ric_for("BRK-B") == "BRKb.N" and p.ric_for("XYZ") == "XYZ.N^K20"
     assert res.pushed_conditions == p.last_pushdown.pushed_conditions
     assert "rsi_14 < 45" in res.residual_conditions and "market_cap_usd_bn between 2 and 20" in res.pushed_conditions
+    assert p.last_pushdown.to_audit()["admitted_features"] == sorted(ADMITTED)
     # preflight is memoised for the day
     p.pushdown_screen(spec, AS_OF)
     assert len([c for c in fake.call_list("get_data") if c["universe"] == "IBM.N"]) == 1
@@ -608,7 +699,7 @@ def test_pushdown_preflight_failure_keeps_predicate_local(fake):
     spec = _spec([Condition(feature="market_cap_usd_bn", op=">=", value=2)], universe=UniverseSpec())
     expr = f"SCREEN({UNIVERSE}, {LISTING}, TR.CompanyMarketCap(Scale=6)>=2000, CURN=USD)"
     fake.screens[expr] = []
-    p = _provider()
+    p = _provider(admitted=ADMITTED)
     res = p.pushdown_screen(spec, AS_OF)
     assert res.query == expr and res.tickers == []
     assert "price >= 5" in res.residual_conditions
@@ -650,61 +741,92 @@ def test_ric_to_ticker(ric, ticker):
 # =============================================================================================
 
 
+RD = "TR.RevenueActReportDate(Period=FQ0)"  # report date pinned to the FQ0 period (unverifiable)
+
+
 def test_fundamentals_units_preflight_and_field_drop(fake):
     p = _provider(rics={"AAA": "AAA.N", "BBB": "BBB.O", "LATE": "LATE.N"})
     v = fake.values
     v[("IBM.N", "TR.RevenueActValue(Period=FQ-4)")] = 1.5e10  # preflight passes
     v[("IBM.N", "TR.FreeCashFlow(Period=LTM,Scale=6)")] = None  # preflight fails -> leg not evaluated
-    for ric, rev, rev4, sh, rd in [("AAA.N", 1.2e9, 1.0e9, 5e8, "2026-07-30"), ("BBB.O", None, 2.0e9, "", "2026-08-05"),
-                                   ("LATE.N", 3e9, 2e9, 1e9, "2026-10-15")]:
+    for ric, rev, rev4 in [("AAA.N", 1.2e9, 1.0e9), ("BBB.O", None, 2.0e9), ("LATE.N", 3e9, 2e9)]:
         v[(ric, "TR.RevenueActValue(Period=FQ0)")] = rev
         v[(ric, "TR.RevenueActValue(Period=FQ-4)")] = rev4
-        v[(ric, "TR.SharesOutstanding")] = sh
-        # TR.RevenueActReportDate deliberately unknown at first: dropped silently by the fake
+        # TR.SharesOutstanding (corrected, not preflighted) deliberately unknown: dropped silently by the fake
+        # the report date is unknown too: its preflight fails, so the look-ahead guard cannot run
     df = p.get_fundamentals(["AAA", "BBB", "LATE"], AS_OF)
     assert list(df.columns) == F.FUNDAMENTAL_COLUMNS
     assert df.loc["AAA", F.REVENUE_LAST_Q] == pytest.approx(1.2e9)
     assert df.loc["AAA", F.REVENUE_LAST_Q_PRIOR_YEAR] == pytest.approx(1.0e9)
-    assert math.isnan(df.loc["BBB", F.REVENUE_LAST_Q]) and math.isnan(df.loc["BBB", F.SHARES_OUTSTANDING])
+    assert math.isnan(df.loc["BBB", F.REVENUE_LAST_Q]) and df[F.SHARES_OUTSTANDING].isna().all()
     assert df[F.FCF_TTM].isna().all() and df[F.REVENUE_TTM].isna().all()
     assert df[F.REPORT_DATE].isna().all() and str(df[F.REPORT_DATE].dtype) == "datetime64[ns]"
     assert any("LEG NOT EVALUATED" in w and "fcf_ttm" in w for w in p.warnings)
+    assert any("LEG NOT EVALUATED" in w and "report_date" in w for w in p.warnings)
+    assert any("look-ahead guard" in w and "could not run" in w for w in p.warnings)
     assert any("re-requested one field at a time" in w for w in p.warnings)
-    assert any("TR.RevenueActReportDate" in w and "no column" in w for w in p.warnings)
+    assert any("TR.SharesOutstanding" in w and "no column" in w for w in p.warnings)
     batched = [c for c in fake.call_list("get_data") if len(c["fields"]) > 1]
     assert batched[0]["universe"] == ["AAA.N", "BBB.O", "LATE.N"]
     assert batched[0]["fields"] == ["TR.RevenueActValue(Period=FQ0)", "TR.RevenueActValue(Period=FQ-4)",
-                                    "TR.SharesOutstanding", "TR.RevenueActReportDate"]
+                                    "TR.SharesOutstanding"]
     assert batched[0]["parameters"] == {"Curn": "USD", "SDate": "2026-10-01"}
     assert p.field_log["fundamentals.fcf_ttm"]["used"] is False
     assert p.field_log["fundamentals.revenue_last_q_prior_year"]["preflight"] is True
-    # with the report date known, a report after as_of blanks the row (look-ahead guard)
-    for ric, rd in [("AAA.N", "2026-07-30"), ("BBB.O", "2026-08-05"), ("LATE.N", "2026-10-15")]:
-        v[(ric, "TR.RevenueActReportDate")] = rd
+    assert p.field_log["fundamentals.report_date"]["preflight"] is False
+    # with the FQ0 report date known (preflight passes on a fresh provider), a report after as_of blanks the row
+    for ric, rd in [("IBM.N", "2026-07-20"), ("AAA.N", "2026-07-30"), ("BBB.O", "2026-08-05"), ("LATE.N", "2026-10-15")]:
+        v[(ric, RD)] = rd
+    for ric, sh in [("AAA.N", 5e8), ("BBB.O", ""), ("LATE.N", 1e9)]:
+        v[(ric, "TR.SharesOutstanding")] = sh
     v[("AAA.N", "TR.FreeCashFlow(Period=LTM,Scale=6)")] = 1.0
-    df2 = p.get_fundamentals(["AAA", "BBB", "LATE"], AS_OF)
+    p2 = _provider(rics={"AAA": "AAA.N", "BBB": "BBB.O", "LATE": "LATE.N"}, ld_module=fake)
+    df2 = p2.get_fundamentals(["AAA", "BBB", "LATE"], AS_OF)
     assert df2.loc["AAA", F.REPORT_DATE] == pd.Timestamp("2026-07-30")
+    assert df2.loc["AAA", F.SHARES_OUTSTANDING] == pytest.approx(5e8) and math.isnan(df2.loc["BBB", F.SHARES_OUTSTANDING])
     assert df2.loc["LATE"].isna().all()
-    assert any("look-ahead" in w for w in p.warnings)
+    assert any("look-ahead" in w for w in p2.warnings)
+    assert not any("could not run" in w for w in p2.warnings)
+    assert [c for c in fake.call_list("get_data") if c["fields"] == [RD] and c["universe"] == "IBM.N"][-1]["parameters"] == \
+        {"Curn": "USD", "SDate": "2026-10-01"}  # preflighted with the real request's parameters
 
 
 def test_fcf_scale_six_converts_to_usd(fake):
     fake.values[("IBM.N", "TR.FreeCashFlow(Period=LTM,Scale=6)")] = 12000.0
     fake.values[("AAA.N", "TR.FreeCashFlow(Period=LTM,Scale=6)")] = 1234.5
-    fake.values[("AAA.N", "TR.RevenueActReportDate")] = "2026-07-30T00:00:00Z"
+    fake.values[("IBM.N", RD)] = "2026-07-20T00:00:00Z"
+    fake.values[("AAA.N", RD)] = "2026-07-30T00:00:00Z"
     p = _provider(rics={"AAA": "AAA.N"})
     df = p.get_fundamentals(["AAA"], AS_OF)
     assert df.loc["AAA", F.FCF_TTM] == pytest.approx(1.2345e9)
     assert df.loc["AAA", F.REPORT_DATE] == pd.Timestamp("2026-07-30")
 
 
-def test_short_interest_codes_anchor_absolute_dates(fake):
-    v = fake.values
-    for code, val in {"TR.ShortInterest(SDate=2026-10-01)": 1e6, "TR.ShortInterest(SDate=2026-09-01)": 8e5,
-                      "TR.SharesFreeFloat(SDate=2026-10-01)": 2e7, "TR.ShortInterest(SDate=2026-10-01).date": "2026-09-15"}.items():
-        v[("IBM.N", code)] = val
-        v[("AAA.N", code)] = val
+SI_CODES = {"TR.ShortInterest(SDate=2026-10-01)": 1e6, "TR.ShortInterest(SDate=2026-09-01)": 8e5,
+            "TR.SharesFreeFloat(SDate=2026-10-01)": 2e7, "TR.ShortInterest(SDate=2026-10-01).date": "2026-09-15"}
+SI_ADMITTED = {"raw": {"short_interest": {k: {"units_verified": True} for k in
+                                          ("short_interest_shares", "short_interest_shares_1m_ago", "float_shares")}}}
+
+
+def test_short_interest_scale_unverified_not_served_by_default(fake):
+    """Regression: SI and free-float shares were served at an unverified scale and fed short_interest_pct_float."""
+    for code, val in SI_CODES.items():
+        fake.values[("IBM.N", code)] = val
+        fake.values[("AAA.N", code)] = val
     p = _provider(rics={"AAA": "AAA.N"})
+    df = p.get_short_interest(["AAA"], AS_OF)
+    assert math.isnan(df.loc["AAA", F.SHORT_INTEREST_SHARES]) and math.isnan(df.loc["AAA", F.FLOAT_SHARES])
+    assert math.isnan(df.loc["AAA", F.SHORT_INTEREST_SHARES_1M_AGO])
+    assert any("LEG NOT EVALUATED" in w and "float_shares" in w and "units UNVERIFIED" in w for w in p.warnings)
+    requested = {f for c in fake.call_list("get_data") for f in c["fields"]}
+    assert "TR.SharesFreeFloat(SDate=2026-10-01)" not in requested and "TR.ShortInterest(SDate=2026-10-01)" not in requested
+
+
+def test_short_interest_codes_anchor_absolute_dates(fake):
+    for code, val in SI_CODES.items():
+        fake.values[("IBM.N", code)] = val
+        fake.values[("AAA.N", code)] = val
+    p = _provider(rics={"AAA": "AAA.N"}, fieldmap=SI_ADMITTED)  # scale admitted through an override (G5)
     df = p.get_short_interest(["AAA"], AS_OF)
     assert list(df.columns) == F.SHORT_INTEREST_COLUMNS
     assert df.loc["AAA", F.SHORT_INTEREST_SHARES] == 1e6 and df.loc["AAA", F.SHORT_INTEREST_SHARES_1M_AGO] == 8e5
@@ -919,3 +1041,258 @@ def test_compile_screen_loads_default_fieldmap_when_none(monkeypatch):
     monkeypatch.delenv(FIELDMAP_ENV, raising=False)
     cq = compile_lseg.compile_screen(_spec([]), None, AS_OF, today=TODAY)
     assert cq.expression == LISTING_EXPR
+
+
+# =============================================================================================
+# Regression tests for the review findings
+# =============================================================================================
+
+
+def test_default_pushdown_admits_nothing_g5(fake):
+    """Regression (G5): confirmed/official predicates were pushed with no field-admission record."""
+    fake.screens[LISTING_EXPR] = ["IBM.N"]
+    p = _provider()
+    res = p.pushdown_screen(_representative_spec(), AS_OF)
+    assert res.query == LISTING_EXPR  # only the universe-definition listing predicates
+    reasons = {r.condition: r.reason for r in p.last_pushdown.residual}
+    assert reasons["market_cap_usd_bn between 2 and 20"].startswith("not admitted (G5)")
+    assert reasons["price >= 5"].startswith("not admitted (G5)")
+    assert not [c for c in fake.call_list("get_data") if c["universe"] == "IBM.N"]  # nothing to preflight
+    assert any("gate G5" in w for w in p.warnings)
+    assert p.last_pushdown.to_audit()["admitted_features"] == []
+    with pytest.raises(TypeError):
+        _provider(admitted="price")
+    with pytest.raises(TypeError):
+        compile_screen(_representative_spec(), load_fieldmap(), AS_OF, today=TODAY, admitted="price")
+
+
+@pytest.mark.parametrize("as_of, today, lag", [
+    (date(2026, 10, 1), date(2026, 10, 2), 0),  # Thursday close, run on Friday
+    (date(2026, 10, 2), date(2026, 10, 2), 0),  # as_of today
+    (date(2026, 9, 28), date(2026, 10, 2), 3),  # the finding's probe: 4 days old is not current
+    (date(2026, 10, 2), date(2026, 10, 5), 0),  # Friday close, run on Monday
+    (date(2026, 10, 1), date(2026, 10, 5), 1),
+    (date(2026, 9, 25), date(2026, 10, 5), 5),
+])
+def test_as_of_lag_sessions(as_of, today, lag):
+    assert compile_lseg.as_of_lag_sessions(as_of, today) == lag
+    assert compile_lseg.is_point_in_time(as_of, today) is (lag == 0)
+
+
+def test_time_varying_predicates_need_the_latest_session(fm):
+    """Regression (look-ahead): an as_of up to 5 days old pushed today's values as thresholds."""
+    spec = _representative_spec()
+    stale = date(2026, 9, 28)
+    assert preflight_codes(spec, fm, stale, today=TODAY, admitted=ADMITTED) == []
+    cq = compile_screen(spec, fm, stale, preflight={"TR.PriceClose": True}, today=TODAY, admitted=ADMITTED)
+    assert not cq.point_in_time and cq.expression == LISTING_EXPR
+    assert all("no look-ahead" in r.reason for r in cq.residual if r.condition.startswith(("market_cap", "price")))
+    assert cq.to_audit()["as_of_lag_sessions"] == 3
+    # an explicit tolerance is recorded in the audit
+    loose = compile_screen(spec, fm, stale, preflight={"TR.PriceClose": True}, today=TODAY, admitted=ADMITTED,
+                           max_session_lag=3)
+    assert loose.point_in_time and "TR.CompanyMarketCap(Scale=6)>=2000" in loose.predicates
+    assert loose.to_audit()["max_session_lag"] == 3
+
+
+def test_sdate_rejected_is_dropped_and_logged(fake):
+    """Regression: the unverifiable global SDate was sent on every request without a preflight."""
+    fake.reject_params = {"SDate"}
+    fake.values[("AAA.N", "TR.RevenueActValue(Period=FQ0)")] = 1.2e9
+    p = _provider(rics={"AAA": "AAA.N"})
+    df = p.get_fundamentals(["AAA"], AS_OF)  # as_of is the latest session: values are current anyway
+    assert df.loc["AAA", F.REVENUE_LAST_Q] == pytest.approx(1.2e9)
+    log = p.field_log["parameters.SDate"]
+    assert log["used"] is False and log["preflight"] is False and log["without"] == 250.0
+    assert any("SDate=2026-10-01 dropped" in w for w in p.warnings)
+    batched = [c for c in fake.call_list("get_data") if c["universe"] == ["AAA.N"]]
+    assert batched and all(c["parameters"] == {"Curn": "USD"} for c in batched)
+    # a historical as_of without an anchor is NOT EVALUATED instead of returning today's values
+    old = date(2026, 6, 30)
+    n = len(fake.call_list("get_data"))
+    hist = p.get_fundamentals(["AAA"], old)
+    assert hist.loc["AAA"].isna().all()
+    assert not [c for c in fake.call_list("get_data")[n:] if c["universe"] == ["AAA.N"]]
+    assert any("no as_of anchor" in w for w in p.warnings)
+
+
+def test_sdate_identical_values_for_historical_as_of_warn(fake):
+    fake.values[("AAA.N", "TR.RevenueActValue(Period=FQ0)")] = 1.2e9
+    p = _provider(rics={"AAA": "AAA.N"})
+    p.get_fundamentals(["AAA"], date(2026, 6, 30))  # the fake ignores SDate: same probe value either way
+    assert any("same value with and without" in w for w in p.warnings)
+    assert p.field_log["parameters.SDate"]["used"] is True
+
+
+def test_history_adjustments_preflighted_and_dropped_when_rejected(fake):
+    """Regression: the unverifiable adjustments list was sent on every history request unpreflighted."""
+    _history(fake, "IBM.N", 250.0)
+    _history(fake, "AAA.N", 10.0)
+    fake.reject_adjustments = True
+    p = _provider(rics={"AAA": "AAA.N"})
+    panel = p.get_price_history(["AAA"], date(2026, 9, 1), AS_OF)
+    assert panel.close["AAA"].iloc[-1] == 19.0 and panel.high["AAA"].notna().all()
+    main = [c for c in fake.call_list("get_history") if c["universe"] == ["AAA.N"]]
+    assert len(main) == 1 and main[0]["adjustments"] is None
+    assert p.field_log["history.adjustments"]["used"] is False
+    assert any("adjustments" in w and "dropped" in w for w in p.warnings)
+    probes = [c for c in fake.call_list("get_history") if c["universe"] == ["IBM.N"]]
+    assert probes[0]["adjustments"] and probes[1]["adjustments"] is None  # with, then without
+    checks = {c.field: c for c in p.verify_fields(as_of=AS_OF)}
+    assert not checks["history.adjustments"].ok and "DROPPED" in checks["history.adjustments"].note
+    assert checks["parameters.SDate"].ok and checks["parameters.SDate"].returned_value == 250.0
+
+
+def test_duplicate_instrument_rows_are_not_combined(fake):
+    """Regression: groupby().first() merged values from different vendor rows of one instrument."""
+    orig = fake.get_data
+
+    def dup(universe, fields, parameters=None, header_type=None):
+        if universe == ["AAA.N"] and len(fields) > 1:
+            fake.calls.append(("get_data", {"universe": universe, "fields": list(fields), "parameters": parameters,
+                                            "header_type": header_type}))
+            cols = {"Instrument": ["AAA.N", "AAA.N"]}
+            for f, vals in zip(fields, ([1.0e9, None], [None, 7.0e8])):
+                cols[f.upper()] = vals
+            return pd.DataFrame(cols)
+        return orig(universe, fields, parameters, header_type)
+
+    fake.get_data = dup
+    fake.values[("AAA.N", "TR.RevenueActValue(Period=FQ0)")] = 1.0e9
+    fake.values[("AAA.N", "TR.SharesOutstanding")] = 7.0e8
+    p = _provider(rics={"AAA": "AAA.N"})
+    df = p.get_fundamentals(["AAA"], AS_OF)
+    assert df.loc["AAA", F.REVENUE_LAST_Q] == pytest.approx(1.0e9)
+    assert math.isnan(df.loc["AAA", F.SHARES_OUTSTANDING])  # from the second row: not combined into the first
+    assert any("several rows" in w and "AAA.N" in w for w in p.warnings)
+
+
+def test_dropped_field_is_not_rerequested_for_later_chunks(fake):
+    """Regression: every chunk re-probed every field after LSEG dropped one."""
+    rics = {f"T{i}": f"T{i}.N" for i in range(4)}
+    for r in rics.values():
+        fake.values[(r, "TR.RevenueActValue(Period=FQ0)")] = 1.0
+    p = _provider(rics=rics)
+    p.max_points = 2  # 2 codes per request -> one RIC per chunk
+    df = p.get_fundamentals(list(rics), AS_OF)
+    assert (df[F.REVENUE_LAST_Q] == 1.0).all() and df[F.SHARES_OUTSTANDING].isna().all()
+    with_shares = [c for c in fake.call_list("get_data") if "TR.SharesOutstanding" in c["fields"]]
+    assert len(with_shares) == 2  # the first chunk's batch request and its single-field retry only
+    later = [c for c in fake.call_list("get_data") if c["universe"] in (["T1.N"], ["T2.N"], ["T3.N"])]
+    assert [c["fields"] for c in later] == [["TR.RevenueActValue(Period=FQ0)"]] * 3
+
+
+@pytest.mark.parametrize("ticker, ric", [("BRK.B", None), ("BRK-B", None), ("brk.b", None), ("BRK.A", None),
+                                         ("MOG.A", None), ("ABCD.U", None), ("IBM.N", "IBM.N"), ("SPY.P", "SPY.P"),
+                                         ("AAPL.O", "AAPL.O"), (".SPX", ".SPX"), ("XYZ.N^K20", "XYZ.N^K20"),
+                                         ("IBM", None), ("A.B.C", None)])
+def test_ric_for_accepts_only_ric_shaped_strings(fake, ticker, ric):
+    """Regression: any ticker containing '.' (e.g. share class 'BRK.B') was sent to LSEG as a RIC."""
+    assert _provider().ric_for(ticker) == ric
+
+
+def test_dotted_share_class_ticker_is_dropped_and_flagged(fake):
+    p = _provider()
+    out = p.get_fundamentals(["BRK.B"], AS_OF)
+    assert out.loc["BRK.B"].isna().all()
+    assert any("no RIC for 1 ticker(s) (BRK.B)" in w for w in p.warnings)
+    assert not [c for c in fake.call_list("get_data") if c["universe"] == ["BRK.B"]]
+    assert _provider(rics={"BRK.B": "BRKb.N"}).ric_for("BRK.B") == "BRKb.N"
+    assert _provider(fieldmap={"symbology": {"ric_suffixes": ["L"]}}).ric_for("VOD.L") == "VOD.L"
+
+
+def _broken_history(fake: FakeLD, message: str) -> list[str]:
+    def boom(universe, fields, interval="daily", start=None, end=None, adjustments=None, count=None):
+        fake.calls.append(("get_history", {"universe": list(universe), "fields": list(fields)}))
+        raise RuntimeError(message)
+
+    fake.get_history = boom
+    return [f"T{i}" for i in range(500)]
+
+
+def test_history_circuit_breaker_bounds_per_ric_retries(fake):
+    """Regression: a systemic history failure turned N/50 requests into N + N/50."""
+    tickers = _broken_history(fake, "backend unavailable for this request")
+    p = _provider(rics={t: f"{t}.N" for t in tickers})
+    with pytest.raises(ProviderError, match="No LSEG price history"):
+        p.get_price_history(tickers, date(2026, 9, 1), AS_OF)
+    main = [c for c in fake.call_list("get_history") if c["universe"] != ["IBM.N"]]
+    assert len(main) == 10 + 3  # 10 batches + 3 identical single-RIC failures, then the breaker trips
+    assert any("circuit breaker tripped" in w for w in p.warnings)
+
+
+@pytest.mark.parametrize("message", ["session expired", "401 Unauthorized", "Daily quota exceeded"])
+def test_systemic_errors_stop_at_once(fake, message):
+    tickers = _broken_history(fake, message)
+    p = _provider(rics={t: f"{t}.N" for t in tickers})
+    with pytest.raises(ProviderError, match="not retried"):
+        p.get_price_history(tickers, date(2026, 9, 1), AS_OF)
+    assert len(fake.call_list("get_history")) == 1
+    n = len(fake.call_list("get_data"))
+    fake.get_data = lambda *a, **k: (_ for _ in ()).throw(RuntimeError(message))
+    with pytest.raises(ProviderError, match="not retried"):  # a preflight does not swallow (and memoise) it
+        _provider(rics={"AAA": "AAA.N"}, ld_module=fake).get_fundamentals(["AAA"], AS_OF)
+    assert len(fake.call_list("get_data")) == n
+
+
+def test_throttling_backs_off_exponentially(fake):
+    _history(fake, "IBM.N", 250.0)
+    _history(fake, "AAA.N", 10.0)
+    orig, state = fake.get_history, {"n": 0}
+
+    def flaky(*a, **k):
+        state["n"] += 1
+        if state["n"] <= 2:
+            raise RuntimeError("HTTP 429 Too Many Requests")
+        return orig(*a, **k)
+
+    fake.get_history = flaky
+    p = _provider(rics={"AAA": "AAA.N"})
+    slept: list[float] = []
+    p._sleep = slept.append
+    panel = p.get_price_history(["AAA"], date(2026, 9, 1), AS_OF)
+    assert panel.close["AAA"].iloc[-1] == 19.0
+    assert slept == [1.0, 2.0]
+    state["n"] = -100  # always throttled from now on
+    fake.get_history = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("429 Too Many Requests"))
+    q = _provider(rics={"AAA": "AAA.N"}, ld_module=fake)
+    q._sleep = slept.append
+    with pytest.raises(ProviderError, match="still throttled after 3 retries"):
+        q.get_price_history(["AAA"], date(2026, 9, 1), AS_OF)
+
+
+def test_daily_request_cap(fake):
+    fake.values[("AAA.N", "TR.RevenueActValue(Period=FQ0)")] = 1.0
+    p = _provider(rics={"AAA": "AAA.N"}, daily_request_cap=2)
+    with pytest.raises(ProviderError, match="daily request cap reached"):
+        p.get_fundamentals(["AAA"], AS_OF)
+    assert p.request_count == 2 and len(fake.call_list("get_data")) == 2
+    day = {"d": TODAY}
+    q = LSEGProvider(today=lambda: day["d"], ld_module=fake, rics={"AAA": "AAA.N"}, daily_request_cap=50)
+    q.request_pause_s = 0.0
+    q.get_fundamentals(["AAA"], AS_OF)
+    used = q.request_count
+    assert 0 < used < 50
+    day["d"] = date(2026, 10, 3)
+    q.get_fundamentals(["AAA"], AS_OF)
+    assert q.request_count <= used  # the counter restarts each day
+
+
+def test_news_is_paced_counted_and_tagged_with_the_session_licence(fake):
+    """Regression: get_story calls went out as an unpaced burst; desktop content was tagged L3."""
+    hl = pd.DataFrame({"headline": ["a", "b", "c"], "storyId": ["s1", "s2", "s3"]},
+                      index=pd.DatetimeIndex(["2026-09-20", "2026-09-21", "2026-09-22"], name="versionCreated"))
+    fake.headlines["R:IBM.N"] = hl
+    fake.stories.update({"s1": "one", "s2": "two", "s3": "three"})
+    p = _provider(rics={"IBM": "IBM.N"})
+    p.request_pause_s = 0.25
+    slept: list[float] = []
+    p._sleep = slept.append
+    docs = p.get_documents("IBM", {DocumentKind.NEWS}, date(2026, 9, 1), AS_OF, limit=3)
+    assert len(docs) == 3 and slept == [0.25] * 3  # one pause before each story request
+    assert p.request_count == 4  # 1 headline request + 3 stories
+    assert all(d.metadata["licence_class"] == "L3" and d.metadata["session"] == "platform.ldp" for d in docs)
+    d = _provider(rics={"IBM": "IBM.N"}, session_name="desktop.workspace")
+    ddocs = d.get_documents("IBM", {DocumentKind.NEWS}, date(2026, 9, 1), AS_OF, limit=3)
+    assert ddocs and all(x.metadata["licence_class"] == "L4" and x.metadata["session"] == "desktop.workspace"
+                         for x in ddocs)

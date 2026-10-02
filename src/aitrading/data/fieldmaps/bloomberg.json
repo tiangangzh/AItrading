@@ -4,7 +4,7 @@
   "version": "2026-10-02",
   "source": "docs/VENDOR_REFERENCE.md section 1 (Bloomberg: 1.1 entry points, 1.2 push-down grammar, 1.3 field map) and section 4; ADR-001 grafts 1-4. Statuses are copied from table 1.3; an entry not in that table says where it comes from in 'notes'. Template placeholders: {as_of} = absolute ISO as-of date; {d<N>} = as_of minus N calendar days; {as_of_1y} = as_of minus one calendar year; {start}/{end} = history window; {benchmark} = benchmark security. Every date is absolute (ADR graft 4: never '0D').",
   "status_meaning": {
-    "confirmed": "Seen in vendor-authored code or docs in the form shown. May be compiled; still needs a field_validation_log entry (gate G5, see BloombergProvider.verify_fields) before production use as a filter predicate.",
+    "confirmed": "Seen in vendor-authored code or docs in the form shown. May be compiled; pushed as a filter predicate only once admitted (gate G5: a field_validation_log entry from BloombergProvider.verify_fields, then admitted=true - see 'admission').",
     "corrected": "Verified only in the form shown here. Use exactly this form; parts listed under 'verify' stay configurable.",
     "unverifiable": "Could not be confirmed. Configurable only, never hard-coded; preflighted on test_security before use; a failure suspends the leg (LEG NOT EVALUATED); never pushed as a BQL threshold."
   },
@@ -38,7 +38,7 @@
     "probe": {
       "expression": "cur_mkt_cap(currency='USD', dates='{as_of}', fill='prev')",
       "status": "confirmed",
-      "notes": "Item placed in get() when no feature condition is pushed (get and for are mandatory). get() never filters."
+      "notes": "Item placed in get() when no feature condition is pushed (get and for are mandatory; get() never filters). Also the single item of the first get_universe tranche: it returns the universe ids, and the label items are then requested for those ids in batch_size chunks (ADR risk table: BQL capacity)."
     }
   },
 

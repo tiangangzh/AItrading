@@ -33,7 +33,7 @@ aitrading = "aitrading.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-aitrading = ["data/universes/*.csv"]
+aitrading = ["data/universes/*.csv", "data/fieldmaps/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

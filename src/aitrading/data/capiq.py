@@ -14,8 +14,11 @@ constituents via ``index='^SPX'`` (GDSHV with the field map's ``universe.constit
 ``ProviderError`` explaining the options. Canonical tickers map to CapIQ identifiers with the field
 map's template (``'IBM'`` -> ``'IBM:'``, ``'BRK-B'`` -> ``'BRK.B:'``); ``identifiers={ticker: 'IBM:NYSE'
 | 'IQ<id>'}`` is the maintained symbology table (ADR graft 6) that pins listings. Constituents that
-cannot be mapped to a ticker are dropped and flagged. Every security is labelled ``common_stock``
-(no verified GDS security-type item) and a warning says ADRs / REITs are not excluded.
+cannot be mapped to a ticker are dropped and flagged. No GDS security-type item is verified, so
+``security_type`` is NaN and a ``UniverseSpec.security_types`` filter is reported ``LEG NOT EVALUATED``:
+no label is ever assumed (NaN never passes). A caller who has checked the list may assert a label with
+an explicit field-map override (``{"raw": {"universe": {"security_type": {"available": null, "assume":
+"common_stock"}}}}``), which is recorded in the field-map digest and warned about on every use.
 
 Transport (plain HTTPS through ``httpx``; no vendor SDK)
 -------------------------------------------------------
@@ -58,12 +61,40 @@ argument (see :mod:`aitrading.data.fieldmaps`; ``null`` deletes a key). Sections
 * ``benchmark``, ``universe.constituents``, ``identifiers``, ``api``, ``documents``.
 
 Rules applied: ``unverifiable`` mnemonics are preflighted alone on ``test_identifier`` (cached per day)
-before any bulk use, and a failure suspends the leg (NaN plus a ``LEG NOT EVALUATED`` warning).
-``units_verified: false`` entries are served converted with a warning (``strict_units=True``
-withholds them). Missing values are NaN, never 0: an ``ErrMsg``, an empty row, a placeholder such as
-``Data Unavailable`` / ``NM`` or any non-numeric value in a numeric column. For an ``as_of`` older
-than ``snapshot_staleness_days``, numeric items without an as-of property are blanked (no look-ahead)
-and a warning notes that ``asOfDate`` point-in-time behaviour is UNVERIFIED for GDS.
+before any bulk use, and a failure suspends the leg (NaN plus a ``LEG NOT EVALUATED`` warning). A
+column with no usable value for any requested name (ErrMsg, placeholder, non-numeric, implausible or
+unmapped label, whatever the cause) also gets a ``LEG NOT EVALUATED`` banner (ADR graft 3). Missing
+values are NaN, never 0: an ``ErrMsg``, an empty row, a placeholder such as ``Data Unavailable`` / ``NM``
+or any non-numeric value in a numeric column.
+
+Admission (gate G5) and thresholds: ``units_verified: false`` entries are served converted (default
+``strict_units=False``, an explicit G5 override recorded in ``warnings`` as ``G5 OVERRIDE``;
+``strict_units=True`` withholds them; ``"admitted": true`` counts as unit-verified). Every served
+canonical column that may not be used as a threshold or filter yet - unverified units, an
+``unverifiable`` item, or a lagged value while the as-of property is unadmitted - is listed in
+``provider.unverified_columns`` (column -> value-free reason) so a consumer can use it as a z-score only
+(ADR graft 1). CapIQ's sector / industry classification is mapped to GICS names only (other labels are
+NaN) and, while unadmitted, ``UniverseSpec.exclude_sectors`` is not pre-applied by the adapter. Daily
+volume (millions assumed, split adjustment UNVERIFIED) is blanked per ticker when the median shares,
+the median dollar volume or - with a cached market cap - the median daily turnover is implausible.
+
+Point in time: the GDSP as-of property (``api.as_of_property``, ``asOfDate``) is an unverifiable part
+with its own admission flag. An ``as_of`` before the latest completed session (the last weekday before
+today) minus ``snapshot_staleness_days`` (default 0) is historical: numeric and date point items without
+the property are blanked, and those with it are suspended too until the property is admitted (no
+look-ahead in a backtest). A lagged item (the property anchored at another date, e.g. the 3-month-ago
+estimates) is served before admission only when a lag check on ``test_identifier`` shows its value
+differing from the ``as_of`` value, and is suspended at serve time when it equals the ``as_of`` value for
+every name (a property GDS ignores would fabricate a zero revision). ``verify_fields(as_of=...)``
+includes an ``api.as_of_property`` check that supplies the admission evidence.
+
+Warnings are value-free
+-----------------------
+``provider.warnings`` is copied into the run result and can reach an external model (e.g. a backtest
+interpretation), while CIQ GDS values are licence class L3 (ranks and booleans only). Warnings
+therefore carry counts, field-map paths, mnemonics and vendor error texts, never a vendor value.
+Per-security detail lines with the offending vendor values go to ``provider.details`` (for an
+operator at the console; not meant to be persisted or sent to a model).
 
 Not available from S&P (VENDOR_REFERENCE 3.3)
 ---------------------------------------------
@@ -93,9 +124,17 @@ Licensing boundary (ADR section 7)
 Default: ``deny_all_text('capiq', note=BOUNDARY_NOTE)`` with ``allow_numeric_features=False``. CIQ GDS
 values are licence class L3 (enterprise data, AI use unconfirmed: only ranks and booleans may reach
 an external model until gate **G3**); Kensho transcripts are L1 pending gate **G2**. Widen it only with
-an explicit ``boundary=DataBoundary(provider='capiq', ...)`` whose ``note`` names the gate: ``G2`` to
-permit TRANSCRIPT text, ``G3`` to permit numeric features or other document kinds. A widened boundary
-whose note does not cite its gate raises ``ValueError`` (a policy row without a citation is a deny).
+an explicit ``boundary=DataBoundary(provider='capiq', ...)`` whose ``note`` is a structured policy-table
+citation, one clause per gate (clauses start the note or follow ``;`` / a newline)::
+
+    G2: <written S&P confirmation reference>, <YYYY-MM-DD>, reviewed by <lawyer>
+    G3: <written S&P AI-use confirmation reference>, <YYYY-MM-DD>, reviewed by <lawyer>
+
+``G2`` permits TRANSCRIPT text; ``G3`` permits numeric features or other document kinds. A clause that
+still holds a ``<placeholder>``, says the confirmation is pending / not received, has no date on or
+before today or names no reviewer is not a citation, and the boundary raises ``ValueError`` (a policy
+row without a citation evaluates as deny). Note that ``DataBoundary`` defaults
+``allow_numeric_features=True``: a transcripts-only boundary must pass ``allow_numeric_features=False``.
 Broker research (L6) can never be permitted.
 """
 
@@ -103,6 +142,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import inspect
 import json
 import math
 import os
@@ -134,6 +174,7 @@ __all__ = [
     "validate_fieldmap",
     "kensho_client_from_env",
     "parse_transcript",
+    "citation_problem",
     "is_identifier",
     "identifier_to_ticker",
     "ticker_to_identifier",
@@ -141,6 +182,7 @@ __all__ = [
     "FIELDMAP_ENV",
     "DEFAULT_BASE_URL",
     "BOUNDARY_NOTE",
+    "G2_BOUNDARY_TEMPLATE",
     "CREDENTIALS_MISSING",
     "KENSHO_MISSING",
 ]
@@ -149,14 +191,20 @@ VENDOR = "capiq"
 FIELDMAP_ENV = env_var(VENDOR)  # AITRADING_FIELDMAP_CAPIQ
 DEFAULT_BASE_URL = "https://api-ciq.marketintelligence.spglobal.com/gdsapi/rest"  # VENDOR_REFERENCE 3.1
 
+# The one template for a transcripts-only (G2) boundary: BOUNDARY_NOTE and diagnostics() both quote it, so the setup
+# guidance cannot drift from what _resolve_boundary accepts (fill in the <placeholders>).
+G2_BOUNDARY_TEMPLATE = (
+    "boundary=DataBoundary(provider='capiq', allowed_document_kinds={DocumentKind.TRANSCRIPT}, "
+    "allow_numeric_features=False, note='G2: <confirmation reference>, <YYYY-MM-DD>, reviewed by <lawyer>')"
+)
 BOUNDARY_NOTE = (
     "S&P Capital IQ GDS values are licence class L3 (enterprise data, AI use unconfirmed): only ranks and booleans "
     "may reach an external model until gate G3 (written S&P AI-use confirmation for the dataset). Kensho LLM-ready "
     "API transcripts and line items are licence class L1 pending gate G2 (written S&P confirmation that Kensho data "
     "and transcripts may be processed by Anthropic for inference, with log retention and internal memo "
     "distribution). Until then no S&P text or values reach Claude. Widen only with an explicit "
-    "boundary=DataBoundary(provider='capiq', allowed_document_kinds={DocumentKind.TRANSCRIPT}, "
-    "note='G2: <S&P confirmation reference>') and/or allow_numeric_features=True with a note citing G3."
+    f"{G2_BOUNDARY_TEMPLATE}, "
+    "and allow_numeric_features=True only with a 'G3: ...' clause of the same form."
 )
 CREDENTIALS_MISSING = (
     "S&P Capital IQ GDS API credentials are not set: export {user_env} and {pw_env} (the API username and password "
@@ -186,8 +234,23 @@ KINDS = ("number", "label", "date")
 DERIVE_ARITY = {"multiply": 2, "divide": 2, "divide_by_one_plus": 2, "reciprocal": 1}
 PROBE_DAYS = 10  # history window used to preflight / verify a history mnemonic
 
-_GATE_G2 = re.compile(r"\bG2\b")
-_GATE_G3 = re.compile(r"\bG3\b")
+# A widened boundary's note is a policy-table citation (ADR section 7), one clause per gate:
+# "G2: <reference>, <YYYY-MM-DD>, reviewed by <lawyer>" (clauses start the note or follow ';' / a newline).
+_CLAUSE_RE = re.compile(r"(?:^|[;\n])\s*(G\d)\s*:", re.IGNORECASE)
+_CITATION_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_CITATION_REVIEWER_RE = re.compile(r"\breview(?:ed\s+by|er\s*:)\s*[A-Za-z]", re.IGNORECASE)
+# A clause body that opens by negating itself ("none", "n/a", "no confirmation yet", "not received"). A bare "no" /
+# "not" followed by anything other than whitespace and a word ("No. 2026-117 letter") is a reference, not a negation.
+_CITATION_NOT_YET_START_RE = re.compile(
+    r"^(?:none\b|n/?a\b|\?|request\b|no\s+[a-z]|not\s+[a-z]|\(?\s*placeholder)", re.IGNORECASE)
+# "Not yet received" vocabulary anywhere in the clause body (word boundaries, so "requested" mid-clause or an
+# "(unsigned draft)" letter is caught, while "reviewed by" / "to be processed by Anthropic" are not).
+_CITATION_NOT_RECEIVED_RE = re.compile(
+    r"\b(?:pending|awaiting|requested|requesting|draft|drafts|unsigned|outstanding|tbd|todo|placeholder|"
+    r"in\s+progress|under\s+(?:review|negotiation|discussion)|"
+    r"not\s+(?:yet\s+)?(?:been\s+)?(?:received|signed|countersigned|confirmed|obtained|granted|issued|final)|"
+    r"to\s+be\s+(?:confirmed|received|signed|countersigned|obtained|granted|issued|provided|agreed|reviewed))\b|\?\?",
+    re.IGNORECASE)
 _LIMIT_RE = re.compile(r"limit.*exceed|exceed.*limit", re.IGNORECASE)
 _TICKER_EXCH_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9.\-/&]*):([A-Za-z0-9 .\-]*)$")
 _ID_PATTERNS = (
@@ -322,17 +385,97 @@ def _attr(obj: Any, *names: str) -> Any:
 
 
 def _call_kw(fn: Any, **kwargs: Any) -> Any:
-    """Call ``fn`` with keyword arguments, falling back to positional ones for a different signature."""
+    """Call ``fn`` once: with keyword arguments when its signature accepts them, else positionally.
+
+    The signature is inspected *before* the call, so a ``TypeError`` raised inside a vendor method never
+    triggers a second (billable) call.
+    """
     try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):  # builtins / C extensions: no introspectable signature
         return fn(**kwargs)
-    except TypeError as e:
-        if "argument" not in str(e):
-            raise
+    try:
+        sig.bind(**kwargs)
+    except TypeError:
         return fn(*kwargs.values())
+    return fn(**kwargs)
 
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _safe_token(raw: Any) -> str:
+    """A vendor string safe to quote in a warning (short, no digits), else a neutral description.
+
+    Warnings may reach an external model, so no vendor *value* is ever quoted; placeholders such as
+    ``'NM'`` or ``'abc'`` are harmless and useful for diagnosis.
+    """
+    s = str(raw).strip()
+    if s and len(s) <= 24 and not re.search(r"\d", s):
+        return repr(s)
+    return "value (withheld from warnings; see provider.details)"
+
+
+def _last_session(today: date) -> date:
+    """Latest completed trading session as seen on ``today``: the last weekday strictly before it."""
+    d = today - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def _units_verified(e: Mapping[str, Any]) -> bool:
+    """False only for ``units_verified: false`` entries not yet ``admitted: true`` (gate G5)."""
+    return e.get("units_verified") is not False or e.get("admitted") is True
+
+
+def _gate_clauses(note: str) -> dict[str, list[str]]:
+    """``{'G2': [body, ...], ...}`` for every ``G<n>:`` clause of a boundary note."""
+    text = note or ""
+    marks = list(_CLAUSE_RE.finditer(text))
+    out: dict[str, list[str]] = {}
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        out.setdefault(m.group(1).upper(), []).append(text[m.end():end].strip())
+    return out
+
+
+def _citation_body_problem(body: str, today: date) -> str | None:
+    if not body:
+        return "the citation is empty"
+    if "<" in body or ">" in body:
+        return "the citation still contains a <placeholder>"
+    if _CITATION_NOT_YET_START_RE.match(body) or _CITATION_NOT_RECEIVED_RE.search(body):
+        return "the citation says the confirmation has not been received"
+    dates: list[date] = []
+    for y, mo, d in _CITATION_DATE_RE.findall(body):
+        try:
+            dates.append(date(int(y), int(mo), int(d)))
+        except ValueError:
+            continue
+    if not any(d <= today for d in dates):
+        return "the citation must give the confirmation date as YYYY-MM-DD (not in the future)"
+    if not _CITATION_REVIEWER_RE.search(body):
+        return "the citation must name the reviewing lawyer ('reviewed by <name>')"
+    return None
+
+
+def citation_problem(note: str, gate: str, today: date | None = None) -> str | None:
+    """None when ``note`` holds a valid ``<gate>: <reference>, <YYYY-MM-DD>, reviewed by <lawyer>`` clause.
+
+    Otherwise a human-readable reason. A bare gate token anywhere in the note ("pending G2", "until gate
+    G3") is not a citation: the clause must start the note or follow ``;`` / a newline.
+    """
+    gate = gate.strip().upper()
+    bodies = _gate_clauses(note).get(gate)
+    if not bodies:
+        return (f"the note must contain a clause starting with '{gate}:' that cites the written confirmation "
+                f"('{gate}: <reference>, <YYYY-MM-DD>, reviewed by <lawyer>')")
+    problems = [_citation_body_problem(b, today or date.today()) for b in bodies]
+    if any(p is None for p in problems):
+        return None
+    return f"{gate}: {problems[0]}"
 
 
 # =============================================================================================
@@ -456,8 +599,18 @@ def _segments_from_payload(payload: Any, depth: int = 0) -> list[TranscriptSegme
     return _segments_from_payload(inner, depth + 1) if inner is not None and inner is not payload else []
 
 
+def _key_matches(key: Any, ident: str) -> bool:
+    """True when a result key names ``ident`` (``'SPGI'``, ``'spgi'``, ``'SPGI:NYSE'``, ``'SPGI US'``)."""
+    k, i = str(key).strip().upper(), str(ident).strip().upper()
+    return bool(k) and (k == i or re.split(r"[:\s]", k, maxsplit=1)[0] == i)
+
+
 def _find_earnings(obj: Any, ident: str, depth: int = 0) -> Any:
-    """The latest-earnings record (anything with a ``key_dev_id``) inside a Kensho tool result."""
+    """The latest-earnings record (anything with a ``key_dev_id``) inside a Kensho tool result.
+
+    A result keyed by identifier is read only under ``ident``'s key: a record filed under another
+    identifier (an upper-case key that does not match) is never taken for this company's call.
+    """
     if obj is None or depth > 5:
         return None
     if isinstance(obj, (list, tuple)):
@@ -472,7 +625,7 @@ def _find_earnings(obj: Any, ident: str, depth: int = 0) -> Any:
     if not isinstance(m, Mapping):
         return None
     for k, v in m.items():
-        if str(k).strip().upper() == ident.strip().upper():
+        if _key_matches(k, ident):
             return _find_earnings(v, ident, depth + 1)
     for k in ("results", "result", "data", "latest_earnings", "earnings"):
         if k in m:
@@ -480,7 +633,9 @@ def _find_earnings(obj: Any, ident: str, depth: int = 0) -> Any:
             if r is not None:
                 return r
     if len(m) == 1:
-        return _find_earnings(next(iter(m.values())), ident, depth + 1)
+        key = str(next(iter(m)))
+        if key != key.upper():  # a wrapper field name (snake_case), not another company's identifier
+            return _find_earnings(next(iter(m.values())), ident, depth + 1)
     return None
 
 
@@ -537,10 +692,11 @@ def _entry_errors(path: str, e: Any, scale_key: str, columns: Mapping[str, Any] 
     for key in ("to_canonical", "to_catalog"):
         if key in e and (not _is_number(e[key]) or float(e[key]) == 0):
             errs.append(f"{path}.{key} must be a non-zero number")
-    if "plausible" in e:
-        p = e["plausible"]
-        if not (isinstance(p, (list, tuple)) and len(p) == 2 and all(_is_number(x) for x in p) and p[0] <= p[1]):
-            errs.append(f"{path}.plausible must be [low, high] numbers with low <= high")
+    for key in ("plausible", "plausible_dollar_volume", "plausible_turnover"):
+        if key in e:
+            p = e[key]
+            if not (isinstance(p, (list, tuple)) and len(p) == 2 and all(_is_number(x) for x in p) and p[0] <= p[1]):
+                errs.append(f"{path}.{key} must be [low, high] numbers with low <= high")
     if "value_map" in e and not isinstance(e["value_map"], Mapping):
         errs.append(f"{path}.value_map must be an object")
     if e.get("derive") is not None:
@@ -584,6 +740,13 @@ def validate_fieldmap(fm: Mapping[str, Any]) -> list[str]:
         v = _value(api.get(key))
         if v is not None and (not _is_number(v) or float(v) < 1):
             errs.append(f"api.{key}.value must be a number >= 1")
+    aop = api.get("as_of_property")
+    if aop is not None:
+        if not isinstance(aop, Mapping) or not isinstance(aop.get("value"), str) or not aop.get("value"):
+            errs.append("api.as_of_property.value (the GDS as-of property name, e.g. 'asOfDate') is required")
+        elif aop.get("probe") is not None and not (isinstance(aop["probe"], Mapping) and isinstance(aop["probe"].get("mnemonic"), str)
+                                                   and isinstance(aop["probe"].get("properties", {}), Mapping)):
+            errs.append("api.as_of_property.probe needs a mnemonic (and optional properties object)")
     raw = fm.get("raw") or {}
     if not isinstance(raw, Mapping):
         errs.append("raw must be an object")
@@ -623,6 +786,8 @@ def validate_fieldmap(fm: Mapping[str, Any]) -> list[str]:
     if cons is not None:
         if not isinstance(cons, Mapping) or not cons.get("mnemonic") or cons.get("function") not in GDS_FUNCTIONS:
             errs.append("universe.constituents needs mnemonic and a GDS function")
+        elif cons.get("end_messages") is not None and not isinstance(cons["end_messages"], list):
+            errs.append("universe.constituents.end_messages must be a list of vendor messages")
     bm = fm.get("benchmark")
     if bm is not None and (not isinstance(bm, Mapping) or not bm.get("identifier") or not bm.get("mnemonic")):
         errs.append("benchmark needs identifier and mnemonic")
@@ -689,15 +854,27 @@ class _Leg:
     units_verified: bool = True
     unit: str = ""
     status: str = "unverifiable"
-    as_of_capable: bool = False
+    as_of_capable: bool = False  # the as-of property (api.as_of_property, 'asOfDate') holds an {as_of...} template
+    lagged: bool = False  # ... rendered to a date other than as_of (e.g. {as_of_3m}: the 3-month-ago estimates)
+    as_of_date: str = ""  # the rendered as-of property value ('' when the leg has none)
+    twin_properties: dict[str, Any] | None = None  # lagged legs: the same request anchored at as_of instead
 
     def request(self, identifier: str, *, probe: bool = False) -> dict[str, Any]:
         props = self.probe_properties if probe else self.properties
         return {"function": self.function, "identifier": identifier, "mnemonic": self.mnemonic, "properties": dict(props)}
 
+    def twin_request(self, identifier: str) -> dict[str, Any]:
+        """The same item anchored at ``as_of`` (lagged legs only): the reference for the lag check."""
+        return {"function": self.function, "identifier": identifier, "mnemonic": self.mnemonic,
+                "properties": dict(self.twin_properties or self.properties)}
+
     @property
     def key(self) -> str:
         return json.dumps([self.function, self.mnemonic, self.properties], sort_keys=True, default=str)
+
+    @property
+    def twin_key(self) -> str:
+        return json.dumps([self.function, self.mnemonic, self.twin_properties or self.properties], sort_keys=True, default=str)
 
     @property
     def probe_key(self) -> str:
@@ -729,14 +906,15 @@ class CapIQProvider:
         identifiers: Mapping[str, str] | None = None,
         preflight: bool = True,
         strict_units: bool = False,
-        snapshot_staleness_days: int = 5,
+        snapshot_staleness_days: int = 0,
         timeout: float = 60.0,
         today: Any | None = None,
     ) -> None:
         """
         Args:
             boundary: licensing boundary; default denies all S&P text and numeric values (see module docs).
-                A widened boundary must have ``provider='capiq'`` and cite gate G2 (transcripts) / G3 (values).
+                A widened boundary must have ``provider='capiq'`` and a structured citation of gate G2
+                (transcripts) / G3 (values, other text): ``'G2: <reference>, <YYYY-MM-DD>, reviewed by <lawyer>'``.
             fieldmap: override merged over the default map and ``$AITRADING_FIELDMAP_CAPIQ`` (mapping or JSON path).
             username_env / password_env: environment variables holding the GDS API credentials.
             base_url: GDS REST root; ``None`` -> the field map's ``api.base_url`` (``DEFAULT_BASE_URL``,
@@ -746,9 +924,14 @@ class CapIQProvider:
             index: index identifier for constituents (``'^SPX'``; a bare ``'SPX'`` gets the ``^``).
             kensho: injected Kensho client (see module docs); transcripts also need a G2 boundary.
             identifiers: symbology table ``{ticker: CapIQ identifier}`` (``'IBM:NYSE'``, ``'IQ<id>'``).
-            preflight: preflight ``unverifiable`` mnemonics on ``test_identifier`` before bulk use.
-            strict_units: withhold ``units_verified: false`` entries (NaN) instead of serving them converted.
-            snapshot_staleness_days: an ``as_of`` older than this is historical (current-only items blanked).
+            preflight: preflight ``unverifiable`` mnemonics on ``test_identifier`` before bulk use (and lag-check
+                lagged items while the as-of property is unadmitted; with ``preflight=False`` those are suspended).
+            strict_units: withhold ``units_verified: false`` entries (NaN) instead of serving them converted. The
+                default ``False`` is an explicit G5 override: it is recorded in ``warnings`` and the affected
+                columns are listed in ``unverified_columns`` (z-scores only, never thresholds, until admitted).
+            snapshot_staleness_days: tolerance, in calendar days, before the latest completed session (the last
+                weekday before today); an ``as_of`` older than that is historical and current-only numeric
+                items are blanked. Default 0: only today or the latest completed session count as current.
             timeout: HTTP timeout in seconds.
             today: clock returning a ``date`` (tests).
         """
@@ -773,6 +956,12 @@ class CapIQProvider:
         self._date_index = int(row_cfg.get("date_index", 1))
         self._missing_values = {str(x).strip().lower() for x in (_value(api.get("missing_values"), []) or [])}
         self._entitlement_values = {str(x).strip().lower() for x in (_value(api.get("entitlement_values"), []) or [])}
+        aop = api.get("as_of_property") if isinstance(api.get("as_of_property"), Mapping) else {}
+        self.as_of_property: str = str(_value(aop, "asOfDate"))
+        # The as-of property is an unverifiable part (VENDOR_REFERENCE 3.3 lists asOfDate only for estimate revisions):
+        # until it is admitted (gate G5) a historical as_of suspends point values and lagged legs are lag-checked.
+        self.as_of_admitted: bool = aop.get("admitted") is True
+        self._as_of_probe: Mapping[str, Any] = aop.get("probe") if isinstance(aop.get("probe"), Mapping) else {}
         self.test_identifier: str = str(self.fieldmap["test_identifier"])
         ident_cfg = self.fieldmap.get("identifiers") or {}
         self._template = str(_value(ident_cfg.get("ticker_template"), "{ticker}:"))
@@ -783,7 +972,11 @@ class CapIQProvider:
         self._today = today or date.today
         self.kensho = kensho
         self.index: str | None = self._index_identifier(index) if index else None
-        self.warnings: list[str] = []
+        self.warnings: list[str] = []  # value-free (may reach an external model via the run result)
+        self.details: list[str] = []  # per-security lines with vendor values: console only, never persisted
+        # canonical column -> why it may not be used as a threshold / filter yet (gate G5): unverified units, an
+        # unverifiable item or an unadmitted as-of property. Built from what was actually served (value-free).
+        self.unverified_columns: dict[str, str] = {}
         self.query_log: list[str] = []  # every request body sent (GDS JSON, Kensho calls), verbatim
         self.http_calls = 0  # data calls (POST clientservice), excluding auth
         self.auth_calls = 0
@@ -836,21 +1029,41 @@ class CapIQProvider:
         if msg not in self.warnings:
             self.warnings.append(msg)
 
+    _MAX_DETAILS = 5000
+
+    def _detail(self, msg: str) -> None:
+        """A per-security line that may quote vendor values (console only; see the module docs)."""
+        if len(self.details) < self._MAX_DETAILS and msg not in self.details:
+            self.details.append(msg)
+
     def _roll_day(self) -> None:
         d = self._today()
         if d != self._counter_day:
             self._counter_day, self.requests_today = d, 0
 
     def _is_historical(self, as_of: date) -> bool:
-        return as_of < self._today() - timedelta(days=self.snapshot_staleness_days)
+        """True when ``as_of`` is before the latest completed session minus ``snapshot_staleness_days``.
+
+        GDSP returns current values unless an as-of property anchors them, so current-only items are
+        served only for today or the latest completed session (no look-ahead into a past run)."""
+        return as_of < _last_session(self._today()) - timedelta(days=self.snapshot_staleness_days)
 
     def _note_historical(self, as_of: date) -> None:
-        if self._is_historical(as_of) and as_of not in self._historical_noted:
-            self._historical_noted.add(as_of)
-            self._warn(f"capiq: as_of {as_of} is historical: values are anchored with the asOfDate property, whose "
-                       "point-in-time behaviour on GDS is UNVERIFIED (VENDOR_REFERENCE 3.3 lists asOfDate only for "
-                       "estimate revisions) - check with verify_fields(as_of=...). Items without an as-of property are "
+        if not self._is_historical(as_of) or as_of in self._historical_noted:
+            return
+        self._historical_noted.add(as_of)
+        if self.as_of_admitted:
+            self._warn(f"capiq: as_of {as_of} is historical: point values are anchored with the {self.as_of_property} "
+                       "property (admitted in the field map, api.as_of_property). Items without an as-of property are "
                        "left blank rather than leaking current values.")
+        else:
+            self._warn(f"capiq: as_of {as_of} is historical and the {self.as_of_property} property is not admitted "
+                       "(api.as_of_property, gate G5): its point-in-time behaviour on GDS is UNVERIFIED (VENDOR_REFERENCE "
+                       "3.3 lists asOfDate only for estimate revisions), so every numeric and date point item is "
+                       "suspended (LEG NOT EVALUATED) rather than risk today's values in a past run. Run "
+                       "verify_fields(as_of=<past date>) - its api.as_of_property check must show the probe item "
+                       "changing between dates - record it in field_validation_log, then set "
+                       "{\"api\": {\"as_of_property\": {\"admitted\": true}}} in an override.")
 
     @staticmethod
     def _index_identifier(index: str) -> str:
@@ -880,19 +1093,27 @@ class CapIQProvider:
         kinds = set(boundary.allowed_document_kinds)
         if (boundary.allow_numeric_features or kinds) and note.strip() == BOUNDARY_NOTE:
             raise ValueError("BOUNDARY_NOTE describes the default deny state and is not a gate citation: a widened "
-                             "boundary's note must cite the written confirmation (e.g. 'G2: S&P letter 2026-xx-xx')")
+                             "boundary's note must cite the written confirmation "
+                             "('G2: <reference>, <YYYY-MM-DD>, reviewed by <lawyer>')")
         if DocumentKind.RESEARCH in kinds:
             raise ValueError("broker research is licence class L6 and never reaches an external model (and S&P offers "
                              "none via API): remove DocumentKind.RESEARCH from the boundary")
-        if DocumentKind.TRANSCRIPT in kinds and not _GATE_G2.search(note):
-            raise ValueError("a boundary that permits Kensho TRANSCRIPT text must cite gate G2 (written S&P confirmation "
-                             "that Kensho data and transcripts may be processed by Anthropic) in its note, e.g. "
-                             "note='G2: S&P letter 2026-xx-xx, reviewed by <lawyer>'; a policy row without a citation "
-                             "evaluates as deny")
-        if (boundary.allow_numeric_features or (kinds - {DocumentKind.TRANSCRIPT})) and not _GATE_G3.search(note):
-            raise ValueError("a boundary that permits S&P numeric values or other document text must cite gate G3 "
-                             "(written per-dataset AI-use confirmation; CIQ GDS is licence class L3) in its note; a "
-                             "policy row without a citation evaluates as deny")
+        today = self._today()
+        if DocumentKind.TRANSCRIPT in kinds:
+            problem = citation_problem(note, "G2", today)
+            if problem:
+                raise ValueError("a boundary that permits Kensho TRANSCRIPT text (licence class L1) must cite gate G2 "
+                                 "(written S&P confirmation that Kensho data and transcripts may be processed by "
+                                 f"Anthropic): {problem}. A policy row without a citation evaluates as deny.")
+        if boundary.allow_numeric_features or (kinds - {DocumentKind.TRANSCRIPT}):
+            problem = citation_problem(note, "G3", today)
+            if problem:
+                what = ("S&P numeric values (DataBoundary defaults allow_numeric_features=True: pass "
+                        "allow_numeric_features=False for a transcripts-only boundary)" if boundary.allow_numeric_features
+                        else "S&P document text other than transcripts")
+                raise ValueError(f"a boundary that permits {what} must cite gate G3 (written per-dataset AI-use "
+                                 f"confirmation; CIQ GDS is licence class L3): {problem}. A policy row without a "
+                                 "citation evaluates as deny.")
         return boundary
 
     def _fetchable(self, e: Any, *, ignore_units: bool = False) -> bool:
@@ -900,7 +1121,7 @@ class CapIQProvider:
         if not isinstance(e, Mapping) or e.get("available") is False or e.get("compute") is not None:
             return False
         if e.get("mnemonic"):
-            return ignore_units or not (self.strict_units and e.get("units_verified") is False)
+            return ignore_units or not (self.strict_units and not _units_verified(e))
         if e.get("derive") is not None:
             return all(self._fetchable(i, ignore_units=ignore_units)
                        for i in (e.get("inputs") or []) if isinstance(i, Mapping) and i.get("mnemonic"))
@@ -939,13 +1160,13 @@ class CapIQProvider:
             problems.append(self._credentials_message())
         if not self._tickers and not self.index:
             problems.append(self._no_universe_message())
-        if not self.base_url.lower().startswith("https://"):
-            problems.append(f"base_url {self.base_url!r} is not HTTPS: credentials and tokens would travel in clear text")
+        if not self._secure_transport():
+            problems.append(f"base_url {self.base_url!r} is not HTTPS: the adapter refuses to send credentials there")
         permits_tr = DocumentKind.TRANSCRIPT in self.boundary.allowed_document_kinds
         if self.kensho is not None and not permits_tr:
             problems.append("a Kensho client was injected but the boundary does not permit TRANSCRIPT text (licence class "
-                            "L1 pending gate G2), so transcripts are not fetched. After G2 pass boundary=DataBoundary("
-                            "provider='capiq', allowed_document_kinds={DocumentKind.TRANSCRIPT}, note='G2: <reference>').")
+                            f"L1 pending gate G2), so transcripts are not fetched. After G2 pass {G2_BOUNDARY_TEMPLATE} "
+                            "with the <placeholders> filled in from the written confirmation.")
         elif permits_tr and self.kensho is None:
             problems.append("the boundary permits transcripts but no Kensho client was injected: pass "
                             "kensho=kensho_client_from_env() (or another client exposing the documented methods).")
@@ -973,7 +1194,18 @@ class CapIQProvider:
             self._http = httpx.Client(transport=self._transport, timeout=self.timeout)
         return self._http
 
+    def _secure_transport(self) -> bool:
+        """HTTPS, or plain HTTP to the local machine only (a local test double / forwarding proxy)."""
+        try:
+            url = httpx.URL(self.base_url)
+        except Exception:  # noqa: BLE001 - an unparseable base_url is not secure
+            return False
+        return url.scheme == "https" or (url.scheme == "http" and url.host in ("localhost", "127.0.0.1", "::1"))
+
     def _authenticate(self) -> str:
+        if not self._secure_transport():
+            raise ProviderUnavailable(f"refusing to send S&P Capital IQ credentials to {self.base_url!r}: the GDS API "
+                                      "base_url must be HTTPS (plain HTTP is accepted only for localhost)")
         user, pw = os.environ.get(self.username_env), os.environ.get(self.password_env)
         if not user or not pw:
             raise ProviderUnavailable(self._credentials_message())
@@ -1142,6 +1374,11 @@ class CapIQProvider:
         probe = {str(k): _render(v, probe_ctx) for k, v in tmpl.items()} if probe_ctx is not None else dict(props)
         plaus = entry.get("plausible")
         scale = entry.get(scale_key)
+        aprop = self.as_of_property
+        a_tmpl = tmpl.get(aprop)
+        as_of_capable = isinstance(a_tmpl, str) and "{as_of" in a_tmpl
+        as_of_date = str(props.get(aprop, "")) if as_of_capable else ""
+        lagged = as_of_capable and "as_of" in ctx and as_of_date != str(ctx["as_of"])
         return _Leg(
             label=label,
             function=str(entry.get("function") or function),
@@ -1151,10 +1388,13 @@ class CapIQProvider:
             kind=str(entry.get("kind") or "number"),
             scale=float(scale) if scale is not None else 1.0,
             plausible=(float(plaus[0]), float(plaus[1])) if plaus else None,
-            units_verified=entry.get("units_verified") is not False,
+            units_verified=_units_verified(entry),
             unit=str(entry.get("unit") or ""),
             status=str(entry.get("status") or "unverifiable"),
-            as_of_capable=any(isinstance(v, str) and "{as_of" in v for v in tmpl.values()),
+            as_of_capable=as_of_capable,
+            lagged=lagged,
+            as_of_date=as_of_date,
+            twin_properties={**props, aprop: ctx["as_of"]} if lagged else None,
         )
 
     def _is_missing_text(self, v: Any) -> bool:
@@ -1184,27 +1424,35 @@ class CapIQProvider:
         return ts.normalize()
 
     def _convert(self, raw: Any, leg: _Leg, *, check_plausible: bool = True) -> tuple[Any, str | None]:
-        """Vendor value -> canonical value (or NaN / NaT) and an issue label (None when clean or plainly missing)."""
+        """Vendor value -> canonical value (or NaN / NaT) and an issue label (None when clean or plainly missing).
+
+        The issue label is value-free (it goes into ``warnings``); callers put the vendor value in ``details``.
+        """
         missing: Any = pd.NaT if leg.kind == "date" else math.nan
         if self._is_missing_text(raw):
             return missing, None
         if isinstance(raw, str) and raw.strip().lower() in self._entitlement_values:
-            return missing, f"not entitled ({raw.strip()})"
+            return missing, f"not entitled ({_safe_token(raw)})"
         if leg.kind == "label":
             return str(raw).strip(), None
         if leg.kind == "date":
             d = self._parse_date(raw)
-            return (d, None) if d is not pd.NaT else (pd.NaT, f"unparseable date {str(raw)[:20]!r}")
+            return (d, None) if d is not pd.NaT else (pd.NaT, "unparseable date")
         f = _to_float(raw)
         if math.isnan(f):
-            return math.nan, f"non-numeric {str(raw)[:20]!r}"
+            return math.nan, f"non-numeric {_safe_token(raw)}"
         c = f * leg.scale
         if check_plausible and leg.plausible and not (leg.plausible[0] <= c <= leg.plausible[1]):
-            return math.nan, f"implausible {c:.4g} outside [{leg.plausible[0]:g}, {leg.plausible[1]:g}] (scale or sign?)"
+            return math.nan, (f"implausible value outside [{leg.plausible[0]:g}, {leg.plausible[1]:g}] after "
+                              f"x{leg.scale:g} (scale or sign?)")
         return c, None
 
     def _probe_result(self, leg: _Leg, el: Mapping[str, Any]) -> tuple[bool, str, Any]:
-        """(ok, note, vendor value) for one probe element (preflight / verify_fields)."""
+        """(ok, note, vendor value) for one probe element (preflight / verify_fields).
+
+        A failure note is value-free (it ends up in ``warnings`` via ``_gate``); the vendor value travels only in the
+        returned tuple (``FieldCheck.returned_value`` for the admission log, ``details`` for the console).
+        """
         err = _errmsg(el)
         if err:
             return False, f"ErrMsg: {err}", None
@@ -1220,32 +1468,106 @@ class CapIQProvider:
             return False, "empty result (wrong mnemonic, missing entitlement or no data)", None
         value = vals[-1] if leg.function in HISTORY_FUNCTIONS else vals[0]
         if isinstance(value, str) and value.strip().lower() in self._entitlement_values:
-            return False, f"not entitled ({value.strip()})", value
+            return False, f"not entitled ({_safe_token(value)})", value
         if leg.kind == "number" and all(math.isnan(_to_float(v)) for v in vals):
-            return False, f"non-numeric value {str(value)[:30]!r}", value
-        return True, f"returned {str(value)[:30]!r}", value
+            return False, f"non-numeric {_safe_token(value)}", value
+        return True, "a value came back", value
 
     def _gate(self, legs: Iterable[_Leg], as_of: date) -> dict[str, str]:
-        """``leg.key -> reason`` for every leg that must NOT be used (preflights unverifiable legs, cached per day)."""
+        """``leg.key -> reason`` for every leg that must NOT be used (preflights unverifiable legs, cached per day).
+
+        Point-in-time rules (the as-of property, ``api.as_of_property``, is an unverifiable part until admitted):
+
+        * historical ``as_of``: a numeric / date point item without the as-of property is current-only and blanked;
+          with it, it is served only when the property is admitted (otherwise today's value could leak into a past
+          run if GDS ignores the property).
+        * a lagged item (as-of property rendered to another date, e.g. the 3-month-ago estimates) while the property
+          is not admitted: served only when a lag check on ``test_identifier`` shows the lagged value differing from
+          the value at ``as_of`` (a property GDS ignores would fabricate a zero revision). ``preflight=False``
+          disables the check, so such legs are suspended.
+        """
         reasons: dict[str, str] = {}
         hist = self._is_historical(as_of)
+        prop = self.as_of_property
         probe: dict[str, _Leg] = {}
+        lag: dict[str, _Leg] = {}
         for leg in legs:
             if leg.key in reasons:
                 continue
+            point_value = leg.function in POINT_FUNCTIONS and leg.kind != "label"
             if self.strict_units and not leg.units_verified:
                 reasons[leg.key] = f"units UNVERIFIED ({leg.unit or '?'}) and strict_units=True"
-            elif hist and leg.function in POINT_FUNCTIONS and leg.kind != "label" and not leg.as_of_capable:
+            elif hist and point_value and not leg.as_of_capable:
                 reasons[leg.key] = f"current-only item (no as-of property) for historical as_of {as_of}"
-            elif leg.status == "unverifiable" and self.preflight:
-                probe.setdefault(leg.key, leg)
+            elif hist and point_value and not self.as_of_admitted:
+                reasons[leg.key] = (f"historical as_of {as_of} needs the {prop} property, which is not admitted "
+                                    "(api.as_of_property, gate G5): today's value could leak into a past run")
+            elif point_value and leg.lagged and not self.as_of_admitted and not self.preflight:
+                reasons[leg.key] = (f"lagged value ({prop} {leg.as_of_date}) while the {prop} property is not admitted "
+                                    "and preflight=False, so the lag check cannot run")
+            else:
+                if point_value and leg.lagged and not self.as_of_admitted:
+                    lag.setdefault(leg.key, leg)
+                if leg.status == "unverifiable" and self.preflight:
+                    probe.setdefault(leg.key, leg)
         if probe:
             results = self._preflight(list(probe.values()))
             for key, leg in probe.items():
                 ok, note = results[leg.probe_key]
                 if not ok:
                     reasons[key] = f"preflight on {self.test_identifier} failed ({note})"
+        lag = {k: leg for k, leg in lag.items() if k not in reasons}
+        if lag:
+            results = self._lag_check(list(lag.values()))
+            for key, leg in lag.items():
+                ok, note = results[leg.probe_key]
+                if not ok:
+                    reasons[key] = f"lag check on {self.test_identifier} failed ({note})"
         return reasons
+
+    @staticmethod
+    def _same_value(a: Any, b: Any) -> bool:
+        fa, fb = _to_float(a), _to_float(b)
+        if not (math.isnan(fa) or math.isnan(fb)):
+            return bool(np.isclose(fa, fb, rtol=1e-12, atol=0.0))
+        return str(a).strip() == str(b).strip()
+
+    def _lag_check(self, legs: list[_Leg]) -> dict[str, tuple[bool, str]]:
+        """Lagged legs: does the value at the lagged as-of date differ from the value at ``as_of`` on the test
+        identifier? Identical values mean the as-of property is ignored (cached per day; the two requests usually
+        coincide with the legs' own preflights, so they cost nothing extra)."""
+        day = self._today()
+        out: dict[str, tuple[bool, str]] = {}
+        pending: dict[str, _Leg] = {}
+        for leg in legs:
+            cached = self._preflight_cache.get((day, "lag:" + leg.probe_key))
+            if cached is not None:
+                out[leg.probe_key] = cached
+            else:
+                pending.setdefault(leg.probe_key, leg)
+        if pending:
+            reqs: list[dict[str, Any]] = []
+            for leg in pending.values():
+                reqs += [leg.request(self.test_identifier, probe=True), leg.twin_request(self.test_identifier)]
+            els = self._execute(reqs)
+            for i, (pk, leg) in enumerate(pending.items()):
+                ok_l, note_l, v_l = self._probe_result(leg, els[2 * i])
+                ok_c, note_c, v_c = self._probe_result(leg, els[2 * i + 1])
+                prop = self.as_of_property
+                if not ok_l:
+                    res = (False, f"no lagged value: {note_l}")
+                elif not ok_c:
+                    res = (False, f"no value at as_of to compare the lagged value with: {note_c}")
+                elif self._same_value(v_l, v_c):
+                    res = (False, f"the value at {prop} {leg.as_of_date} equals the value at as_of, so GDS appears to "
+                                  f"ignore the {prop} property (a zero change would be fabricated)")
+                    self._detail(f"capiq lag check {leg.label} ({leg.mnemonic}) on {self.test_identifier}: "
+                                 f"{str(v_l)[:40]!r} at {leg.as_of_date} and at as_of")
+                else:
+                    res = (True, "the lagged value differs from the as_of value")
+                self._preflight_cache[(day, "lag:" + pk)] = res
+                out[pk] = res
+        return out
 
     def _preflight(self, legs: list[_Leg]) -> dict[str, tuple[bool, str]]:
         day = self._today()
@@ -1260,37 +1582,54 @@ class CapIQProvider:
         if pending:
             els = self._execute([leg.request(self.test_identifier, probe=True) for leg in pending.values()])
             for (pk, leg), el in zip(pending.items(), els):
-                ok, note, _ = self._probe_result(leg, el)
+                ok, note, value = self._probe_result(leg, el)
                 self._preflight_cache[(day, pk)] = (ok, note)
                 out[pk] = (ok, note)
+                if not ok and value is not None:
+                    self._detail(f"capiq preflight {leg.label} ({leg.mnemonic}) on {self.test_identifier}: {note}; "
+                                 f"vendor value {str(value)[:40]!r}")
         return out
 
-    def _leg_series(self, leg: _Leg, els: Mapping[str, Mapping[str, Any]], tickers: list[str]) -> pd.Series:
-        """Canonical values of one point leg for ``tickers`` (warns about errors / invalid values)."""
+    def _leg_series(self, leg: _Leg, els: Mapping[str, Mapping[str, Any]], tickers: list[str]) -> tuple[pd.Series, Counter[str]]:
+        """Canonical values of one point leg for ``tickers`` and the value-free issue counts.
+
+        Warns about partial errors / invalid values; a leg with no usable value at all is reported by the caller
+        as ``LEG NOT EVALUATED`` (whatever the cause: ErrMsg, placeholder, non-numeric or implausible values).
+        """
         vals: list[Any] = []
         issues: Counter[str] = Counter()
-        n_err = 0
         for t in tickers:
             el = els.get(t)
             err = _errmsg(el) if el is not None else "no response"
             if err:
-                n_err += 1
                 issues[f"ErrMsg {err[:60]!r}"] += 1
                 vals.append(pd.NaT if leg.kind == "date" else math.nan)
                 continue
             rows = _rows(el)
-            v, issue = self._convert(rows[0][0] if rows and rows[0] else None, leg)
+            raw = rows[0][0] if rows and rows[0] else None
+            v, issue = self._convert(raw, leg)
             if issue:
                 issues[issue] += 1
+                self._detail(f"capiq {leg.label} ({leg.mnemonic}) {t}: {issue}; vendor value {str(raw)[:40]!r}")
             vals.append(v)
-        if tickers and n_err == len(tickers):
-            self._warn(f"LEG NOT EVALUATED: capiq {leg.label} ({leg.mnemonic}) failed for every requested name "
-                       f"({next(iter(issues))}); NaN.")
-        elif issues:
+        s = _typed_series(vals, tickers, leg.kind)
+        if issues and s.notna().any():
             bad = sum(issues.values())
             self._warn(f"capiq {leg.label} ({leg.mnemonic}): {bad} of {len(tickers)} value(s) set to NaN - "
                        + "; ".join(f"{k} x{n}" for k, n in issues.most_common(3)))
-        return _typed_series(vals, tickers, leg.kind)
+        return s, issues
+
+    def _gaps(self, e: Mapping[str, Any], leg: _Leg | None = None) -> list[str]:
+        """Why an entry may not be used as a threshold / filter yet (gate G5); empty when it may. Value-free."""
+        gaps: list[str] = []
+        if e.get("admitted") is not True:
+            if e.get("units_verified") is False:
+                gaps.append(f"units UNVERIFIED ({e.get('unit') or '?'})")
+            if e.get("status") == "unverifiable":
+                gaps.append("unverifiable item, not admitted")
+        if leg is not None and leg.lagged and not self.as_of_admitted:
+            gaps.append(f"lagged value: the {self.as_of_property} property is not admitted")
+        return gaps
 
     def _fetch(
         self,
@@ -1303,13 +1642,19 @@ class CapIQProvider:
         *,
         scale_key: str,
         fallbacks: Mapping[str, pd.Series] | None = None,
+        record: bool = False,
     ) -> tuple[dict[str, pd.Series], list[str]]:
-        """Values for ``cols`` of one map section: ``({column: Series}, [columns with no S&P source])``."""
+        """Values for ``cols`` of one map section: ``({column: Series}, [columns with no S&P source])``.
+
+        ``record=True`` (raw datasets) adds every served column that may not be a threshold yet to
+        ``unverified_columns``.
+        """
         ctx = self._ctx(as_of)
         direct: dict[str, _Leg] = {}
         derived: dict[str, tuple[Mapping[str, Any], list[tuple[str, Any]]]] = {}
         post: dict[str, Mapping[str, Any]] = {}
         unavailable: list[str] = []
+        input_entries: dict[str, Mapping[str, Any]] = {}  # derived input leg label -> its map entry
         for col in cols:
             e = entries.get(col)
             path = f"{prefix}.{col}"
@@ -1321,7 +1666,9 @@ class CapIQProvider:
                     if inp.get("column") is not None:
                         ins.append(("column", str(inp["column"])))
                     else:
-                        ins.append(("leg", self._make_leg(f"{path}.inputs[{i}]", inp, ctx, "to_canonical")))
+                        leg = self._make_leg(f"{path}.inputs[{i}]", inp, ctx, "to_canonical")
+                        input_entries[leg.label] = inp
+                        ins.append(("leg", leg))
                 derived[col] = (e, ins)
             elif e.get("mnemonic"):
                 direct[col] = self._make_leg(path, e, ctx, scale_key)
@@ -1329,8 +1676,19 @@ class CapIQProvider:
                 post[col] = e
             else:
                 unavailable.append(col)
-        legs = list(direct.values()) + [x for _, ins in derived.values() for k, x in ins if k == "leg"]
-        reasons = self._gate(legs, as_of)
+        # Gate the direct legs first: a derived column whose column input is unavailable or suspended (or whose
+        # own vendor input is suspended) cannot be computed, so its other inputs are neither preflighted nor
+        # requested (every identifier x mnemonic request counts toward the daily GDS budget).
+        reasons = self._gate(list(direct.values()), as_of)
+
+        def dead_column(x: str) -> bool:
+            return (x not in direct and x not in post) or (x in direct and direct[x].key in reasons)
+
+        dead: set[str] = {col for col, (_, ins) in derived.items() if any(k == "column" and dead_column(x) for k, x in ins)}
+        reasons.update(self._gate([x for col, (_, ins) in derived.items() if col not in dead
+                                   for k, x in ins if k == "leg"], as_of))
+        dead |= {col for col, (_, ins) in derived.items() if any(k == "leg" and x.key in reasons for k, x in ins)}
+        legs = list(direct.values()) + [x for col, (_, ins) in derived.items() if col not in dead for k, x in ins if k == "leg"]
         uniq: dict[str, _Leg] = {}
         for leg in legs:
             if leg.key not in reasons:
@@ -1345,53 +1703,130 @@ class CapIQProvider:
         by_key: dict[str, dict[str, Mapping[str, Any]]] = {}
         for (key, t), el in zip(owners, els):
             by_key.setdefault(key, {})[t] = el
+        leg_issues: dict[str, Counter[str]] = {}
 
         def series(leg: _Leg) -> pd.Series:
             if leg.key in reasons:
                 self._warn(f"LEG NOT EVALUATED: capiq {leg.label} ({leg.mnemonic}): {reasons[leg.key]}; NaN.")
                 return _typed_series([None] * len(tickers), tickers, leg.kind)
-            return self._leg_series(leg, by_key.get(leg.key, {}), tickers)
+            s, leg_issues[leg.key] = self._leg_series(leg, by_key.get(leg.key, {}), tickers)
+            return s
+
+        def nan_series(kind: str) -> pd.Series:
+            return _typed_series([None] * len(tickers), tickers, kind)
 
         out: dict[str, pd.Series] = {}
-        unverified: list[_Leg] = []
+        reported: set[str] = set()  # columns already announced as LEG NOT EVALUATED
+        unlabelled: set[str] = set()  # label columns whose vendor labels were all outside the value_map
         for col, leg in direct.items():
             s = series(leg)
+            if leg.key in reasons:
+                reported.add(col)
             fb = (fallbacks or {}).get(col)
             if fb is not None:
                 s = s.where(s.notna(), fb.reindex(s.index))
             vmap = (entries.get(col) or {}).get("value_map")
             if leg.kind == "label" and isinstance(vmap, Mapping):
+                had = s.notna().any()
                 s = _map_labels(s, vmap, entries[col].get("unmapped", "pass"))
+                if had and s.isna().all():
+                    unlabelled.add(col)
             out[col] = s
-            if leg.key not in reasons and not leg.units_verified:
-                unverified.append(leg)
+        # Serve-time lag check: a lagged column equal to its as_of twin for every comparable name (two or more) means
+        # the as-of property was ignored; serving it would fabricate a zero change (e.g. a 0% EPS revision).
+        twins = {leg.key: col for col, leg in direct.items() if leg.key not in reasons}
+        for col, leg in direct.items():
+            twin_col = twins.get(leg.twin_key) if leg.lagged and leg.key not in reasons else None
+            if twin_col is None or twin_col == col:
+                continue
+            a = pd.to_numeric(out[col], errors="coerce").astype("float64")
+            b = pd.to_numeric(out[twin_col], errors="coerce").astype("float64")
+            both = a.notna() & b.notna()
+            if int(both.sum()) >= 2 and bool(np.isclose(a[both], b[both], rtol=1e-12, atol=0.0).all()):
+                self._warn(f"LEG NOT EVALUATED: capiq {leg.label} ({leg.mnemonic}): every value at "
+                           f"{self.as_of_property} {leg.as_of_date} equals the as_of value ({col} vs {twin_col}, "
+                           f"{int(both.sum())} names), so GDS appears to ignore the {self.as_of_property} property; NaN "
+                           "(a zero change would be fabricated).")
+                out[col] = nan_series(leg.kind)
+                reasons[leg.key] = "lagged values equal the as_of values"
+                reported.add(col)
+        unverified: list[_Leg] = [leg for leg in direct.values() if leg.key not in reasons and not leg.units_verified]
+        gaps: dict[str, list[str]] = {}
+        for col, leg in direct.items():
+            if leg.key not in reasons:
+                gaps[col] = self._gaps(entries[col], leg)
         for col, (e, ins) in derived.items():
+            if col in dead:
+                for k, x in ins:
+                    if k == "leg" and x.key in reasons:
+                        series(x)  # the input's own LEG NOT EVALUATED warning
+                self._warn(f"LEG NOT EVALUATED: capiq {prefix}.{col} (derived): an input is unavailable or suspended; "
+                           "NaN (its other inputs were not requested).")
+                out[col] = pd.Series(math.nan, index=pd.Index(tickers, dtype=object), dtype="float64")
+                reported.add(col)
+                continue
             parts: list[pd.Series] = []
+            g = self._gaps(e)
             for k, x in ins:
                 if k == "column":
                     parts.append(pd.to_numeric(out.get(x, pd.Series(math.nan, index=pd.Index(tickers), dtype="float64")),
                                                errors="coerce").astype("float64"))
+                    if gaps.get(x):
+                        g.append(f"derived from {x}")
                 else:
                     parts.append(series(x).astype("float64"))
                     if x.key not in reasons and not x.units_verified:
                         unverified.append(x)
+                    g += [f"input {x.mnemonic}: {gap}" for gap in self._gaps(input_entries.get(x.label, {}), x)]
             out[col] = self._derive(f"{prefix}.{col}", e, parts, scale_key)
+            gaps[col] = g
         for col, e in post.items():
             if e.get("assume") is not None:
                 out[col] = _typed_series([e["assume"]] * len(tickers), tickers, "label")
-                self._warn(f"capiq {prefix}.{col}: no verified S&P item; every name is labelled {e['assume']!r} "
-                           f"({e.get('notes', '')})".rstrip())
+                self._warn(f"capiq {prefix}.{col}: every name is labelled {e['assume']!r} by a field-map assertion "
+                           "('assume'), not by an S&P value: the label is only as good as the caller's check of the "
+                           "list (it is recorded in the field-map digest).")
+                gaps[col] = ["asserted by the field map ('assume'), not an S&P value"]
             else:
-                src = out.get(str(e["from_column"]))
+                src_col = str(e["from_column"])
+                src = out.get(src_col)
                 if src is None:
-                    src = _typed_series([None] * len(tickers), tickers, "label")
+                    src = nan_series("label")
+                had = src.notna().any()
                 out[col] = _map_labels(src, e.get("value_map") or {}, e.get("unmapped", "nan"))
+                if had and out[col].isna().all():
+                    unlabelled.add(col)
+                gaps[col] = self._gaps(e) + ([f"derived from {src_col}"] if gaps.get(src_col) else [])
+        # ADR graft 3: a field missing across the board suspends its leg with a banner, whatever the cause.
+        if tickers:
+            for col, s in out.items():
+                if col in reported or not s.isna().all():
+                    continue
+                if col in direct:
+                    what = direct[col].mnemonic
+                    iss = leg_issues.get(direct[col].key) or Counter()
+                    cause = ("; ".join(f"{k} x{n}" for k, n in iss.most_common(3)) if iss else
+                             "every value missing: a placeholder such as 'Data Unavailable' / 'NM', or an empty row")
+                elif col in derived:
+                    what, cause = "derived", "no name had every input, or every result was non-finite / implausible"
+                else:
+                    what, cause = "from_column", f"no usable {post[col].get('from_column')} label"
+                if col in unlabelled:
+                    cause = "no vendor label is in the field map's value_map (unmapped labels are NaN)"
+                self._warn(f"LEG NOT EVALUATED: capiq {prefix}.{col} ({what}): no usable value for any of {len(tickers)} "
+                           f"name(s) ({cause}); NaN.")
+        if record:
+            for col, g in gaps.items():
+                if g and out.get(col) is not None and out[col].notna().any():
+                    self.unverified_columns[col] = "; ".join(dict.fromkeys(g))
         if unverified:
             desc = ", ".join(f"{leg.label} ({leg.mnemonic} x{leg.scale:g}: {leg.unit or '?'})"
                              for leg in {id(x): x for x in unverified}.values())
-            self._warn(f"capiq {prefix}: units UNVERIFIED for {desc}. Values are served converted to canonical units "
-                       "(implausible ones blanked); admit them with verify_fields() and the field_validation_log (gate G5) "
-                       "and set units_verified=true in an override, or pass strict_units=True to withhold them.")
+            self._warn(f"G5 OVERRIDE (strict_units=False): capiq {prefix}: units UNVERIFIED for {desc}. Values are served "
+                       "converted to canonical units before admission (implausible ones blanked); the affected columns are "
+                       "listed in provider.unverified_columns - use them as z-scores only, never as thresholds, until "
+                       "admitted with verify_fields() and the field_validation_log (gate G5) and units_verified=true / "
+                       "admitted=true in an override. strict_units=True withholds them instead.")
         return out, unavailable
 
     def _derive(self, path: str, e: Mapping[str, Any], parts: list[pd.Series], scale_key: str) -> pd.Series:
@@ -1434,6 +1869,8 @@ class CapIQProvider:
         page = max(1, int(e.get("page_size", 600)))
         pages = max(1, int(e.get("max_pages", 10)))
         vi = int(e.get("value_index", 0))
+        # vendor messages that mean "no rows beyond this rank" (none is verified, so the default list is empty)
+        end_msgs = [str(m).strip().lower() for m in (e.get("end_messages") or []) if str(m).strip()]
         found: list[str] = []
         truncated = True
         for p in range(pages):
@@ -1447,6 +1884,11 @@ class CapIQProvider:
                                         "Index coverage is untested (VENDOR_REFERENCE 3.3): check the entitlement or pass "
                                         "tickers=[...].")
                 truncated = False
+                if not any(m in err.lower() for m in end_msgs):
+                    self._warn(f"capiq: the constituent list of {self.index} may be truncated after rank {p * page}: "
+                               f"{leg.function} {leg.mnemonic} ranks {p * page + 1}-{(p + 1) * page} returned ErrMsg "
+                               f"{err[:120]!r}. Only the first {len(found)} member(s) are used; re-run, or list the "
+                               "message in universe.constituents.end_messages if it only means 'no more rows'.")
                 break
             vals = [str(r[vi]).strip() for r in _rows(el) if len(r) > vi and not self._is_missing_text(r[vi])]
             found += vals
@@ -1471,8 +1913,9 @@ class CapIQProvider:
                 tickers.append(t)
         if unresolved:
             self._warn(f"capiq: {len(unresolved)} constituent(s) of {self.index} have no ticker and were dropped and "
-                       f"flagged ({', '.join(unresolved[:10])}): supply them through identifiers={{ticker: '<CapIQ id>'}} "
-                       "(the maintained symbology table, ADR graft 6).")
+                       "flagged (identifiers in provider.details): supply them through identifiers={ticker: "
+                       "'<CapIQ id>'} (the maintained symbology table, ADR graft 6).")
+            self._detail(f"capiq: constituents of {self.index} dropped for lack of a ticker: {', '.join(unresolved)}")
         if not tickers:
             self._warn(f"capiq: index {self.index} returned no usable constituents")
         if self._is_historical(as_of):
@@ -1484,7 +1927,10 @@ class CapIQProvider:
         """Explicit tickers or index constituents, indexed by canonical ticker, columns ``fields.UNIVERSE_COLUMNS``.
 
         Raises ``ProviderError`` when neither ``tickers`` nor ``index`` is configured (S&P GDS cannot screen).
-        Known country mismatches and excluded sectors are dropped; the local engine re-applies every filter.
+        Known country / security-type mismatches and excluded sectors are dropped; unknown values are kept for
+        the local engine, which re-applies every filter (and never lets a missing value pass). A
+        ``security_type`` missing for every name (the default: no verified GDS item) suspends that leg here
+        with a ``LEG NOT EVALUATED`` warning; no label is assumed.
         """
         a = _as_date(as_of)
         tickers = self._members(a)
@@ -1497,13 +1943,12 @@ class CapIQProvider:
         # exchange part of a 'TICKER:EXCH' identifier fills a missing exchange (the value_map applies to both)
         fallback = _typed_series([_exchange_part(ids[t]) for t in tickers], tickers, "label")
         data, _ = self._fetch("raw.universe", entries, DATASET_COLUMNS["universe"], tickers, ids, a,
-                              scale_key="to_canonical", fallbacks={F.EXCHANGE: fallback})
+                              scale_key="to_canonical", fallbacks={F.EXCHANGE: fallback}, record=True)
         data[F.VENDOR_ID] = _typed_series([ids[t] for t in tickers], tickers, "label")
         df = self._frame(F.UNIVERSE_COLUMNS, tickers, data, a)
         return self._apply_universe_spec(df, spec)
 
-    @staticmethod
-    def _apply_universe_spec(df: pd.DataFrame, spec: Any) -> pd.DataFrame:
+    def _apply_universe_spec(self, df: pd.DataFrame, spec: Any) -> pd.DataFrame:
         if spec is None or df.empty:
             return df
         keep = pd.Series(True, index=df.index)
@@ -1511,9 +1956,35 @@ class CapIQProvider:
         if country:
             c = df[F.COUNTRY]
             keep &= c.isna() | (c.astype(object).map(lambda x: str(x).strip().upper()) == str(country).strip().upper())
+        types = [str(t).strip().lower() for t in (getattr(spec, "security_types", None) or [])]
+        if types:
+            st = df[F.SECURITY_TYPE]
+            if st.isna().all():
+                # ADR graft 3: missing across the board suspends the leg with a banner; no label is ever assumed.
+                self._warn(f"LEG NOT EVALUATED: capiq security_type is missing for every security (no verified GDS "
+                           f"security-type item), so security_type in [{', '.join(types)}] was not applied here: "
+                           "ADRs, REITs, funds and preferreds are NOT identified. The local screen drops names whose "
+                           "type is missing: set UniverseSpec.security_types=[] to screen without a security-type "
+                           "filter, or, after checking the list yourself, assert a label with fieldmap={'raw': "
+                           "{'universe': {'security_type': {'available': None, 'assume': 'common_stock'}}}}.")
+            else:
+                keep &= st.isna() | st.map(lambda x: str(x).strip().lower()).isin(types)
         excl = {str(x).strip().lower() for x in (getattr(spec, "exclude_sectors", None) or [])}
         if excl:
-            keep &= ~df[F.GICS_SECTOR].map(lambda x: str(x).strip().lower() if isinstance(x, str) else "").isin(excl)
+            sector = ((self.fieldmap.get("raw") or {}).get("universe") or {}).get(F.GICS_SECTOR) or {}
+            if isinstance(sector, Mapping) and (sector.get("admitted") is True
+                                                or sector.get("status") in ("confirmed", "corrected")):
+                keep &= ~df[F.GICS_SECTOR].map(lambda x: str(x).strip().lower() if isinstance(x, str) else "").isin(excl)
+            else:
+                # An unverifiable classification is never a filter before admission (G5): the adapter does not
+                # pre-apply it. The local engine still evaluates exclude_sectors on the labels it receives; those are
+                # mapped to GICS sector names (value_map, unmapped='nan'), and a NaN label is missing data, which the
+                # engine excludes rather than letting a differently spelt excluded sector pass.
+                self._warn("capiq: exclude_sectors was not pre-applied by the adapter: gics_sector comes from CapIQ's "
+                           "own industry classification (unverifiable, not admitted - gate G5), whose sector cut may "
+                           "differ from GICS. Labels are mapped to GICS sector names (field-map value_map; any other "
+                           "label is NaN and excluded as missing data by the local engine). Check the labels with "
+                           "verify_fields() and admit the item before relying on a sector filter.")
         return df.loc[keep]
 
     # ------------------------------------------------------------------ snapshots
@@ -1553,7 +2024,8 @@ class CapIQProvider:
             return self._frame(cols, tick, {}, a)
         self._note_historical(a)
         ids = {t: self._identifier(t) for t in tick}
-        data, unavailable = self._fetch(f"raw.{dataset}", entries, cols, tick, ids, a, scale_key="to_canonical")
+        data, unavailable = self._fetch(f"raw.{dataset}", entries, cols, tick, ids, a, scale_key="to_canonical",
+                                        record=True)
         if unavailable:
             self._warn(f"capiq {dataset}: no S&P mapping (NaN) for {', '.join(unavailable)}")
         return self._frame(cols, tick, data, a)
@@ -1619,10 +2091,12 @@ class CapIQProvider:
         return legs
 
     def _history_series(self, leg: _Leg, el: Mapping[str, Any] | None, start: date, end: date,
-                        issues: Counter[str]) -> pd.Series:
+                        issues: Counter[str], who: str = "") -> pd.Series:
         err = _errmsg(el) if el is not None else "no response"
         if err:
             issues[f"ErrMsg {err[:60]!r}"] += 1
+            if who:
+                self._detail(f"capiq {leg.label} ({leg.mnemonic}) {who}: ErrMsg {err[:120]!r}")
             return pd.Series(dtype="float64")
         lo, hi = pd.Timestamp(start), pd.Timestamp(end)
         pts: dict[pd.Timestamp, float] = {}
@@ -1644,7 +2118,10 @@ class CapIQProvider:
         if leg.plausible and s.notna().any():
             med = float(s.median())
             if not (leg.plausible[0] <= med <= leg.plausible[1]):
-                issues[f"implausible median {med:.4g} outside [{leg.plausible[0]:g}, {leg.plausible[1]:g}] (scale?)"] += 1
+                issues[f"implausible median outside [{leg.plausible[0]:g}, {leg.plausible[1]:g}] after "
+                       f"x{leg.scale:g} (scale?)"] += 1
+                self._detail(f"capiq {leg.label} ({leg.mnemonic}) {who or '?'}: median {med:.6g} outside "
+                             f"[{leg.plausible[0]:g}, {leg.plausible[1]:g}]; series blanked")
                 s = s * math.nan
         return s
 
@@ -1681,10 +2158,7 @@ class CapIQProvider:
         series: dict[str, dict[str, pd.Series]] = {f: {} for f in F.PRICE_FIELDS}
         issues: dict[str, Counter[str]] = {f: Counter() for f in usable}
         for (f, t), el in zip(owners, els):
-            series[f][t] = self._history_series(usable[f], el, s, e, issues[f])
-        for f, c in issues.items():
-            if c:
-                self._warn(f"capiq history.{f} ({usable[f].mnemonic}): " + "; ".join(f"{k} x{n}" for k, n in c.most_common(3)))
+            series[f][t] = self._history_series(usable[f], el, s, e, issues[f], who=t)
         dates = sorted({d for f in series for ser in series[f].values() for d in ser.index})
         idx = pd.DatetimeIndex(dates, name="date")
         frames: dict[str, pd.DataFrame] = {}
@@ -1695,10 +2169,85 @@ class CapIQProvider:
         if close.notna().sum().sum() == 0:
             raise ProviderError(f"S&P Capital IQ returned no {legs[F.CLOSE].mnemonic} history for any of {len(tick)} "
                                 f"ticker(s) between {s} and {e}")
+        if F.VOLUME in usable:
+            self._check_volume_scale(frames[F.VOLUME], close, usable[F.VOLUME], e, issues[F.VOLUME])
+        for f, c in issues.items():
+            if c and frames[f].notna().any().any():
+                self._warn(f"capiq history.{f} ({usable[f].mnemonic}): " + "; ".join(f"{k} x{n}" for k, n in c.most_common(3)))
+        for f, leg in usable.items():  # ADR graft 3: missing across the board -> banner (close raised above)
+            if f != F.CLOSE and frames[f].isna().all().all():
+                cause = ("; ".join(f"{k} x{n}" for k, n in issues[f].most_common(3)) if issues[f]
+                         else "every value missing or no rows in the window")
+                self._warn(f"LEG NOT EVALUATED: capiq history.{f} ({leg.mnemonic}): no usable value for any of "
+                           f"{len(tick)} ticker(s) ({cause}); NaN {f} prices.")
+        served = [leg for f, leg in usable.items() if frames[f].notna().any().any()]
+        for f, leg in usable.items():
+            if frames[f].notna().any().any():
+                g = self._gaps(((self.fieldmap.get("history") or {}).get("fields") or {}).get(f) or {})
+                if g:
+                    self.unverified_columns[f] = "; ".join(g)
+        unverified = [leg for leg in served if not leg.units_verified]
+        if unverified:
+            desc = ", ".join(f"{leg.label} ({leg.mnemonic} x{leg.scale:g}: {leg.unit or '?'})" for leg in unverified)
+            self._warn(f"G5 OVERRIDE (strict_units=False): capiq history: units UNVERIFIED for {desc}. Values are served "
+                       "converted to canonical units before admission (implausible series blanked); the affected columns "
+                       "are listed in provider.unverified_columns - use them as z-scores only, never as thresholds (e.g. "
+                       "the liquidity floor), until admitted with verify_fields() and the field_validation_log (gate G5). "
+                       "strict_units=True withholds them instead.")
         missing = [t for t in tick if not close[t].notna().any()]
         if missing:
-            self._warn(f"capiq: no price history for {len(missing)} ticker(s) ({', '.join(missing[:20])}); NaN")
+            self._warn(f"capiq: no price history for {len(missing)} of {len(tick)} ticker(s); NaN (tickers in "
+                       "provider.details)")
+            self._detail(f"capiq: no price history between {s} and {e} for: {', '.join(missing)}")
         return PricePanel(frames[F.OPEN], frames[F.HIGH], frames[F.LOW], close, frames[F.VOLUME])
+
+    def _cached_market_caps(self, tickers: Sequence[str], as_of: date) -> dict[str, float]:
+        """Market caps (canonical USD) at ``as_of`` that this provider already holds in its response cache
+        (``get_universe`` fetched them); nothing is requested. Used only as a volume-scale sanity check."""
+        e = ((self.fieldmap.get("raw") or {}).get("universe") or {}).get(F.MARKET_CAP)
+        if not isinstance(e, Mapping) or not e.get("mnemonic") or e.get("available") is False:
+            return {}
+        leg = self._make_leg("raw.universe.market_cap", e, self._ctx(as_of), "to_canonical")
+        out: dict[str, float] = {}
+        for t in tickers:
+            el = self._cache.get(json.dumps(leg.request(self._identifier(t)), sort_keys=True, default=str))
+            if el is None or _errmsg(el):
+                continue
+            rows = _rows(el)
+            v, issue = self._convert(rows[0][0] if rows and rows[0] else None, leg)
+            if issue is None and isinstance(v, float) and math.isfinite(v) and v > 0:
+                out[t] = v
+        return out
+
+    def _check_volume_scale(self, volume: pd.DataFrame, close: pd.DataFrame, leg: _Leg, as_of: date,
+                            issues: Counter[str]) -> None:
+        """Blank (in place) a ticker's volume whose scale is implausible: the median daily dollar volume
+        (close x volume) outside ``history.fields.volume.plausible_dollar_volume``, or - when the market cap is
+        already cached - the median daily turnover (dollar volume / market cap) outside ``plausible_turnover``.
+        A thin name whose raw IQ volume is really in shares would otherwise be inflated x1e6 and pass the
+        liquidity floor."""
+        entry = ((self.fieldmap.get("history") or {}).get("fields") or {}).get(F.VOLUME) or {}
+        dv_rng, to_rng = entry.get("plausible_dollar_volume"), entry.get("plausible_turnover")
+        if not dv_rng and not to_rng:
+            return
+        mcaps = self._cached_market_caps(list(volume.columns), as_of) if to_rng else {}
+        for t in volume.columns:
+            dv = (volume[t] * close[t]).dropna()
+            if dv.empty:
+                continue
+            med = float(dv.median())
+            bad = None
+            if dv_rng and not (float(dv_rng[0]) <= med <= float(dv_rng[1])):
+                bad = (f"implausible median dollar volume outside [{float(dv_rng[0]):g}, {float(dv_rng[1]):g}] USD/day "
+                       f"after x{leg.scale:g} (volume scale?)")
+            elif to_rng and t in mcaps and not (float(to_rng[0]) <= med / mcaps[t] <= float(to_rng[1])):
+                bad = (f"implausible median daily turnover (dollar volume / market cap) outside [{float(to_rng[0]):g}, "
+                       f"{float(to_rng[1]):g}] after x{leg.scale:g} (volume scale?)")
+            if bad:
+                issues[bad] += 1
+                self._detail(f"capiq {leg.label} ({leg.mnemonic}) {t}: median dollar volume {med:.6g}"
+                             + (f", market cap {mcaps[t]:.6g}" if t in mcaps else "") + "; series blanked")
+                volume[t] = math.nan
 
     def get_benchmark_history(self, start: date, end: date, symbol: str | None = None) -> pd.Series:
         """Close of the benchmark: the field map's ``benchmark`` (``^SPX``, unverifiable) with its fallback, or ``symbol``."""
@@ -1747,7 +2296,8 @@ class CapIQProvider:
         wanted = set(DocumentKind) if kinds is None else {DocumentKind(k) for k in kinds}
         docs_cfg = self.fieldmap.get("documents") or {}
         for k in sorted(wanted - {DocumentKind.TRANSCRIPT}, key=lambda x: x.value):
-            note = (docs_cfg.get(k.value) or {}).get("notes", "no verified S&P API")
+            entry = docs_cfg.get(k.value) or docs_cfg.get(k.value + "s") or {}  # map keys: news, filings, research
+            note = entry.get("notes", "no verified S&P API") if isinstance(entry, Mapping) else "no verified S&P API"
             self._warn(f"capiq: {k.value} documents are not served by this adapter: {note}")
         if DocumentKind.TRANSCRIPT not in wanted:
             return []
@@ -1808,7 +2358,7 @@ class CapIQProvider:
         if not segs:
             self._warn(f"capiq: Kensho transcript {key} for {ticker} is empty")
             return None
-        return self._transcript_document(ticker, key, name, when, segs, cfg)
+        return self._transcript_document(ticker, key, name, when, segs, cfg, end)
 
     def _in_window(self, ticker: str, key: Any, when: datetime | None, start: date, end: date) -> bool:
         if key is None:
@@ -1825,7 +2375,7 @@ class CapIQProvider:
         return True
 
     def _transcript_document(self, ticker: str, key: Any, name: Any, when: datetime, segs: list[TranscriptSegment],
-                             cfg: Mapping[str, Any]) -> Document:
+                             cfg: Mapping[str, Any], as_of: date) -> Document:
         paragraphs = [(f"{s.speaker}: {s.text}" if s.speaker else s.text) for s in segs]
         text = "\n\n".join(paragraphs)
         return Document(
@@ -1841,8 +2391,11 @@ class CapIQProvider:
             metadata={
                 "vendor": VENDOR,
                 "channel": str(cfg.get("channel") or "kensho"),
+                "field": "transcript",
+                "as_of": as_of.isoformat(),
                 "key_dev_id": str(key),
                 "licence_class": str(cfg.get("licence_class") or "L1"),
+                "mnpi_class": str(cfg.get("mnpi_class") or "public"),
                 "gate": str(cfg.get("gate") or "G2"),
                 "boundary_note": (self.boundary.note or "")[:500],
                 "text_sha256": _sha256(text),
@@ -1903,8 +2456,44 @@ class CapIQProvider:
         ident = self._identifier(sample_ticker) if sample_ticker else self.test_identifier
         legs = self._check_legs(a)
         reqs = [leg.request(fixed or ident) for leg, fixed in legs]
+        aop = self._as_of_probe_leg(a)
+        if aop is not None:
+            reqs += [aop.request(ident), aop.twin_request(ident)]
         els = self._execute(reqs, use_cache=False)
-        return [self._field_check(leg, el, fixed or ident, a) for (leg, fixed), el in zip(legs, els)]
+        checks = [self._field_check(leg, el, fixed or ident, a) for (leg, fixed), el in zip(legs, els)]
+        if aop is not None:
+            checks.append(self._as_of_check(aop, els[-2], els[-1], ident, a))
+        return checks
+
+    def _as_of_probe_leg(self, as_of: date) -> _Leg | None:
+        """The ``api.as_of_property.probe`` item anchored 91 days before ``as_of`` (its twin is anchored at ``as_of``)."""
+        probe = self._as_of_probe
+        if not probe.get("mnemonic"):
+            return None
+        entry = {"mnemonic": probe["mnemonic"], "status": probe.get("status", "unverifiable"),
+                 "properties": {**(probe.get("properties") or {}), self.as_of_property: "{as_of_3m}"}}
+        return self._make_leg("api.as_of_property", entry, self._ctx(as_of), "to_canonical")
+
+    def _as_of_check(self, leg: _Leg, el_then: Mapping[str, Any], el_now: Mapping[str, Any], ident: str,
+                     as_of: date) -> FieldCheck:
+        """Admission evidence for the as-of property: a time-varying item must differ between two as-of dates."""
+        aop = ((self.fieldmap.get("api") or {}).get("as_of_property") or {})
+        ok_then, note_then, v_then = self._probe_result(leg, el_then)
+        ok_now, note_now, v_now = self._probe_result(leg, el_now)
+        prop, then = self.as_of_property, leg.as_of_date
+        if not (ok_then and ok_now):
+            ok, note = False, f"no value to compare ({prop} {then}: {note_then}; as_of: {note_now})"
+        elif self._same_value(v_then, v_now):
+            ok, note = False, (f"{leg.mnemonic} is identical at {prop} {then} and at as_of: GDS appears to ignore the "
+                               f"{prop} property - do not admit it")
+        else:
+            ok, note = True, (f"{leg.mnemonic} differs between {prop} {then} ({str(v_then)[:30]!r}) and as_of: the property "
+                              "has an effect. Before admitting it, compare the as_of value with a second source or a "
+                              "filing (point-in-time, not restated), record it in field_validation_log and set "
+                              "api.as_of_property.admitted=true")
+        return FieldCheck("api.as_of_property", str(aop.get("status", "unverifiable")), v_now, ok, note,
+                          mnemonic=leg.mnemonic, function=leg.function, identifier=ident,
+                          properties=dict(leg.twin_properties or leg.properties), as_of=as_of)
 
     def _field_check(self, leg: _Leg, el: Mapping[str, Any], ident: str, as_of: date) -> FieldCheck:
         guidance = {
@@ -1929,9 +2518,11 @@ class CapIQProvider:
         if leg.kind == "number":
             c, issue = self._convert(value, leg)
             canonical = None if (isinstance(c, float) and math.isnan(c)) else c
-            notes.append(f"unit {leg.unit or '?'}; x{leg.scale:g} -> {c:.6g}" if not issue else f"unit {leg.unit or '?'}; {issue}")
-            if issue:
+            if issue:  # the admission log records the value (VENDOR_REFERENCE section 5, step 4)
                 ok = False
+                notes.append(f"unit {leg.unit or '?'}; x{leg.scale:g} -> {_to_float(value) * leg.scale:.6g}: {issue}")
+            else:
+                notes.append(f"unit {leg.unit or '?'}; x{leg.scale:g} -> {c:.6g}")
         elif leg.kind == "date":
             canonical = self._parse_date(value)
         if not leg.units_verified:
@@ -1963,14 +2554,20 @@ def _typed_series(values: Sequence[Any], tickers: Sequence[str], kind: str) -> p
     return pd.Series(vals, index=idx, dtype=object)
 
 
+def _label_key(x: Any) -> str:
+    """Spelling-insensitive label key: case, runs of whitespace and '&' vs 'and' do not matter."""
+    return re.sub(r"\s+", " ", str(x).replace("&", " and ")).strip().lower()
+
+
 def _map_labels(s: pd.Series, value_map: Mapping[str, Any], unmapped: str) -> pd.Series:
-    """Map labels case-insensitively; unmapped labels pass through (``'pass'``) or become NaN (``'nan'``)."""
-    lookup = {str(k).strip().lower(): v for k, v in value_map.items()}
+    """Map labels (case-, whitespace- and '&'/'and'-insensitively); unmapped labels pass through (``'pass'``) or
+    become NaN (``'nan'``)."""
+    lookup = {_label_key(k): v for k, v in value_map.items()}
 
     def one(x: Any) -> Any:
         if not isinstance(x, str) or not x.strip():
             return np.nan
-        hit = lookup.get(x.strip().lower())
+        hit = lookup.get(_label_key(x))
         if hit is not None:
             return hit
         return x if unmapped == "pass" else np.nan

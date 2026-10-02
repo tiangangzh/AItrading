@@ -24,9 +24,11 @@ Overrides
 
 Merging is a deep merge: mappings merge key by key, any other value (lists included) replaces the
 default, and ``null`` deletes the key. So an override such as
-``{"features": {"fcf_yield_pct": {"status": "confirmed", "units_verified": true}}}`` changes just
-those two attributes of one entry (typically after the item passed admission, G5). The merged map
-is validated (every ``status`` must be one of :data:`STATUSES`); errors raise :class:`FieldMapError`.
+``{"features": {"fcf_yield_pct": {"status": "confirmed", "units_verified": true, "admitted": true}}}``
+changes just those attributes of one entry (typically after the item passed admission, gate G5:
+push-down compilers push only features flagged ``"admitted": true`` or passed in their ``admitted=``
+argument). The merged map is validated (every ``status`` must be one of :data:`STATUSES`, every
+``admitted`` flag a JSON boolean); errors raise :class:`FieldMapError`.
 
 The loader is deliberately schema-agnostic beyond ``vendor`` and ``status``: each adapter documents
 the sections it reads. Keys starting with ``_`` are metadata (``_sources`` lists the files merged)
@@ -137,8 +139,24 @@ def iter_statuses(node: Any, path: str = "") -> Iterator[tuple[str, str, Any]]:
             yield from iter_statuses(v, f"{path}[{i}]")
 
 
+def _iter_key(node: Any, key: str, path: str = "") -> Iterator[tuple[str, Any]]:
+    """Yield ``(path, value)`` for every ``key`` in the map (metadata keys starting with ``_`` skipped)."""
+    if isinstance(node, Mapping):
+        for k, v in node.items():
+            if str(k).startswith("_"):
+                continue
+            here = f"{path}.{k}" if path else str(k)
+            if k == key:
+                yield here, v
+            else:
+                yield from _iter_key(v, key, here)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from _iter_key(v, key, f"{path}[{i}]")
+
+
 def validate(fieldmap: Mapping[str, Any], *, vendor: str | None = None, source: str = "") -> None:
-    """Raise :class:`FieldMapError` listing every problem (bad ``vendor``, unknown status)."""
+    """Raise :class:`FieldMapError` listing every problem (bad ``vendor``, unknown status, non-boolean ``admitted``)."""
     where = f" ({source})" if source else ""
     if not isinstance(fieldmap, Mapping):
         raise FieldMapError(f"field map must be a mapping{where}")
@@ -148,6 +166,9 @@ def validate(fieldmap: Mapping[str, Any], *, vendor: str | None = None, source: 
     for path, _key, value in iter_statuses(fieldmap):
         if value not in STATUSES:
             errors.append(f"{path}: status {value!r} is not one of {', '.join(STATUSES)}")
+    for path, value in _iter_key(fieldmap, "admitted"):
+        if not isinstance(value, bool):  # a string "true" would otherwise silently leave the item unadmitted
+            errors.append(f"{path}: admitted must be true or false, got {value!r}")
     if errors:
         raise FieldMapError(f"invalid field map{where}: " + "; ".join(errors))
 

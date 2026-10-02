@@ -391,3 +391,37 @@ def test_canonical_demo_spec():
     assert out.funnel[-1].missing_data == 1  # NOSI
     remaining = [s.remaining for s in out.funnel]
     assert remaining == sorted(remaining, reverse=True) and remaining[-1] == 2
+
+
+def test_universe_leg_missing_for_every_name_is_not_evaluated():
+    import numpy as np
+    import pandas as pd
+
+    from aitrading.screen.engine import apply_universe
+    from aitrading.screen.spec import UniverseSpec
+
+    frame = pd.DataFrame(
+        {"country": ["US", "US", "GB"], "security_type": [np.nan, np.nan, np.nan], "price": [10.0, 3.0, 20.0],
+         "avg_dollar_volume_20d_usd_mn": [50.0, 50.0, 50.0], "gics_sector": ["Energy", "Energy", "Energy"]},
+        index=pd.Index(["A", "B", "C"], name="ticker"),
+    )
+    mask, funnel = apply_universe(UniverseSpec(), frame)
+    assert list(mask[mask].index) == ["A"]  # country and price still applied
+    sec = [f for f in funnel if f.label.startswith("security_type")][0]
+    assert "NOT EVALUATED" in sec.label and sec.missing_data == 0
+
+
+def test_universe_leg_partially_missing_still_excludes_missing():
+    import numpy as np
+    import pandas as pd
+
+    from aitrading.screen.engine import apply_universe
+    from aitrading.screen.spec import UniverseSpec
+
+    frame = pd.DataFrame(
+        {"country": ["US", "US"], "security_type": ["common_stock", np.nan], "price": [10.0, 10.0],
+         "avg_dollar_volume_20d_usd_mn": [50.0, 50.0], "gics_sector": ["Energy", "Energy"]},
+        index=pd.Index(["A", "B"], name="ticker"),
+    )
+    mask, funnel = apply_universe(UniverseSpec(), frame)
+    assert list(mask[mask].index) == ["A"]

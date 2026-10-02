@@ -329,6 +329,14 @@ class ResearchPipeline:
         # 5. explanations
         medians: pd.DataFrame | None = None
         explaining = bool(top) and self.explain_top_k > 0 and self.explainer is not None
+        if explaining and getattr(self.explainer, "llm", None) is not None and getattr(self.provider, "external_llm_allowed", True) is False:
+            # Licensing gate (ADR section 7): tickers, ranks and values derived from this provider may not
+            # reach an external model at all, so LLM explanations are skipped rather than redacted.
+            warnings.append(
+                f"explanations skipped: provider '{self.provider_name}' does not permit sending its results to an external "
+                "LLM (licensing gate not cleared; see docs/ARCHITECTURE.md section 7)"
+            )
+            explaining = False
         if explaining and pushed is None:
             umask, _ = apply_universe(spec.universe, frame)
             medians = self._sector_medians(frame, umask)
@@ -337,7 +345,7 @@ class ResearchPipeline:
         ideas: list[InvestmentIdea] = []
         documents_log: list[dict[str, Any]] = []
         for i, cand in enumerate(candidates):
-            if i >= self.explain_top_k or self.explainer is None:
+            if not explaining or i >= self.explain_top_k or self.explainer is None:
                 ideas.append(InvestmentIdea(candidate=cand))
                 continue
             idea, docs = self._explain(cand, rich_frame, medians, spec, as_of, warnings)

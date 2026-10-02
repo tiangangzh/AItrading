@@ -127,8 +127,8 @@ BOUNDARY_NOTE = (
     "booleans to leave zone T and be stored firm-side) clears, and even then only ids, ranks and booleans; EDF Textual "
     "News (L5) and broker research (L6) never. This boundary object withholds document text and numeric feature "
     "values only; it CANNOT withhold candidate tickers, names or ranks, so until G1 clears do not use an LLM-backed "
-    "explainer (or any external model) on results from this provider. Widening requires a note citing "
-    "'G1: <written approval reference>' recorded in the policy table."
+    "explainer (or any external model) on results from this provider. Widening requires a note that cites gate G1 "
+    "with the reference of the written approval, recorded in the policy table."
 )
 BQL_MISSING = (
     "The 'bql' package is not available. It ships only inside Bloomberg BQuant (BQNT<GO> on an entitled Terminal, or "
@@ -163,7 +163,7 @@ _FATAL_SUBCATEGORIES = {"INVALID_FIELD", "NOT_AUTHORIZED", "NO_AUTH", "FIELD_NOT
 _FATAL_TEXT = re.compile(r"invalid|not valid|unknown field|not authori|entitle", re.IGNORECASE)
 _PER_SECURITY_TEXT = re.compile(r"not applicable|n/a for this security", re.IGNORECASE)
 # A widened boundary must cite the gate with a reference, e.g. note="G1: Bloomberg letter 2026-11-03, reviewed by <lawyer>".
-_G1_CITATION = re.compile(r"\bG1\s*:\s*\S")
+_G1_CITATION = re.compile(r"\bG1\s*:\s*[^\s<]")  # 'G1: <reference>' placeholders do not count
 _NEVER_TO_MODEL = frozenset({DocumentKind.NEWS, DocumentKind.RESEARCH})  # L5 EDF Textual News, L6 broker research
 
 
@@ -516,8 +516,14 @@ class BloombergProvider:
         return default if v is None else v
 
     def _warn(self, msg: str) -> None:
+        """Record a degradation. Must not contain vendor values or security ids (the run persists it)."""
         if msg not in self.warnings:
             self.warnings.append(msg)
+
+    def _detail(self, msg: str) -> None:
+        """Record ticker-level detail for the zone-T operator only (never persisted firm-side before G1)."""
+        if msg not in self.zone_t_details:
+            self.zone_t_details.append(msg)
 
     @property
     def fieldmap_digest(self) -> str:
@@ -525,18 +531,37 @@ class BloombergProvider:
         return digest(self.fieldmap)
 
     def _init_boundary(self, boundary: DataBoundary | None) -> DataBoundary:
+        """Deny-by-default (ADR-001 section 7): a widened boundary without a G1 citation is refused.
+
+        L4 values never reach a model (``allow_numeric_features`` must stay False), EDF Textual News (L5)
+        and broker research (L6) never do, and any document kind needs ``"G1: <reference>"`` in the note.
+        """
         if boundary is None:
             return deny_all_text(provider=VENDOR, note=BOUNDARY_NOTE).model_copy(update={"allow_numeric_features": False})
         if not isinstance(boundary, DataBoundary):
             raise TypeError("boundary must be an aitrading.core.policy.DataBoundary")
         if boundary.provider != VENDOR:
             raise ValueError(f"boundary is for provider {boundary.provider!r}, expected {VENDOR!r}")
-        if boundary.allow_numeric_features or boundary.allowed_document_kinds:
+        if boundary.allow_numeric_features:
+            raise ValueError(
+                "a Bloomberg boundary may not allow numeric features: Terminal / Desktop API / BQuant data is licence "
+                "class L4, whose values never reach an external model (after gate G1 only ids, ranks and booleans may "
+                "leave zone T). Use deny_all_text(provider='bloomberg') with allow_numeric_features=False.")
+        kinds = {DocumentKind(k) for k in boundary.allowed_document_kinds}
+        never = sorted(k.value for k in kinds & _NEVER_TO_MODEL)
+        if never:
+            raise ValueError(
+                f"a Bloomberg boundary may not allow {', '.join(never)} text: EDF Textual News is L5 (black-box use only) "
+                "and broker research L6 (Terminal only): these never reach an external model.")
+        if kinds and not _G1_CITATION.search(boundary.note or ""):
+            raise ValueError(
+                "a widened Bloomberg boundary must cite gate G1 (written Bloomberg approval) in its note, e.g. "
+                "note='G1: Bloomberg letter 2026-xx-xx, reviewed by <lawyer>'; a policy row without a citation "
+                "evaluates as deny (ADR-001 section 7).")
+        if kinds:
             self._warn(
-                "bloomberg: a boundary wider than the ADR-001 default was passed. Bloomberg Terminal / Desktop API / "
-                "BQuant data is licence class L4: it may leave zone T only after gate G1 (written Bloomberg approval), "
-                "and then only as ids, ranks and booleans. Record the approval in the policy table."
-            )
+                "bloomberg: a boundary wider than the ADR-001 default was passed (citing G1). No Bloomberg text API is "
+                "verified, so nothing is fetched; record the approval in the policy table.")
         return boundary
 
     def _channels(self, dataset: str) -> tuple[str, ...]:
@@ -551,8 +576,8 @@ class BloombergProvider:
             e = spec.get(ch)
             if not isinstance(e, Mapping):
                 continue
-            if ch == "derived" or e.get("expression") or e.get("code") or e.get("assume") is not None:
-                return ch, dict(e)
+            if ch == "derived" or e.get("expression") or e.get("code"):
+                return ch, dict(e)  # an entry without an item is skipped: no value is ever assumed
         return None
 
     def _capabilities(self) -> set[Capability]:
@@ -572,15 +597,30 @@ class BloombergProvider:
         return caps
 
     def _is_stale(self, as_of: date) -> bool:
+        """True when current-only (BDP) values would post-date ``as_of`` beyond the configured tolerance."""
         return as_of < self._today() - timedelta(days=self.snapshot_staleness_days)
 
     def _vendor_id(self, ticker: str) -> str:
+        """Bloomberg id used for data requests (the composite id for a home-market listing)."""
         t = str(ticker).strip()
-        return self._ids.get(t) or to_vendor_id(t)
+        return self._ids.get(t) or to_vendor_id(t, self._composite or "US")
+
+    def _data_id(self, vendor_id: str) -> str:
+        """``'AAPL UW Equity'`` -> ``'AAPL US Equity'``: exchange-level home-market ids map to the composite.
+
+        PX_VOLUME / px_volume on an exchange-level id is that venue's volume only; canonical volume is the
+        consolidated (composite) figure. Non-home exchanges and non-equity ids are unchanged.
+        """
+        vid = str(vendor_id).strip()
+        root, exch, yellow = split_vendor_id(vid)
+        homes = {c.upper() for c in self._home_codes}
+        if self._composite and yellow == "Equity" and root and exch and exch.upper() in homes:
+            return f"{root} {self._composite} Equity"
+        return vid
 
     def _canonical(self, vendor_id: str) -> str:
         t = to_canonical_ticker(vendor_id, self._home_codes)
-        self._ids.setdefault(t, str(vendor_id))
+        self._ids.setdefault(t, self._data_id(vendor_id))
         return t
 
     # ------------------------------------------------------------------ SDK access (lazy)
@@ -656,13 +696,17 @@ class BloombergProvider:
                     self._blpapi()
                 except ProviderUnavailable as e:
                     problems.append(f"BDP-only columns {', '.join(sorted(set(bdp_cols)))} will be NOT EVALUATED: {e}")
+                    if F.SECURITY_TYPE in bdp_cols:
+                        problems.append("without the Desktop API no security type is known (none is assumed), so a "
+                                        "UniverseSpec.security_types filter cannot be evaluated: the local screen drops "
+                                        "names whose type is missing; set security_types=[] to screen without it")
         elif not self._tickers and not self.universe_expr:
             problems.append("the blpapi backend cannot screen: pass tickers=[...] or universe_expr='<saved EQS screen>' "
                             "for get_universe (or run backend='bql' inside BQuant)")
         return problems
 
     # ------------------------------------------------------------------ BQL plumbing
-    def _bql_run(self, query: str, expected: Sequence[str]) -> pd.DataFrame:
+    def _bql_exec(self, query: str, expected: Sequence[str]) -> pd.DataFrame:
         mod = self._bql()
         bq = self._bq()
         self.query_log.append(query)
@@ -678,6 +722,36 @@ class BloombergProvider:
         if missing:
             raise ProviderError(f"BQL response lacks column(s) {missing} (got {list(df.columns)}); query: {query}")
         return df
+
+    def _with_clause(self) -> str:
+        """The opt-in ``requests.bql_with_clause`` (e.g. ``with(mode=cached)``), preflighted once; '' if off/failed."""
+        cfg = (self.fieldmap.get("requests") or {}).get("bql_with_clause") or {}
+        clause = str(cfg.get("value") or "").strip() if isinstance(cfg, Mapping) else ""
+        if not clause or not cfg.get("enabled"):
+            return ""
+        if not re.fullmatch(r"with\([A-Za-z0-9_=,' ]*\)", clause):
+            raise FieldMapError(f"requests.bql_with_clause {clause!r} is not a plain with(...) clause")
+        if self._with_clause_state is None:
+            probe = (self.fieldmap.get("universe") or {}).get("probe") or {}
+            ok, why = False, "no universe.probe item to preflight it with"
+            if probe.get("expression"):
+                item = self._render(str(probe["expression"]), self._today())
+                try:
+                    df = self._bql_exec(f"let(#v={item};) get(#v) for([{bql_quote(self.test_security)}]) {clause}", ["v"])
+                    ok = bool(len(df)) and not df["v"].map(_missing).all()
+                    why = "" if ok else "all-NaN result"
+                except ProviderError as e:
+                    why = f"request failed: {e}"
+            self._with_clause_state = ok
+            if not ok:
+                self._warn(f"bloomberg: the unverified BQL clause {clause} failed its preflight on the test security "
+                           f"({why}); BQL requests run without it (no cached mode)")
+        return clause if self._with_clause_state else ""
+
+    def _bql_run(self, query: str, expected: Sequence[str]) -> pd.DataFrame:
+        """Execute one BQL string (with the opt-in ``with(...)`` clause appended when enabled and preflighted)."""
+        clause = self._with_clause()
+        return self._bql_exec(f"{query} {clause}" if clause else query, expected)
 
     @staticmethod
     def _bql_query(items: Mapping[str, str], for_clause: str) -> str:
@@ -711,7 +785,32 @@ class BloombergProvider:
         return {k: (pd.concat(v, axis=1) if v else pd.DataFrame()) for k, v in out.items()}
 
     # ------------------------------------------------------------------ blpapi plumbing
+    @staticmethod
+    def _cid_matches(msg: Any, cid: Any) -> bool:
+        """True if ``msg`` answers the request sent with correlation id ``cid``."""
+        getter = getattr(msg, "correlationIds", None)
+        if getter is None:
+            return False
+        try:
+            ids = list(getter() or [])
+        except Exception:  # noqa: BLE001
+            return False
+        for c in ids:
+            if c == cid:
+                return True
+            try:
+                if c.value() == cid.value():
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
     def _blp_request(self, request_type: str, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Send one request with its own ``CorrelationId`` and collect only the messages that answer it.
+
+        Messages for other correlation ids (a late reply to an earlier, timed-out request, or traffic of
+        other code sharing an injected session) are discarded. On TIMEOUT the request is cancelled.
+        """
         blp = self._blpapi()
         s = self._refdata_session()
         req = s.getService(self.refdata_service).createRequest(request_type)
@@ -720,20 +819,32 @@ class BloombergProvider:
         except Exception as e:  # noqa: BLE001
             raise _RequestRejected(f"{request_type} rejected the request elements ({type(e).__name__}: {e})") from e
         self.query_log.append(f"{request_type} {json.dumps(dict(payload), sort_keys=True, default=str)}")
-        s.sendRequest(req)
+        cid_cls = getattr(blp, "CorrelationId", None)
+        if cid_cls is None:
+            raise ProviderUnavailable("the blpapi module has no CorrelationId: requests cannot be matched to replies")
+        cid = cid_cls(next(self._cid_seq))
+        s.sendRequest(req, correlationId=cid)
         out: list[dict[str, Any]] = []
         while True:
             ev = s.nextEvent(self.timeout_ms)
             et = ev.eventType()
             if et == blp.Event.TIMEOUT:
-                raise ProviderError(f"{request_type} timed out after {self.timeout_ms} ms")
+                try:
+                    s.cancel(cid)
+                except Exception:  # noqa: BLE001 - best effort; late replies are filtered by correlation id anyway
+                    pass
+                raise ProviderError(f"{request_type} timed out after {self.timeout_ms} ms (request cancelled)")
+            answered = False
             for msg in ev:
+                if not self._cid_matches(msg, cid):
+                    continue  # session status, or a reply to another request
+                answered = True
                 d = msg.toPy()
                 if isinstance(d, Mapping):
                     if d.get("responseError"):
                         raise ProviderError(f"{request_type} failed: {_err_text(d['responseError'])}")
                     out.append(dict(d))
-            if et == blp.Event.RESPONSE:
+            if et == blp.Event.RESPONSE and answered:
                 return out
 
     @staticmethod
@@ -757,6 +868,7 @@ class BloombergProvider:
                 groups[key].append(code)
         values: dict[str, dict[str, Any]] = {}
         errors: dict[str, list[tuple[str, str, bool]]] = {}
+        bad_secs: set[str] = set()
         for ov, codes in groups.items():
             for chunk in _chunks(list(ids), self.batch_size):
                 payload = {"securities": chunk, "fields": list(codes),
@@ -765,7 +877,8 @@ class BloombergProvider:
                     for sd in _security_data(msg):
                         sec = str(sd.get("security", ""))
                         if sd.get("securityError"):
-                            self._warn(f"bloomberg: {sec}: security error {_err_text(sd['securityError'])}")
+                            bad_secs.add(sec)
+                            self._detail(f"bloomberg BDP: {sec}: security error {_err_text(sd['securityError'])}")
                             continue
                         fd = sd.get("fieldData") or {}
                         row = values.setdefault(sec, {})
@@ -776,6 +889,9 @@ class BloombergProvider:
                             info = fe.get("errorInfo") or {}
                             key = self._bdp_key(str(fe.get("fieldId")), dict(ov))
                             errors.setdefault(key, []).append((sec, _err_text(info), _is_fatal(info)))
+        if bad_secs:
+            self._warn(f"bloomberg: {len(bad_secs)} security(ies) returned a security error on a BDP request "
+                       "(left NaN; details in zone_t_details)")
         return values, errors
 
     def _history_elements(self) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -789,6 +905,8 @@ class BloombergProvider:
         """BDH: ``{code: DataFrame(date x security)}``."""
         base, adj = self._history_elements()
         series: dict[str, dict[str, pd.Series]] = {c: {} for c in codes}
+        bad_secs: set[str] = set()
+        exc_secs: set[str] = set()
         for chunk in _chunks(list(ids), self.history_batch_size):
             payload: dict[str, Any] = {"securities": chunk, "fields": list(codes), **base}
             if adj and self._bdh_adjust:
@@ -810,10 +928,13 @@ class BloombergProvider:
                 for sd in _security_data(msg):
                     sec = str(sd.get("security", ""))
                     if sd.get("securityError"):
-                        self._warn(f"bloomberg: {sec}: security error {_err_text(sd['securityError'])}")
+                        bad_secs.add(sec)
+                        self._detail(f"bloomberg BDH: {sec}: security error {_err_text(sd['securityError'])}")
                         continue
                     for fe in sd.get("fieldExceptions") or []:
-                        self._warn(f"bloomberg: {sec}: BDH field exception on {fe.get('fieldId')}: {_err_text(fe.get('errorInfo'))}")
+                        exc_secs.add(sec)
+                        self._detail(f"bloomberg BDH: {sec}: field exception on {fe.get('fieldId')}: "
+                                     f"{_err_text(fe.get('errorInfo'))}")
                     rows = sd.get("fieldData") or []
                     if isinstance(rows, Mapping):
                         rows = [rows]
@@ -828,6 +949,12 @@ class BloombergProvider:
                             ser = pd.Series(frame[c].to_numpy(), index=idx)
                             prev = series[c].get(sec)
                             series[c][sec] = ser if prev is None else pd.concat([prev, ser])
+        if bad_secs:
+            self._warn(f"bloomberg: {len(bad_secs)} security(ies) returned a security error on a BDH request "
+                       "(left NaN; details in zone_t_details)")
+        if exc_secs:
+            self._warn(f"bloomberg: {len(exc_secs)} security(ies) returned BDH field exceptions "
+                       "(left NaN; details in zone_t_details)")
         out: dict[str, pd.DataFrame] = {}
         for c, per in series.items():
             cleaned = {k: v[~v.index.duplicated(keep="last")].sort_index() for k, v in per.items()}
@@ -866,6 +993,7 @@ class BloombergProvider:
         unmapped: list[str] = []
         unverified: list[str] = []
         stale: list[str] = []
+        tolerated: list[str] = []
         for col in columns:
             choice = self._choose(raw.get(col), dataset)
             if choice is None:
@@ -878,7 +1006,13 @@ class BloombergProvider:
             if ch == "bdp" and self._is_stale(as_of):
                 stale.append(col)
                 continue
+            if ch == "bdp" and as_of < self._today():
+                tolerated.append(col)
             plan[col] = (ch, e)
+        if tolerated:
+            self._warn(f"bloomberg: BDP current values served for {dataset} column(s) {', '.join(tolerated)} at as_of "
+                       f"{as_of} although today is {self._today()} (snapshot_staleness_days="
+                       f"{self.snapshot_staleness_days}): values published after as_of may be included (look-ahead risk)")
         if unmapped:
             self._warn(f"bloomberg: no {self.backend}-backend field-map entry for {dataset} column(s) {', '.join(unmapped)}: "
                        f"left NaN (add an admitted item via ${env_var(VENDOR)} to fill them)")
@@ -887,7 +1021,8 @@ class BloombergProvider:
                        "admitted (check with verify_fields(), then set units_verified=true in a field-map override)")
         if stale:
             self._warn(f"bloomberg: BDP returns current values only, so {dataset} column(s) {', '.join(stale)} are blank "
-                       f"for as_of {as_of} (more than {self.snapshot_staleness_days} days before today {self._today()})")
+                       f"for as_of {as_of} (before today {self._today()}; tolerance snapshot_staleness_days="
+                       f"{self.snapshot_staleness_days})")
         return plan
 
     def _preflight_ok(self, channel: str, col: str, entry: Mapping[str, Any], as_of: date) -> bool:
@@ -900,11 +1035,14 @@ class BloombergProvider:
         key = (channel, f"{item}|{json.dumps(entry.get('overrides') or {}, sort_keys=True)}")
         if key not in self._preflight_cache:
             chk = self._check_entry(f"preflight.{col}", channel, entry, self.test_security, as_of, column=col)
-            self._preflight_cache[key] = (chk.ok, chk.note)
-        ok, note = self._preflight_cache[key]
+            self._preflight_cache[key] = (chk.ok, chk.failure)
+            if not chk.ok:
+                self._detail(f"bloomberg preflight {col} ({channel} {item}) on {self.test_security}: {chk.note}")
+        ok, failure = self._preflight_cache[key]
         if not ok:
-            self._warn(f"LEG NOT EVALUATED: bloomberg {col} ({channel} {item}) failed its preflight on "
-                       f"{self.test_security}: {note}")
+            # value-free: the FieldCheck note (which may quote the returned value) stays in zone_t_details
+            self._warn(f"LEG NOT EVALUATED: bloomberg {col} ({channel} {item}) failed its preflight on the test "
+                       f"security: {failure}")
         return ok
 
     def _convert(self, raw: pd.Series, col: str, entry: Mapping[str, Any]) -> pd.Series:
@@ -931,7 +1069,8 @@ class BloombergProvider:
         if isinstance(plaus, (list, tuple)) and len(plaus) == 2 and x.notna().any():
             med = float(x.median())
             if not (float(plaus[0]) <= med <= float(plaus[1])):
-                self._warn(f"bloomberg: {col} looks mis-scaled (median {med:.4g} outside the plausible range "
+                # value-free (warnings are persisted): the range and the field-map key, never the vendor statistic
+                self._warn(f"bloomberg: {col} looks mis-scaled (its median is outside the plausible range "
                            f"[{float(plaus[0]):g}, {float(plaus[1]):g}] in canonical units): check unit / to_canonical "
                            "in the field map with verify_fields()")
         return x
@@ -953,7 +1092,10 @@ class BloombergProvider:
     ) -> tuple[dict[str, pd.Series], list[str]]:
         """Fetch planned columns -> ``({column: Series indexed by vendor id}, ids)``.
 
-        With ``for_clause`` (BQL universe) the ids come from the BQL response.
+        With ``for_clause`` (BQL universe) the ids come from a first, single-item request over the
+        universe (``universe.probe``); the label / value items are then requested for those ids in
+        ``batch_size`` tranches, so no request carries every item over the whole universe (ADR risk
+        table: BQL capacity limits).
         """
         out: dict[str, pd.Series] = {}
         by_ch: dict[str, list[tuple[str, dict[str, Any]]]] = {}
@@ -961,35 +1103,23 @@ class BloombergProvider:
             by_ch.setdefault(ch, []).append((col, e))
 
         # ---- BQL
-        items: dict[str, str] = {}
-        entries: dict[str, dict[str, Any]] = {}
-        assumed: list[tuple[str, dict[str, Any]]] = []
-        for col, e in by_ch.get("bql", []):
-            if not e.get("expression"):
-                assumed.append((col, e))
-                continue
-            if self._preflight_ok("bql", col, e, as_of):
-                items[col] = self._render(e["expression"], as_of)
-                entries[col] = e
-        if for_clause is not None and not items:
+        if for_clause is not None:
             probe = (self.fieldmap.get("universe") or {}).get("probe") or {}
             if not probe.get("expression"):
                 raise ProviderError("no BQL item to request for the universe (field map has no universe.probe)")
-            items["probe"] = self._render(probe["expression"], as_of)
-        if items:
-            if for_clause is not None:
-                df = self._bql_snapshot(items, for_clause)
-                ids = list(df.index)
-            else:
-                parts = [self._bql_snapshot(items, self._bql_list(chunk)) for chunk in _chunks(list(ids or []), self.batch_size)]
-                df = pd.concat(parts) if parts else pd.DataFrame(columns=list(items))
+            ids = list(self._bql_snapshot({"probe": self._render(probe["expression"], as_of)}, for_clause).index)
+        items: dict[str, str] = {}
+        entries: dict[str, dict[str, Any]] = {}
+        for col, e in by_ch.get("bql", []):
+            if e.get("expression") and self._preflight_ok("bql", col, e, as_of):
+                items[col] = self._render(e["expression"], as_of)
+                entries[col] = e
+        ids = list(ids or [])
+        if items and ids:
+            parts = [self._bql_snapshot(items, self._bql_list(chunk)) for chunk in _chunks(ids, self.batch_size)]
+            df = pd.concat(parts) if parts else pd.DataFrame(columns=list(items))
             for col, e in entries.items():
                 out[col] = self._convert(df[col], col, e)
-        ids = list(ids or [])
-        for col, e in assumed:
-            self._warn(f"bloomberg: {col} has no verified BQL item; every security is labelled {e.get('assume')!r} "
-                       f"(field-map assumption: {e.get('notes', '')})")
-            out[col] = pd.Series([e.get("assume")] * len(ids), index=ids, dtype=object)
 
         # ---- BDP (primary on blpapi, secondary channel on bql)
         bdp = by_ch.get("bdp", [])
@@ -1006,13 +1136,16 @@ class BloombergProvider:
                 for col, e in usable:
                     key = self._bdp_key(e["code"], e.get("overrides"))
                     errs = errors.get(key, [])
+                    for sec, m, fatal in errs:
+                        self._detail(f"bloomberg BDP {e['code']}: {sec}: {m}{' (fatal for the leg)' if fatal else ''}")
                     if any(f for _, _, f in errs):
                         msg = next(m for _, m, f in errs if f)
                         self._warn(f"LEG NOT EVALUATED: bloomberg {col} (BDP {e['code']}) field exception: {msg}")
                         continue
                     if errs:
-                        self._warn(f"bloomberg: {col} (BDP {e['code']}) unavailable for {len(errs)} security(ies), "
-                                   f"e.g. {errs[0][0]}: {errs[0][1]}")
+                        kinds = sorted({m for _, m, _ in errs})
+                        self._warn(f"bloomberg: {col} (BDP {e['code']}) unavailable for {len(errs)} security(ies) "
+                                   f"({'; '.join(kinds[:3])}): left NaN (details in zone_t_details)")
                     out[col] = self._convert(pd.Series({i: values.get(i, {}).get(key) for i in ids}, dtype=object), col, e)
 
         # ---- derived from the Bloomberg id
@@ -1068,7 +1201,11 @@ class BloombergProvider:
         ``bql``: ``filter(<equitiesuniv(['ACTIVE','PRIMARY']) | universe_expr>, cntry_of_risk()=='<country>')``
         (country defaults to 'US' when ``spec`` is None). ``blpapi``: ``tickers`` or a saved EQS screen.
         Then the cheap reference filters ``spec.country`` (listing country derived from the Bloomberg
-        exchange code) and ``spec.security_types`` are applied locally; missing values never pass.
+        exchange code) and ``spec.security_types`` are applied locally; missing values never pass. A
+        ``security_type`` column missing for every security (no verified BQL item, BDP unreachable or
+        not current) suspends that leg instead (``LEG NOT EVALUATED`` warning): no label is assumed.
+        The BQL universe is fetched in tranches: ids first (one ``universe.probe`` item), then the
+        label items for ``batch_size`` ids per request.
         """
         a = _as_date(as_of)
         country = (getattr(spec, "country", None) if spec is not None else "US") or None
@@ -1090,19 +1227,34 @@ class BloombergProvider:
             values, ids = self._fetch(self._plan("universe", cols, a), ids, a)
         tick: list[str] = []
         keep_ids: list[str] = []
+        dupes = 0
         for i in ids:
             t = self._canonical(i)
             if t in tick:
-                self._warn(f"bloomberg: duplicate canonical ticker {t} ({i}); kept {self._ids.get(t)}")
+                dupes += 1
+                self._detail(f"bloomberg universe: duplicate canonical ticker {t} ({i}); kept {keep_ids[tick.index(t)]}")
                 continue
             tick.append(t)
             keep_ids.append(i)
+        if dupes:
+            self._warn(f"bloomberg: {dupes} universe id(s) mapped to an already-seen canonical ticker; first kept "
+                       "(details in zone_t_details)")
         df = self._frame("universe", tick, keep_ids, values, a)
         df[F.VENDOR_ID] = pd.Series(keep_ids, index=df.index, dtype=object)
         if country:
             df = df[df[F.COUNTRY].fillna("").astype(str).str.upper() == str(country).upper()]
         if types:
-            df = df[df[F.SECURITY_TYPE].fillna("").astype(str).str.lower().isin(types)]
+            st = df[F.SECURITY_TYPE]
+            if len(df) and st.isna().all():
+                # ADR graft 3: missing across the board suspends the leg (banner), it never empties the universe
+                # and no label is ever assumed (NaN never passes a predicate that IS evaluated).
+                self._warn(f"LEG NOT EVALUATED: bloomberg security_type is missing for every security (no verified BQL "
+                           f"item; the BDP item needs the Desktop API and a current as_of), so the universe filter "
+                           f"security_type in [{', '.join(types)}] was not applied here: ADRs, REITs, funds and "
+                           "preferreds are NOT excluded. Provide blpapi for the BDP item, or set "
+                           "UniverseSpec.security_types=[] to screen without a security-type filter.")
+            else:
+                df = df[st.fillna("").astype(str).str.lower().isin(types)]
         return df[F.UNIVERSE_COLUMNS]
 
     def _universe_for_clause(self, country: str | None, as_of: date) -> str:
@@ -1138,6 +1290,16 @@ class BloombergProvider:
         frames = self._history(ids, s, e, list(F.PRICE_FIELDS))
         return self._panel(frames, ids, tick, s, e)
 
+    def _filled_columns(self, cols: Sequence[str]) -> set[str]:
+        """Price columns whose chosen item is forward-filled vendor-side (``forward_filled: true``, e.g. fill='prev')."""
+        raw = (self.fieldmap.get("raw") or {}).get("prices") or {}
+        out: set[str] = set()
+        for c in cols:
+            choice = self._choose(raw.get(c), "prices")
+            if choice and choice[1].get("forward_filled") is True:
+                out.add(c)
+        return out
+
     def _history(self, ids: Sequence[str], start: date, end: date, cols: Sequence[str]) -> dict[str, pd.DataFrame]:
         if self.backend == "bql":
             self._bq()
@@ -1170,7 +1332,21 @@ class BloombergProvider:
                 else pd.DataFrame(np.nan, index=idx, columns=list(ids)) for c in F.PRICE_FIELDS}
         vol, close = full[F.VOLUME], full[F.CLOSE]
         if vol.notna().any().any():
-            sessions = idx[vol.notna().any(axis=1).to_numpy()]  # fill='prev' prices would otherwise create holiday rows
+            traded = vol.notna().to_numpy()
+            is_session = traded.any(axis=1)
+            sessions = idx[is_session]  # fill='prev' prices would otherwise create holiday rows
+            # fill='prev' also carries a halted / suspended / delisted security's last price onto every later
+            # session: blank forward-filled OHLC wherever that security's own volume is missing (it did not trade
+            # that session). A security with no volume at all (e.g. an index) is left as is.
+            filled = self._filled_columns(list(F.PRICE_FIELDS)) - {F.VOLUME}
+            no_trade = ~traded & traded.any(axis=0, keepdims=True)
+            if filled and no_trade.any():
+                for c in filled:
+                    full[c] = full[c].where(~no_trade)
+                n = int(no_trade[is_session].any(axis=0).sum())
+                if n:
+                    self._warn(f"bloomberg: forward-filled prices blanked on sessions without own volume for {n} "
+                               "security(ies) (halted, suspended or delisted: no stale prices served)")
         else:
             sessions = idx[close.notna().any(axis=1).to_numpy()]
             if len(sessions):
@@ -1183,9 +1359,13 @@ class BloombergProvider:
             renamed[c] = g.astype("float64")
         missing = [t for t in tick if renamed[F.CLOSE][t].isna().all()]
         if missing and len(missing) == len(tick):
-            raise ProviderError(f"Bloomberg returned no prices for any of {list(tick)[:10]} in [{s}, {e}]")
+            self._detail(f"bloomberg history: no prices for {', '.join(map(str, tick))} in [{s}, {e}]")
+            raise ProviderError(f"Bloomberg returned no prices for any of the {len(tick)} requested security(ies) in "
+                                f"[{s}, {e}] (details in zone_t_details)")
         if missing:
-            self._warn(f"bloomberg: no prices for {', '.join(missing[:20])}{' ...' if len(missing) > 20 else ''} in [{s}, {e}]")
+            self._detail(f"bloomberg history: no prices for {', '.join(missing)} in [{s}, {e}]")
+            self._warn(f"bloomberg: no prices for {len(missing)} of {len(tick)} security(ies) in [{s}, {e}] "
+                       "(details in zone_t_details)")
         return PricePanel(renamed[F.OPEN], renamed[F.HIGH], renamed[F.LOW], renamed[F.CLOSE], renamed[F.VOLUME])
 
     def get_benchmark_history(self, start: date, end: date, symbol: str | None = None) -> pd.Series:
@@ -1258,9 +1438,14 @@ class BloombergProvider:
 
     # ------------------------------------------------------------------ ScreenPushdown
     def compile_pushdown(self, spec: "ScreenSpec", as_of: date) -> CompiledQuery:
-        """Compile (without executing) the BQL push-down, for the analyst's approval of the split."""
+        """Compile (without executing) the BQL push-down, for the analyst's approval of the split.
+
+        Gate G5 is deny-by-default: only features admitted through the field map (``"admitted": true``)
+        or the ``admitted=`` constructor argument are pushed.
+        """
         return compile_screen(spec, self.fieldmap, as_of, universe_expr=self.universe_expr,
-                              admitted=self.admitted, benchmark=self.benchmark)
+                              admitted=self.admitted, benchmark=self.benchmark,
+                              allow_unadmitted=self.allow_unadmitted)
 
     def pushdown_screen(self, spec: "ScreenSpec", as_of: date) -> PushdownResult:
         """Run ONE BQL request narrowing the universe; residual predicates are left to the local engine.
@@ -1278,6 +1463,7 @@ class BloombergProvider:
         for w in cq.warnings:
             self._warn(f"bloomberg push-down: {w}")
         df = self._bql_run(cq.query, list(cq.lets))
+        executed = self.query_log[-1]  # cq.query plus the opt-in with(...) clause when enabled
         tickers: list[str] = []
         for vid in pd.unique(df["id"].astype(str)):
             t = self._canonical(vid)
@@ -1289,7 +1475,7 @@ class BloombergProvider:
                        "security; check the pushed items with verify_fields() before trusting an empty screen")
         return PushdownResult(
             tickers=tickers,
-            query=cq.query,
+            query=executed,
             pushed_conditions=[c.describe() for c in cq.pushed] + [f"universe: {u}" for u in cq.universe_conditions],
             residual_conditions=cq.residual_descriptions + [f"universe: {u}" for u in cq.universe_residual],
         )
@@ -1361,8 +1547,9 @@ class BloombergProvider:
                 values, errors = self._bdp([security], [(code, ov)])
                 errs = errors.get(self._bdp_key(code, ov))
                 if errs:
-                    return FieldCheck(name, status, None, False, "; ".join(notes + [f"field exception: {errs[0][1]}"]),
-                                      channel, rendered, security, as_of)
+                    why = f"field exception: {errs[0][1]}"
+                    return FieldCheck(name, status, None, False, "; ".join(notes + [why]), channel, rendered, security,
+                                      as_of, failure=why)
                 value = _py(values.get(security, {}).get(self._bdp_key(code, ov)))
             elif channel == "bdh":
                 frames = self._bdh([security], [item], as_of - timedelta(days=10), as_of)
@@ -1374,23 +1561,27 @@ class BloombergProvider:
             else:
                 raise FieldMapError(f"unknown channel {channel!r}")
         except (ProviderError, FieldMapError, KeyError) as e:
-            return FieldCheck(name, status, None, False, "; ".join(notes + [f"request failed: {e}"]), channel, rendered,
-                              security, as_of)
+            why = f"request failed: {e}"
+            return FieldCheck(name, status, None, False, "; ".join(notes + [why]), channel, rendered, security, as_of,
+                              failure=why)
         if _missing(value):
-            return FieldCheck(name, status, None, False,
-                              "; ".join(notes + ["all-NaN result (wrong item, missing entitlement or no data)"]),
-                              channel, rendered, security, as_of)
-        ok = True
+            why = "all-NaN result (wrong item, missing entitlement or no data)"
+            return FieldCheck(name, status, None, False, "; ".join(notes + [why]), channel, rendered, security, as_of,
+                              failure=why)
+        ok, failure = True, ""
         if column is not None and _column_kind(column, entry) == "number":
             try:
                 canon = float(value) * float(entry.get("to_canonical", 1) or 1)
             except (TypeError, ValueError):
-                return FieldCheck(name, status, value, False, "; ".join(notes + ["non-numeric value for a numeric column"]),
-                                  channel, rendered, security, as_of)
+                why = "non-numeric value for a numeric column"
+                return FieldCheck(name, status, value, False, "; ".join(notes + [why]), channel, rendered, security,
+                                  as_of, failure=why)
             notes.append(f"vendor unit {entry.get('unit', '?')}; x{entry.get('to_canonical', 1)} -> canonical {canon:.6g}")
             plaus = entry.get("plausible")
             if isinstance(plaus, (list, tuple)) and len(plaus) == 2 and not (float(plaus[0]) <= canon <= float(plaus[1])):
                 ok = False
+                failure = (f"implausible scale: the canonical value is outside the plausible range "
+                           f"[{float(plaus[0]):g}, {float(plaus[1]):g}] (check unit / to_canonical)")
                 notes.append(f"implausible scale: canonical {canon:.6g} outside [{float(plaus[0]):g}, {float(plaus[1]):g}]")
         elif name.startswith("features.") and entry.get("threshold_scale"):
             try:
@@ -1400,4 +1591,4 @@ class BloombergProvider:
                 pass
         if entry.get("units_verified") is False:
             notes.append("units UNVERIFIED: confirm the unit before setting units_verified=true")
-        return FieldCheck(name, status, value, ok, "; ".join(notes), channel, rendered, security, as_of)
+        return FieldCheck(name, status, value, ok, "; ".join(notes), channel, rendered, security, as_of, failure=failure)

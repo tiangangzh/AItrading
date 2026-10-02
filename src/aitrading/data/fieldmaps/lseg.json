@@ -13,8 +13,8 @@
   },
   "test_ric": "IBM.N",
   "symbology": {
-    "ric_suffixes": ["N", "O", "OQ", "A", "P", "K", "U", "PK", "Z"],
-    "notes": "A ticker passed directly is used as a RIC only if it is an index RIC ('.SPX') or ends with one of these exchange suffixes (an optional '^' delisting tail is ignored); anything else ('BRK.B', 'BRK-B') must come from a SCREEN result or the rics= table, otherwise it is dropped and flagged as unresolved (ADR graft 6). Extend the list in an override for non-US listings."
+    "ric_suffixes": ["N", "O", "OQ", "P", "K", "PK", "Z"],
+    "notes": "A ticker passed directly is used as a RIC only if it is an index RIC ('.SPX') or ends with one of these exchange suffixes (an optional '^' delisting tail is ignored); anything else ('BRK.B', 'BRK-B') must come from a SCREEN result or the rics= table, otherwise it is dropped and flagged as unresolved (ADR graft 6). 'A' (NYSE American) and 'U' are deliberately absent: they collide with dotted share-class and unit tickers ('BRK.A' is BRKa.N, not a NYSE American RIC). Extend the list in an override for non-US listings."
   },
   "sessions": {
     "default": "platform.ldp",
@@ -31,7 +31,8 @@
       "value": "{as_of}",
       "status": "unverifiable",
       "probe": "TR.PriceClose",
-      "notes": "Anchors every snapshot to the absolute as_of (ADR graft 4: never '0D'). The global SDate parameter is not shown in VENDOR_REFERENCE, so it is preflighted once a day per as_of on test_ric: 'probe' (a confirmed field) is requested with and without SDate and both values go to field_log (record in the admission log that values move with SDate). If the request with SDate fails, SDate is dropped (warned, logged); a historical as_of then has no anchor, so snapshots are NOT EVALUATED (NaN) instead of silently returning current values."
+      "anchors_as_of": true,
+      "notes": "Anchors every snapshot to the absolute as_of (ADR graft 4: never '0D'). The global SDate parameter is not shown in VENDOR_REFERENCE, so it is preflighted once a day per as_of on test_ric: 'probe' (a confirmed field) is requested with and without SDate and both values go to field_log (record in the admission log that values move with SDate). If the request with SDate fails while the one without it works, SDate is dropped (warned, logged); a historical as_of (older than the latest completed session) then has no anchor, so snapshot fields whose own code does not carry {as_of} are NOT EVALUATED (NaN) instead of silently returning current values. A historical as_of whose probe value is identical with and without SDate is warned about. 'anchors_as_of' marks the parameter that makes a snapshot point-in-time."
     }
   },
 
@@ -360,7 +361,7 @@
         "to_canonical": 1,
         "status": "unverifiable",
         "units_verified": false,
-        "notes": "Reference form TR.ShortInterest(SDate=0D), anchored to the absolute as_of. Third-party evidence only. LSEG keeps short interest only for listed names (survivorship). Scale UNVERIFIED: VENDOR_REFERENCE table 2.3 says '100*TR.ShortInterest(SDate=0D)/TR.SharesFreeFloat(SDate=0D) ... The exported expression returns a fraction', i.e. a factor-of-100 mismatch between this field and float_shares, and it is not known which one is off. Not served until verify_fields on IBM.N plus a second source fixes the scale; then admit it with units_verified=true (and the right to_canonical) in an override."
+        "notes": "Reference form TR.ShortInterest(SDate=0D), anchored to the absolute as_of. Third-party evidence only. LSEG keeps short interest only for listed names (survivorship). Units/scale UNVERIFIED: VENDOR_REFERENCE gives only third-party evidence for this field and for TR.SharesFreeFloat, and its table 2.3 row ('100*TR.ShortInterest(SDate=0D)/TR.SharesFreeFloat(SDate=0D) computed locally ... The exported expression returns a fraction') is ambiguous: read literally it implies a factor-of-100 gap between the two legs, and nothing says which one would be off. A scale error would flow straight into short_interest_pct_float thresholds, so the leg is not served (NOT EVALUATED) until verify_fields on IBM.N plus a second source (exchange short-interest file) fixes the scale; then admit it with units_verified=true and the right to_canonical in an override (gate G5)."
       },
       "short_interest_shares_1m_ago": {
         "code": "TR.ShortInterest(SDate={as_of_1m})",
@@ -376,7 +377,7 @@
         "to_canonical": 1,
         "status": "unverifiable",
         "units_verified": false,
-        "notes": "TR.SharesFreeFloat is third-party (TR.FreeFloat / TR.FreeFloatPct are corrected but their units are undocumented). Scale UNVERIFIED: see short_interest_shares (the reference's '100*SI/float ... returns a fraction' remark implies a 100x mismatch between the two legs). Not served until admitted."
+        "notes": "TR.SharesFreeFloat is third-party (TR.FreeFloat / TR.FreeFloatPct are corrected but their units are undocumented). Units/scale UNVERIFIED: see short_interest_shares (the reference's '100*SI/float ... returns a fraction' remark may imply a 100x gap between the two legs). Not served until admitted."
       },
       "settlement_date": {
         "code": "TR.ShortInterest(SDate={as_of}).date",
