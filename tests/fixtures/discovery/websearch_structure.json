@@ -1,0 +1,21 @@
+{
+  "id": "msg_01Structure00000000000003",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-5-5",
+  "content": [
+    {"type": "thinking", "thinking": "", "signature": "EpIBCkgIBxABGAIiQOq9m3Zt2a"},
+    {"type": "text", "text": "{\"items\": [{\"title\": \"Earnings Announcement Drift in the 2020s\", \"url\": \"https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4812345\", \"authors\": [\"Jane Doe\", \"Richard Roe\"], \"published\": \"2025-03-03\", \"excerpt\": \"We revisit post-earnings announcement drift using 2000-2024 data. A long-short portfolio formed on standardized unexpected earnings earns 0.5% per month after transaction costs, concentrated in small and illiquid stocks.\"}, {\"title\": \"Industry-Neutral Momentum and the Cross-Section of Expected Stock Returns\", \"url\": \"https://arxiv.org/abs/2609.04512\", \"authors\": [\"Jane Q. Doe\", \"Richard Roe\", \"Wei Zhang\"], \"published\": \"2026-09\", \"excerpt\": \"We study a momentum signal that ranks stocks on their past twelve-month return, skipping the most recent month, after removing the industry component of returns.\"}, {\"title\": \"Machine Sentiment Alpha\", \"url\": \"https://papers.ssrn.com/sol3/papers.cfm?abstract_id=9999999\", \"authors\": [], \"published\": null, \"excerpt\": \"A sentiment signal earns large abnormal returns.\"}]}"}
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 2300,
+    "output_tokens": 410,
+    "cache_creation_input_tokens": 520,
+    "cache_read_input_tokens": 0,
+    "iterations": [
+      {"type": "fallback_message", "model": "claude-opus-5", "input_tokens": 2300, "output_tokens": 410, "cache_creation_input_tokens": 520, "cache_read_input_tokens": 0}
+    ]
+  }
+}

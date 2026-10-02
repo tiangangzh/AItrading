@@ -15,20 +15,27 @@ Portfolio accounting
   rate), so a long-short book with legs +1 / -1 holds 100% cash collateral.
 * Between executions weights DRIFT with prices (buy-and-hold). Daily portfolio return
   r_p(d) = sum_i w_i(d-1, drifted) * r_i(d), with r_i the close-to-close simple return.
-* At an execution: one-way turnover = sum_i |w_target_i - w_drifted_i| (fraction of book; the
-  first execution builds the book from cash, so its turnover is the gross exposure);
-  cost = turnover * costs_bps / 1e4, subtracted from that day's return
-  (net = gross - cost).
-* A held name whose price becomes NaN (delisting / data gap) is valued at its last valid price
-  for the rest of the holding period (0% return - effectively converted to cash, no turnover)
-  and is dropped at the next rebalance; a warning names it once.
+* At an execution: traded notional = sum_i |w_target_i - w_drifted_i| (buys + sells, fraction
+  of book); cost = traded * costs_bps / 1e4 (``costs_bps`` is a one-way cost, paid on every
+  unit bought or sold), subtracted from that day's return (net = gross - cost). The reported
+  turnover is the conventional ONE-WAY turnover = traded / 2: fully replacing a long-only book
+  is 100%, building a long-only book from cash 50%, building a +1 / -1 long-short book 100%.
+* Missing prices (NaN / inf) are told apart by whether the name trades again later in ``close``:
+  - interior gap (trading halt, missing print - a later valid price exists): the position keeps
+    its exposure, is carried at its last price while the price is missing and is marked to the
+    new price when trading resumes, so a move during the gap lands in P&L on that day. If the
+    gap covers an execution day the position cannot be traded: it is kept at its drifted weight
+    (no turnover, no cost) next to the new target and traded at a later rebalance.
+  - terminal delisting (no later valid price): on the first missing day the position is marked
+    at its last price times ``1 + delisting_return`` (default 0.0 - no delisting return, which
+    is optimistic for performance-related delistings, cf. Shumway 1997), held as cash from then
+    on and dropped at the next rebalance (no turnover). A warning names each delisted name once.
 * Names in a target without a valid price on the execution day are dropped and the remaining
   weights are NOT renormalised (a warning is added).
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -118,10 +125,14 @@ class SimulationResult:
     * ``daily_returns`` - net of costs, one value per trading day from the first execution day
       to the end of the window (the first day is -cost: the book is built at that close).
     * ``gross_returns`` - before costs, same index.
-    * ``turnover`` / ``costs`` - one-way turnover and cost (fractions of book), indexed by
-      execution date; net = gross - cost on those days.
-    * ``weights_history`` - executed target weights by execution date (after dropping names
-      without a price).
+    * ``turnover`` - ONE-WAY turnover per execution = 0.5 * sum |w_target - w_drifted|
+      (fraction of book; 1.0 = the whole book replaced), indexed by execution date. This is the
+      series to pass to ``metrics.performance_stats(turnover=...)``.
+    * ``traded`` - traded notional per execution = sum |w_target - w_drifted| (buys + sells,
+      = 2 * turnover); ``costs`` = traded * costs_bps / 1e4. Net = gross - cost on those days.
+    * ``weights_history`` - post-trade holdings by execution date: the executed target weights
+      (names without a price that day dropped) plus any held position that could not be traded
+      that day because of a price gap (at its drifted weight).
     """
 
     daily_returns: pd.Series
@@ -130,6 +141,7 @@ class SimulationResult:
     costs: pd.Series
     weights_history: dict[pd.Timestamp, pd.Series]
     warnings: list[str] = field(default_factory=list)
+    traded: pd.Series = field(default_factory=lambda: pd.Series(dtype=float, name="traded"))
 
     def latest_weights(self) -> pd.Series:
         """Most recently executed target weights (empty Series if none)."""
@@ -153,25 +165,47 @@ def _prepare_close(close: pd.DataFrame) -> pd.DataFrame:
     return close
 
 
-def _frozen_growth(prices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Price relatives P_d / P_0 over a holding period with delisting freeze.
+def _price_state(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(raw, filled, last_valid)`` for a (dates x names) price matrix.
 
-    ``prices`` is (k+1, m) with row 0 = execution-day prices (all valid). From the first
-    non-finite price of a column onwards, its growth stays at the last valid value (0% return).
-    Returns ``(growth, first_bad_row)``; first_bad_row = k+1 when the column never goes missing.
+    ``raw`` has non-finite prices replaced by NaN; ``filled`` is ``raw`` forward-filled per
+    column (NaN only before a column's first price); ``last_valid[c]`` is the row of column c's
+    last finite price (-1 if it never has one). A missing price at row r <= last_valid[c] is an
+    interior gap (trading resumes later); rows > last_valid[c] are after a terminal delisting.
     """
+    raw = np.where(np.isfinite(arr), arr, np.nan)
+    filled = pd.DataFrame(raw).ffill().to_numpy(dtype=float)
+    ok = np.isfinite(raw)
+    n = raw.shape[0]
+    last_valid = np.where(ok.any(axis=0), n - 1 - ok[::-1].argmax(axis=0), -1) if n else np.zeros(0, int)
+    return raw, filled, last_valid.astype(int)
+
+
+def _holding_growth(
+    filled: np.ndarray,
+    last_valid: np.ndarray,
+    p0: int,
+    p1: int,
+    cols: np.ndarray,
+    delisting_return: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Price relatives P_d / P_{p0} for rows d = p0..p1 of columns ``cols``.
+
+    ``filled[p0, cols]`` must be positive (the entry / carried price). Interior gaps are carried
+    at the last price (forward fill) and marked to market when trading resumes. Rows after a
+    column's last valid price (terminal delisting) stay at the last price times
+    ``1 + delisting_return``. Returns ``(growth, first_dead)``: growth is (p1-p0+1, m) and
+    ``first_dead[k]`` the relative row of column k's first post-delisting row (p1-p0+1 if none).
+    """
+    seg = filled[p0 : p1 + 1][:, cols]
     with np.errstate(divide="ignore", invalid="ignore"):
-        g = prices / prices[0]
+        g = seg / seg[0]
     rows = g.shape[0]
-    bad = ~np.isfinite(g)
-    has_bad = bad.any(axis=0)
-    first = np.where(has_bad, bad.argmax(axis=0), rows)
-    if has_bad.any():
-        m = g.shape[1]
-        last_valid = g[np.maximum(first - 1, 0), np.arange(m)]
-        frozen = np.arange(rows)[:, None] >= first[None, :]
-        g = np.where(frozen, last_valid[None, :], g)
-    return g, first
+    first_dead = np.clip(last_valid[cols] - p0 + 1, 0, rows)
+    if delisting_return != 0.0:
+        dead = np.arange(rows)[:, None] >= first_dead[None, :]
+        g = np.where(dead, g * (1.0 + delisting_return), g)
+    return g, first_dead
 
 
 def _clean_weights(w) -> pd.Series:
@@ -201,21 +235,28 @@ def simulate(
     execution_lag: int = 1,
     start=None,
     end=None,
+    delisting_return: float = 0.0,
 ) -> SimulationResult:
     """Simulate a rebalanced portfolio from target weights keyed by *signal* date.
 
     See the module docstring for the full convention. In short: weights for signal date t are
     executed at the close ``execution_lag`` sessions later; between executions weights drift
-    with prices; daily return = sum(w_{d-1, drifted} * r_d); turnover at each execution =
-    sum |w_target - w_drifted| (one-way); cost = turnover * costs_bps / 1e4 deducted on the
-    execution day; NaN prices freeze a held name (0% return) until the next rebalance; target
-    names without a price on the execution day are dropped without renormalising.
+    with prices; daily return = sum(w_{d-1, drifted} * r_d); traded notional at each execution =
+    sum |w_target - w_drifted|, cost = traded * costs_bps / 1e4 deducted on the execution day,
+    reported one-way turnover = traded / 2. A held name with a temporary price gap is carried at
+    its last price and marked to market when trading resumes (it is not traded while its price
+    is missing); after a terminal delisting it is marked at its last price times
+    ``1 + delisting_return`` and becomes cash. Target names without a price on the execution day
+    are dropped without renormalising.
 
     ``start`` / ``end`` bound the simulation window: only executions on days within
     [start, end] are used, the return series starts on the first such execution day and ends
     on the last trading day <= ``end`` (default: last row of ``close``). If two signal dates
     map to the same execution day, the later signal wins. A target may be empty (all cash).
-    Raises ``ValueError`` when no signal date can be executed inside the window.
+    ``delisting_return`` (fraction, > -1) is booked on the first missing day of a name with no
+    later price in ``close``; the default 0.0 applies none, which is optimistic when names were
+    delisted for performance reasons (a warning says so). Raises ``ValueError`` when no signal
+    date can be executed inside the window.
 
     Vectorised per holding period: one matrix product over the (days x held names) slice.
     """
@@ -223,11 +264,13 @@ def simulate(
         raise ValueError("costs_bps must be >= 0")
     if execution_lag < 0:
         raise ValueError("execution_lag must be >= 0")
+    if not np.isfinite(delisting_return) or delisting_return <= -1.0:
+        raise ValueError("delisting_return must be a finite fraction > -1")
     close = _prepare_close(close)
     idx = close.index
     if len(idx) == 0:
         raise ValueError("close has no rows")
-    arr = close.to_numpy(dtype=float)
+    arr, filled, last_valid = _price_state(close.to_numpy(dtype=float))
     start_ts = pd.Timestamp(start) if start is not None else None
     end_ts = pd.Timestamp(end) if end is not None else None
     warnings: list[str] = []
@@ -271,11 +314,13 @@ def simulate(
     cost_by_day = np.zeros(n_days)
 
     turnover_vals: list[float] = []
+    traded_vals: list[float] = []
     cost_vals: list[float] = []
     exec_dates: list[pd.Timestamp] = []
     history: dict[pd.Timestamp, pd.Series] = {}
     drifted = pd.Series(dtype=float)  # pre-trade weights at the current execution
     delist_warned: set[str] = set()
+    gap_first: dict[str, pd.Timestamp] = {}
     ruined = False
 
     for j, p in enumerate(exec_pos):
@@ -295,29 +340,50 @@ def simulate(
                     f"day ({_names(dropped)}); remaining weights not renormalised "
                     f"(sum {float(target.sum()):.4f})"
                 )
-            cpos = cpos[ok]
-        else:
-            cpos = np.array([], dtype=int)
+
+        # held names in a price gap today cannot be traded: they stay at their drifted weight
+        stuck = pd.Series(dtype=float)
+        if len(drifted):
+            live = np.isfinite(arr[p, close.columns.get_indexer(drifted.index)])
+            if not live.all():
+                stuck, drifted = drifted[~live], drifted[live]
+                warnings.append(
+                    f"{_fmt(d)}: {len(stuck)} held name(s) had no price on the execution day "
+                    f"(trading halt / data gap) and could not be traded ({_names(stuck.index)}); "
+                    "kept at their drifted weight until a later rebalance"
+                )
 
         t_al, d_al = target.align(drifted, fill_value=0.0)
-        turnover = float(np.abs(t_al.to_numpy() - d_al.to_numpy()).sum())
-        cost = turnover * costs_bps / 1e4
+        traded = float(np.abs(t_al.to_numpy() - d_al.to_numpy()).sum())
+        cost = traded * costs_bps / 1e4
         exec_dates.append(d)
-        turnover_vals.append(turnover)
+        traded_vals.append(traded)
+        turnover_vals.append(0.5 * traded)
         cost_vals.append(cost)
         cost_by_day[p - first_pos] = cost
-        history[d] = target.copy()
+        if len(stuck):
+            # a stuck position's currency value is untouched by today's trading costs (paid from
+            # cash), so re-express its pre-trade weight against the post-cost NAV
+            g_p = gross[p - first_pos]
+            post = 1.0 + g_p - cost
+            if post > 0:
+                stuck = stuck * ((1.0 + g_p) / post)
+            book = pd.concat([target, stuck]).astype(float)
+        else:
+            book = target.copy()
+        history[d] = book.copy()
 
         # ---- holding period (p, next_p] ------------------------------------------------------
         next_p = exec_pos[j + 1] if j + 1 < len(exec_pos) else last_pos
         if next_p <= p:
-            drifted = target.copy()
+            drifted = book.copy()
             continue
-        if len(target) == 0:
+        if len(book) == 0:
             drifted = pd.Series(dtype=float)
             continue
-        w = target.to_numpy()
-        growth, first_bad = _frozen_growth(arr[p : next_p + 1, cpos])
+        w = book.to_numpy()
+        cpos = close.columns.get_indexer(book.index)
+        growth, first_dead = _holding_growth(filled, last_valid, p, next_p, cpos, delisting_return)
         nav = 1.0 + (growth - 1.0) @ w
         with np.errstate(divide="ignore", invalid="ignore"):
             rets = nav[1:] / nav[:-1] - 1.0
@@ -334,20 +400,39 @@ def simulate(
         gross[p + 1 - first_pos : next_p + 1 - first_pos] = rets
 
         rows = growth.shape[0]
-        for k in np.flatnonzero(first_bad < rows):
-            name = str(target.index[k])
+        # interior gaps (price missing, trading resumes later): reported once per name
+        rel = np.arange(rows)[:, None]
+        gap = ~np.isfinite(arr[p : next_p + 1][:, cpos]) & (rel >= 1) & (rel < first_dead[None, :])
+        for k in np.flatnonzero(gap.any(axis=0)):
+            gap_first.setdefault(str(book.index[k]), idx[p + int(gap[:, k].argmax())])
+        for k in np.flatnonzero(first_dead < rows):
+            name = str(book.index[k])
             if name not in delist_warned:
                 delist_warned.add(name)
-                warnings.append(
-                    f"{name}: price missing from {_fmt(idx[p + int(first_bad[k])])} while held "
-                    "(delisting or data gap); valued at its last price (0% return) and dropped "
-                    "at the next rebalance"
+                how = (
+                    f"marked at its last price with a {delisting_return * 100:+.1f}% delisting return"
+                    if delisting_return != 0.0
+                    else "valued at its last price with no delisting return (0%; optimistic if it "
+                    "was delisted for performance reasons)"
                 )
-        alive = first_bad >= rows
+                warnings.append(
+                    f"{name}: no price from {_fmt(idx[p + int(first_dead[k])])} on while held "
+                    f"(delisted, or its data ends); {how}, held as cash and dropped at the next "
+                    "rebalance"
+                )
+        alive = first_dead >= rows
         if nav[-1] > 0:
-            drifted = pd.Series(w[alive] * growth[-1, alive] / nav[-1], index=target.index[alive])
+            dw = pd.Series(w[alive] * growth[-1, alive] / nav[-1], index=book.index[alive])
+            drifted = dw[dw.to_numpy() != 0.0]
         else:
             drifted = pd.Series(dtype=float)
+
+    if gap_first:
+        warnings.append(
+            f"{len(gap_first)} held name(s) had missing prices while held (trading halt / data "
+            "gap); carried at their last price and marked to market when trading resumed: "
+            + _names([f"{k} from {_fmt(v)}" for k, v in gap_first.items()])
+        )
 
     day_index = idx[first_pos : last_pos + 1]
     gross_s = pd.Series(gross, index=day_index, name="gross_return")
@@ -360,6 +445,7 @@ def simulate(
         costs=pd.Series(cost_vals, index=ex_index, name="costs", dtype=float),
         weights_history=history,
         warnings=warnings,
+        traded=pd.Series(traded_vals, index=ex_index, name="traded", dtype=float),
     )
 
 

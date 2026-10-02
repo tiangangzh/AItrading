@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from aitrading.backtest.metrics import (
+    _align_rf,
     compound,
     default_nw_lags,
     drawdown_series,
@@ -190,6 +191,55 @@ def test_daily_risk_free_compounded_onto_monthly_returns():
     rf_m = 1.0001**n_days - 1
     ex = r.to_numpy() - rf_m
     assert s.sharpe == pytest.approx(ex.mean() / ex.std(ddof=1) * math.sqrt(12))
+
+
+def test_month_end_labelled_rf_matches_daily_returns_by_calendar_month():
+    # Kenneth French RF sits on calendar month-ends; daily returns inside month m must be charged
+    # month m's rate (an as-of join charged them month m-1's: Feb got .01, Mar got .02)
+    days = pd.bdate_range("2024-01-01", "2024-03-31")  # 23 / 21 / 21 weekdays
+    rf = pd.Series([0.01, 0.02, 0.03], index=pd.to_datetime(["2024-01-31", "2024-02-29", "2024-03-31"]))
+    a = _align_rf(rf, days, 252.0)
+    per_day = {1: 1.01 ** (12 / 252) - 1, 2: 1.02 ** (12 / 252) - 1, 3: 1.03 ** (12 / 252) - 1}
+    np.testing.assert_allclose(a.to_numpy(), [per_day[m] for m in days.month], rtol=1e-12)
+    monthly = (1 + a).groupby(days.month).prod() - 1
+    # 21 trading days x 12/252 = exactly one month for Feb / Mar
+    np.testing.assert_allclose(monthly.to_numpy(), [1.01 ** (23 / 21) - 1, 0.02, 0.03], rtol=1e-12)
+    # FRED-style labels (1st of the month) mean the same months
+    rf_fred = pd.Series(rf.to_numpy(), index=pd.to_datetime(["2024-01-01", "2024-02-01", "2024-03-01"]))
+    pd.testing.assert_series_equal(_align_rf(rf_fred, days, 252.0), a)
+    # end to end: Sharpe of zero daily returns uses the same-month rates
+    r = pd.Series(np.where(np.arange(len(days)) % 2 == 0, 0.01, -0.01), index=days)
+    ex = r.to_numpy() - a.to_numpy()
+    s = performance_stats(r, label="d", rf=rf)
+    assert s.sharpe == pytest.approx(ex.mean() / ex.std(ddof=1) * math.sqrt(252))
+
+
+def test_month_end_rf_matches_monthly_returns_on_last_trading_day():
+    bme = pd.date_range("2021-01-01", periods=24, freq="BME")  # 2021-01-29, 2021-02-26, ...
+    assert bme[0] == pd.Timestamp("2021-01-29")
+    me = pd.date_range("2021-01-31", periods=24, freq="ME")
+    rf = pd.Series(np.linspace(0.0001, 0.0040, 24), index=me)
+    r = pd.Series([0.02, -0.01, 0.015, 0.0] * 6, index=bme)
+    np.testing.assert_allclose(_align_rf(rf, bme, 12.0).to_numpy(), rf.to_numpy(), rtol=1e-12)
+    ex = r.to_numpy() - rf.to_numpy()  # same calendar month, not the previous one
+    s = performance_stats(r, label="m", rf=rf)
+    assert s.sharpe == pytest.approx(ex.mean() / ex.std(ddof=1) * math.sqrt(12))
+    dd = math.sqrt(float(np.mean(np.minimum(ex, 0) ** 2)))
+    assert s.sortino == pytest.approx(ex.mean() / dd * math.sqrt(12))
+    # rf published with a lag (ends 2 months early): the latest available rate is carried
+    late = _align_rf(rf.iloc[:-2], bme, 12.0)
+    assert late.iloc[-1] == pytest.approx(rf.iloc[-3]) and late.iloc[-2] == pytest.approx(rf.iloc[-3])
+
+
+def test_month_end_rf_compounded_onto_quarterly_returns_on_last_trading_day():
+    # 2022-12-31 is a Saturday: the Q4 return is dated 2022-12-30 and must own December's rf
+    bqe = pd.date_range("2022-01-01", periods=8, freq="BQE")
+    assert pd.Timestamp("2022-12-30") in bqe
+    me = pd.date_range("2022-01-31", periods=24, freq="ME")
+    rf = pd.Series(0.001 * np.arange(1, 25), index=me)
+    a = _align_rf(rf, bqe, 4.0)
+    expected = (1 + rf).groupby(np.arange(24) // 3).prod().to_numpy() - 1
+    np.testing.assert_allclose(a.to_numpy(), expected, rtol=1e-12)
 
 
 def test_benchmark_beta_tracking_error_ir_and_turnover():

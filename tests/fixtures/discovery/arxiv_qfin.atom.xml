@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <link href="http://arxiv.org/api/query?search_query%3D%28cat%3Aq-fin.PM%20OR%20cat%3Aq-fin.TR%29%20AND%20%28ti%3Amomentum%20OR%20abs%3Amomentum%29%26id_list%3D%26start%3D0%26max_results%3D3" rel="self" type="application/atom+xml"/>
+  <title type="html">ArXiv Query: search_query=(cat:q-fin.PM OR cat:q-fin.TR) AND (ti:momentum OR abs:momentum)&amp;id_list=&amp;start=0&amp;max_results=3</title>
+  <id>http://arxiv.org/api/Xq3yBv0hVjKXc0b0yvJ0wWZcN3E</id>
+  <updated>2026-10-02T00:00:00-04:00</updated>
+  <opensearch:totalResults xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">3</opensearch:totalResults>
+  <opensearch:startIndex xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">0</opensearch:startIndex>
+  <opensearch:itemsPerPage xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">3</opensearch:itemsPerPage>
+  <entry>
+    <id>http://arxiv.org/abs/2609.04512v2</id>
+    <updated>2026-09-22T17:02:11Z</updated>
+    <published>2026-09-14T13:45:09Z</published>
+    <title>Industry-Neutral Momentum and the Cross-Section of
+  Expected Stock Returns</title>
+    <summary>  We study a momentum signal that ranks stocks on their past twelve-month
+return, skipping the most recent month, after removing the industry component of
+returns. Industry-neutral momentum earns 0.92% per month (t = 4.1) in US common
+stocks from 1965 to 2024 and is less exposed to momentum crashes than the raw
+signal.
+</summary>
+    <author>
+      <name>Jane Q. Doe</name>
+    </author>
+    <author>
+      <name>Richard Roe</name>
+      <arxiv:affiliation xmlns:arxiv="http://arxiv.org/schemas/atom">Example University</arxiv:affiliation>
+    </author>
+    <author>
+      <name>Wei  Zhang</name>
+    </author>
+    <arxiv:comment xmlns:arxiv="http://arxiv.org/schemas/atom">41 pages, 9 tables</arxiv:comment>
+    <arxiv:journal_ref xmlns:arxiv="http://arxiv.org/schemas/atom">Journal of Example Finance 12 (2026) 1-41</arxiv:journal_ref>
+    <link href="http://arxiv.org/abs/2609.04512v2" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2609.04512v2" rel="related" type="application/pdf"/>
+    <arxiv:primary_category xmlns:arxiv="http://arxiv.org/schemas/atom" term="q-fin.PM" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="q-fin.PM" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="q-fin.ST" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2608.11873v1</id>
+    <updated>2026-08-30T09:12:44Z</updated>
+    <published>2026-08-30T09:12:44Z</published>
+    <title>Overnight Returns and Retail Order Flow</title>
+    <summary>We show that stocks with high past overnight returns relative to intraday
+returns subsequently underperform. A long-short portfolio sorted on the overnight
+minus intraday return spread earns an annualised Sharpe ratio of 0.8 between 2000
+and 2025.</summary>
+    <author>
+      <name>A. N. Author</name>
+    </author>
+    <link href="http://arxiv.org/abs/2608.11873v1" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2608.11873v1" rel="related" type="application/pdf"/>
+    <arxiv:primary_category xmlns:arxiv="http://arxiv.org/schemas/atom" term="q-fin.TR" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="q-fin.TR" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2511.00321v3</id>
+    <updated>2026-02-01T11:00:00Z</updated>
+    <published>2025-11-03T18:30:00Z</published>
+    <title>Gross Profitability Revisited</title>
+    <summary>Gross profits scaled by assets predict the cross-section of average returns
+as well as book-to-market does; we revisit the evidence out of sample.</summary>
+    <author>
+      <name>B. Researcher</name>
+    </author>
+    <author>
+      <name>C. Researcher</name>
+    </author>
+    <link href="http://arxiv.org/abs/2511.00321v3" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2511.00321v3" rel="related" type="application/pdf"/>
+    <arxiv:primary_category xmlns:arxiv="http://arxiv.org/schemas/atom" term="q-fin.GN" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="q-fin.GN" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="q-fin.PM" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+</feed>

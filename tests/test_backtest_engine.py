@@ -96,8 +96,10 @@ def test_drift_and_first_day_cost():
     # d4: .45/1.055 * 10% = .045/1.055
     expected_gross = [0.0, 0.0, 0.055, 0.045 / 1.055]
     np.testing.assert_allclose(res.gross_returns.to_numpy(), expected_gross, atol=1e-12)
-    # building the book from cash: turnover 1.0, cost 10bp charged on d1
-    assert res.turnover.to_dict() == {d1: pytest.approx(1.0)}
+    # building the book from cash: traded notional 1.0 (all buys) = one-way turnover 0.5;
+    # cost = traded * 10bp = 0.001 charged on d1
+    assert res.traded.to_dict() == {d1: pytest.approx(1.0)}
+    assert res.turnover.to_dict() == {d1: pytest.approx(0.5)}
     assert res.costs.to_dict() == {d1: pytest.approx(0.001)}
     np.testing.assert_allclose(res.daily_returns.to_numpy(), [-0.001, 0.0, 0.055, 0.045 / 1.055], atol=1e-12)
     # buy-and-hold wealth: .5*12.1/10 + .5*9.9/10 = 1.1
@@ -112,13 +114,14 @@ def test_rebalance_turnover_and_costs():
     res = simulate({d0: w, d2: w}, close, costs_bps=10)
     # second execution at d3's close; pre-trade drifted weights (.605, .45)/1.055
     drift_a = 0.605 / 1.055
-    turnover = abs(0.5 - drift_a) + abs(0.5 - (1 - drift_a))  # = 2 * .0775 / 1.055
-    assert turnover == pytest.approx(0.14691943127962084)
-    assert res.turnover[d3] == pytest.approx(turnover)
-    assert res.costs[d3] == pytest.approx(turnover * 10 / 1e4)
+    traded = abs(0.5 - drift_a) + abs(0.5 - (1 - drift_a))  # sell .0775/1.055 A, buy as much B
+    assert traded == pytest.approx(0.14691943127962084)
+    assert res.traded[d3] == pytest.approx(traded)
+    assert res.turnover[d3] == pytest.approx(0.0775 / 1.055)  # one-way = traded / 2
+    assert res.costs[d3] == pytest.approx(traded * 10 / 1e4)  # both legs pay the one-way cost
     # d3: return earned on the old drifted book, minus the cost of trading at the close
     assert res.gross_returns[d3] == pytest.approx(0.055)
-    assert res.daily_returns[d3] == pytest.approx(0.055 - turnover * 1e-3)
+    assert res.daily_returns[d3] == pytest.approx(0.055 - traded * 1e-3)
     # d4: back to 50/50 -> .5 * 0% + .5 * 10% = 5%
     assert res.gross_returns[d4] == pytest.approx(0.05)
     assert list(res.turnover.index) == [d1, d3]
@@ -149,7 +152,9 @@ def test_signal_on_execution_day_does_not_see_that_close():
 def test_long_short_weights_drift():
     close = _close(**BASE)
     res = simulate({d0: pd.Series({"A": 1.0, "B": -1.0})}, close, costs_bps=10)
-    assert res.turnover[d1] == pytest.approx(2.0)  # gross exposure 2
+    # building +1 / -1 from cash: traded notional 2 (buy 1, short 1) = 100% one-way turnover
+    assert res.traded[d1] == pytest.approx(2.0)
+    assert res.turnover[d1] == pytest.approx(1.0)
     # d2: 1*10% - 1*(-10%) = 20%; NAV = 1 (cash) + 1.1 - .9 = 1.2
     # d3: A +10% -> 0.11 / 1.2 ; NAV 1.31
     # d4: B +10% on a -0.9 position -> -0.09 / 1.31
@@ -163,30 +168,95 @@ def test_delisted_holding_frozen_and_dropped_with_one_warning():
     close = _close(A=[10, 10, 11, 12.1, 12.1], B=[10, 10, 9, np.nan, np.nan])
     w = pd.Series({"A": 0.5, "B": 0.5})
     res = simulate({d0: w, d3: w}, close, costs_bps=0)
-    # d3: B has no price -> 0 return; A: .55 * 10% = 5.5% ; d4: A flat -> 0
+    # B never trades again (terminal delisting). d3: B at its last price (no delisting return)
+    # -> 0; A: .55 * 10% = 5.5% ; d4: A flat -> 0
     np.testing.assert_allclose(res.gross_returns.to_numpy(), [0.0, 0.0, 0.055, 0.0], atol=1e-12)
     # second execution on d4: B (no price) dropped from the target, A not renormalised;
-    # the frozen B position became cash, so only A trades: |.5 - .605/1.055|
+    # the frozen B position became cash, so only A trades: |.5 - .605/1.055| (one-way: half)
     assert res.weights_history[d4].to_dict() == {"A": 0.5}
-    assert res.turnover[d4] == pytest.approx(abs(0.5 - 0.605 / 1.055))
+    assert res.traded[d4] == pytest.approx(abs(0.5 - 0.605 / 1.055))
+    assert res.turnover[d4] == pytest.approx(abs(0.5 - 0.605 / 1.055) / 2)
     delist = [m for m in res.warnings if m.startswith("B:")]
     assert len(delist) == 1 and "2024-01-04" in delist[0]
+    assert "no delisting return" in delist[0] and "optimistic" in delist[0]
     assert any("dropped 1 target name(s)" in m and "(B)" in m for m in res.warnings)
+    assert not any("trading halt" in m for m in res.warnings)  # a delisting is not a gap
 
 
-def test_data_gap_keeps_zero_return_until_next_rebalance():
-    # B's price comes back on d4, but the position stays frozen at its last price (0% return)
+def test_delisting_return_is_booked_on_the_first_missing_day():
+    close = _close(A=[10, 10, 11, 12.1, 12.1], B=[10, 10, 9, np.nan, np.nan])
+    w = pd.Series({"A": 0.5, "B": 0.5})
+    res = simulate({d0: w}, close, costs_bps=0, delisting_return=-0.3)
+    # d2: NAV 1.0 (A .55, B .45). d3: A +10% -> +.055; B delisted at 9 * .7 -> -.135
+    # NAV .92 -> -8%; d4: A flat, B is cash -> 0
+    np.testing.assert_allclose(res.gross_returns.to_numpy(), [0.0, 0.0, -0.08, 0.0], atol=1e-12)
+    assert np.prod(1 + res.gross_returns) == pytest.approx(0.5 * 1.21 + 0.5 * 0.9 * 0.7)
+    msg = [m for m in res.warnings if m.startswith("B:")]
+    assert len(msg) == 1 and "-30.0% delisting return" in msg[0]
+    # a short position profits from the haircut
+    short = simulate({d0: pd.Series({"B": -1.0})}, close, costs_bps=0, delisting_return=-0.3)
+    assert np.prod(1 + short.gross_returns) == pytest.approx(1 - (0.9 * 0.7 - 1))
+    with pytest.raises(ValueError, match="delisting_return"):
+        simulate({d0: w}, close, delisting_return=-1.0)
+
+
+def test_data_gap_is_carried_and_marked_when_trading_resumes():
+    # B's price is missing on d3 and comes back at 12 on d4: the position keeps its exposure
     close = _close(A=[10, 10, 10, 10, 10], B=[10, 10, 9, np.nan, 12])
     res = simulate({d0: pd.Series({"A": 0.5, "B": 0.5})}, close, costs_bps=0)
-    np.testing.assert_allclose(res.gross_returns.to_numpy(), [0.0, -0.05, 0.0, 0.0], atol=1e-12)
-    assert sum(m.startswith("B:") for m in res.warnings) == 1
+    # d2: B 10 -> 9 = -5% (NAV .95); d3: B carried at 9 -> 0; d4: B 9 -> 12 on a .45 position
+    # -> NAV .5 + .6 = 1.1 -> return 1.1 / .95 - 1 = .15 / .95
+    np.testing.assert_allclose(res.gross_returns.to_numpy(), [0.0, -0.05, 0.0, 0.15 / 0.95], atol=1e-12)
+    assert np.prod(1 + res.gross_returns) == pytest.approx(0.5 + 0.5 * 1.2)
+    gap = [m for m in res.warnings if "trading halt / data gap" in m]
+    assert len(gap) == 1 and "B from 2024-01-04" in gap[0]
+    assert not any(m.startswith("B:") for m in res.warnings)  # not reported as a delisting
+
+
+def test_data_gap_followed_by_crash_is_not_hidden():
+    # reviewer's reproduction: A misses one print, then reopens 50% lower
+    idx = pd.bdate_range("2024-01-01", periods=7)
+    close = pd.DataFrame({"A": [100, 100, 100, np.nan, 50, 50, 50], "B": [100.0] * 7}, index=idx, dtype=float)
+    res = simulate({idx[0]: pd.Series({"A": 0.5, "B": 0.5})}, close, costs_bps=0)
+    # true value .5 * .5 + .5 = .75; the loss lands on the day trading resumes (idx[4])
+    assert np.prod(1 + res.daily_returns) == pytest.approx(0.75)
+    assert res.gross_returns[idx[3]] == 0.0
+    assert res.gross_returns[idx[4]] == pytest.approx(-0.25)
+    # the quantile analysis' forward returns see the same crash
+    fwd = forward_returns_from_close(close, [idx[0], idx[5]], execution_lag=1)
+    assert fwd[idx[0]].to_dict() == pytest.approx({"A": -0.5, "B": 0.0})
+
+
+def test_gap_on_rebalance_day_keeps_position_until_trading_resumes():
+    idx = pd.bdate_range("2024-01-01", periods=7)  # Mon 1 .. Tue 9
+    e0, e1, e2, e3, e4, e5, e6 = idx
+    # B is halted on e3 and e4 (an execution day), reopens at 5 on e5
+    close = pd.DataFrame({"A": [10.0] * 7, "B": [10, 10, 10, np.nan, np.nan, 5, 5]}, index=idx, dtype=float)
+    targets = {e0: pd.Series({"A": 0.5, "B": 0.5}), e3: pd.Series({"A": 1.0}), e5: pd.Series({"A": 1.0})}
+    res = simulate(targets, close, costs_bps=0)
+    # execution e4: B cannot be sold, it stays at its drifted weight .5; A is bought up to 1.0
+    # (traded .5, one-way .25). Book A 1.0 + B .5 (cash -.5)
+    assert res.weights_history[e4].to_dict() == {"A": 1.0, "B": 0.5}
+    assert res.traded[e4] == pytest.approx(0.5) and res.turnover[e4] == pytest.approx(0.25)
+    # e5: B reopens at 5 -> -.5 * .5 = -25%; NOT liquidated at the stale 10
+    assert res.gross_returns[e5] == pytest.approx(-0.25)
+    # execution e6: drifted A = 1 / .75, B = .25 / .75 -> sell B, trim A: traded 2/3
+    assert res.traded[e6] == pytest.approx(2 / 3) and res.turnover[e6] == pytest.approx(1 / 3)
+    assert res.weights_history[e6].to_dict() == {"A": 1.0}
+    assert np.prod(1 + res.daily_returns) == pytest.approx(0.75)
+    assert any(m.startswith("2024-01-05: 1 held name(s) had no price") and "(B)" in m for m in res.warnings)
+    # with costs, the stuck position keeps its currency value: its weight vs the post-cost
+    # NAV is .5 / (1 - .5 * 10bp), so the e5 loss is .25 / (1 - .0005)
+    costly = simulate(targets, close, costs_bps=10)
+    assert costly.weights_history[e4]["B"] == pytest.approx(0.5 / (1 - 0.0005))
+    assert costly.gross_returns[e5] == pytest.approx(-0.25 / (1 - 0.0005))
 
 
 def test_missing_price_on_execution_day_dropped_not_renormalised():
     close = _close(A=[10, 10, 11, 11, 11], C=[10, np.nan, 10, 10, 10])
     res = simulate({d0: pd.Series({"A": 0.5, "C": 0.3, "ZZZ": 0.2})}, close, costs_bps=10)
     assert res.weights_history[d1].to_dict() == {"A": 0.5}
-    assert res.turnover[d1] == pytest.approx(0.5)
+    assert res.traded[d1] == pytest.approx(0.5) and res.turnover[d1] == pytest.approx(0.25)
     assert res.gross_returns[d2] == pytest.approx(0.05)  # .5 * 10%, the rest is cash
     msg = [m for m in res.warnings if "dropped 2 target name(s)" in m]
     assert msg and "C" in msg[0] and "ZZZ" in msg[0] and "not renormalised" in msg[0]
@@ -213,6 +283,21 @@ def test_cash_target_window_and_unexecutable_signals():
         simulate({d0: w}, close, costs_bps=-1)
 
 
+def test_full_long_only_swap_is_100pct_one_way_turnover():
+    close = _close(A=[10.0] * 5, B=[10.0] * 5)
+    res = simulate({d0: pd.Series({"A": 1.0}), d1: pd.Series({"B": 1.0})}, close, costs_bps=10)
+    # d1: build A from cash (buy 1) ; d2: sell A 1, buy B 1 -> traded 2, one-way 1.0
+    assert res.traded.to_dict() == {d1: pytest.approx(1.0), d2: pytest.approx(2.0)}
+    assert res.turnover.to_dict() == {d1: pytest.approx(0.5), d2: pytest.approx(1.0)}
+    assert res.costs.to_dict() == {d1: pytest.approx(0.001), d2: pytest.approx(0.002)}
+    np.testing.assert_allclose(res.daily_returns.to_numpy(), [-0.001, -0.002, 0.0, 0.0], atol=1e-15)
+    # the stats layer reports the series as-is: mean(50%, 100%) = 75% one-way per rebalance
+    from aitrading.backtest.metrics import performance_stats
+
+    stats = performance_stats(res.daily_returns, label="swap", turnover=res.turnover)
+    assert stats.avg_turnover_pct == pytest.approx(75.0)
+
+
 def test_signals_mapping_to_same_execution_day_use_the_later_one():
     idx = pd.bdate_range("2024-01-01", periods=7)  # Mon 1 .. Tue 9
     close = pd.DataFrame({"A": [10.0] * 6 + [11.0], "B": [10.0] * 7}, index=idx)
@@ -233,9 +318,15 @@ def test_ruin_is_clipped_at_minus_100pct():
     assert any("ruin" in m for m in res.warnings)
 
 
-def _reference_simulate(target_weights, close, costs_bps, lag):
-    """Brute-force day-by-day simulator (positions in currency units) used as an oracle."""
+def _reference_simulate(target_weights, close, costs_bps, lag, delisting_return=0.0):
+    """Brute-force day-by-day simulator (positions in currency units) used as an oracle.
+
+    Gap = missing price with a later valid price (carried at the last price, marked when it
+    trades again, never traded while missing); delisting = no later valid price (marked at
+    last * (1 + delisting_return), then cash at the next rebalance).
+    """
     idx = close.index
+    last_valid = {k: idx.get_loc(close[k].last_valid_index()) for k in close if close[k].notna().any()}
     execs = {}
     for t, w in sorted(target_weights.items()):
         p = execution_index(idx, t, lag)
@@ -243,30 +334,38 @@ def _reference_simulate(target_weights, close, costs_bps, lag):
             execs[p] = w
     first = min(execs)
     pos: dict[str, float] = {}  # ticker -> currency value
-    frozen: set[str] = set()
+    last_px: dict[str, float] = {}
+    dead: set[str] = set()
     cash, nav = 1.0, 1.0
     out = []
     for p in range(first, len(idx)):
         value = cash
         for k in list(pos):
-            if k not in frozen and p > first:
-                p0, p1 = close[k].iloc[p - 1], close[k].iloc[p]
-                if np.isfinite(p1):
-                    pos[k] *= p1 / p0
-                else:
-                    frozen.add(k)  # valued at its last price from here on
+            px = close[k].iloc[p]
+            if k not in dead and p > first:
+                if np.isfinite(px):
+                    pos[k] *= px / last_px[k]
+                    last_px[k] = px
+                elif p > last_valid[k]:  # delisted today
+                    pos[k] *= 1.0 + delisting_return
+                    dead.add(k)
+                # else: a gap - carried at the last price
             value += pos[k]
         r = value / nav - 1.0
         if p in execs:
-            for k in frozen:  # frozen positions become cash at the rebalance
+            for k in dead:  # delisted positions became cash
                 cash += pos.pop(k)
-            frozen.clear()
-            drifted = {k: v / value for k, v in pos.items()}
+            dead.clear()
+            stuck = {k for k in pos if not np.isfinite(close[k].iloc[p])}
+            drifted = {k: v / value for k, v in pos.items() if k not in stuck}
             tgt = {k: v for k, v in execs[p].items() if v != 0 and np.isfinite(close[k].iloc[p])}
-            turnover = sum(abs(tgt.get(k, 0.0) - drifted.get(k, 0.0)) for k in set(tgt) | set(drifted))
-            r -= turnover * costs_bps / 1e4
+            traded = sum(abs(tgt.get(k, 0.0) - drifted.get(k, 0.0)) for k in set(tgt) | set(drifted))
+            r -= traded * costs_bps / 1e4
             value = nav * (1.0 + r)
-            pos = {k: w * value for k, w in tgt.items()}
+            pos = {k: v for k, v in pos.items() if k in stuck}  # untradeable: keep currency value
+            for k, w in tgt.items():
+                pos[k] = w * value
+                last_px[k] = close[k].iloc[p]
             cash = value - sum(pos.values())
         nav = value
         out.append(r)
@@ -278,16 +377,24 @@ def test_matches_bruteforce_reference_on_random_data():
     idx = pd.bdate_range("2021-01-01", periods=120)
     tick = [f"S{i}" for i in range(12)]
     px = pd.DataFrame(50 * np.exp(np.cumsum(rng.normal(0, 0.02, (120, 12)), axis=0)), index=idx, columns=tick)
+    # signal dates are Fridays (rows 0, 5, 10, ...): executions on rows 5k+1 (lag 1), 5k+2 (lag 2)
     px.iloc[70:, 3] = np.nan  # delisting
-    px.iloc[30:33, 5] = np.nan  # data gap
+    px.iloc[30:33, 5] = np.nan  # data gap covering execution days (lag 1: row 31, lag 2: row 32)
+    px.iloc[[44, 46, 47, 58, 90], 7] = np.nan  # one-day holes; 46 / 47 are execution days
+    px.iloc[55:62, 1] = np.nan  # a halt spanning two rebalances (rows 56 / 61, lag 2: 57)
+    px.iloc[:15, 9] = np.nan  # listed later: dropped from early targets
+    px.iloc[100:, 10] = np.nan  # second delisting
     targets = {}
     for d in rebalance_dates(idx, "weekly")[:-1]:
         w = pd.Series(rng.normal(0, 1, 12), index=tick)
         targets[d] = (w / w.abs().sum() * 1.5).round(4)
-    for bps, lag in [(0, 1), (25, 1), (10, 2)]:
-        res = simulate(targets, px, costs_bps=bps, execution_lag=lag)
-        ref = _reference_simulate(targets, px, bps, lag)
+    for bps, lag, dr in [(0, 1, 0.0), (25, 1, 0.0), (10, 2, 0.0), (10, 1, -0.3)]:
+        res = simulate(targets, px, costs_bps=bps, execution_lag=lag, delisting_return=dr)
+        ref = _reference_simulate(targets, px, bps, lag, dr)
         pd.testing.assert_series_equal(res.daily_returns, ref, check_names=False, check_freq=False, atol=1e-12, rtol=0)
+    assert any("had missing prices while held" in m for m in res.warnings)
+    assert any("held name(s) had no price on the execution day" in m for m in res.warnings)
+    assert any(m.startswith("S3:") for m in res.warnings) and any(m.startswith("S10:") for m in res.warnings)
 
 
 def test_speed_500_names_10_years_monthly():
@@ -416,6 +523,21 @@ def test_forward_returns_consistent_with_simulate():
     # lag 0: d0 close -> d2 close
     fwd0 = forward_returns_from_close(close, [d0, d2], execution_lag=0)
     assert fwd0[d0].to_dict() == pytest.approx({"A": 0.1, "B": -0.1})
+    # an explicit delisting return haircuts B's terminal value: 9 * .7 / 10 - 1
+    fwd_dr = forward_returns_from_close(close, [d0, d2], execution_lag=1, delisting_return=-0.3)
+    assert fwd_dr[d0].to_dict() == pytest.approx({"A": 0.21, "B": -0.37})
+
+
+def test_forward_returns_exit_after_a_halt_on_the_exit_day():
+    # B is halted on the exit day d3 and reopens at 12 on d4: it is sold when trading resumes
+    close = _close(A=[10, 10, 11, 12.1, 12.1], B=[10, 10, 9, np.nan, 12])
+    fwd = forward_returns_from_close(close, [d0, d2, d3], execution_lag=1)
+    assert fwd[d0].to_dict() == pytest.approx({"A": 0.21, "B": 0.2})
+    # B has no entry price on d3 (the halt) -> not in the next period, so no double counting
+    assert fwd[d2].to_dict() == pytest.approx({"A": 0.0})
+    # a mid-period hole does not stop the return: interior NaN on d2, exit on d3
+    gap = _close(A=[10, 10, np.nan, 8, 8])
+    assert forward_returns_from_close(gap, [d0, d2])[d0].to_dict() == pytest.approx({"A": -0.2})
 
 
 def test_spearman_basics():

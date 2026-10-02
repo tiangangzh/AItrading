@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:content="http://purl.org/rss/1.0/modules/content/"
+     xmlns:dc="http://purl.org/dc/elements/1.1/"
+     xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Example Quant Notes</title>
+    <link>https://quant.example.com/</link>
+    <atom:link href="https://quant.example.com/feed/" rel="self" type="application/rss+xml"/>
+    <description>Notes on systematic equity research</description>
+    <language>en-US</language>
+    <lastBuildDate>Tue, 29 Sep 2026 08:00:00 +0000</lastBuildDate>
+    <item>
+      <title>Short-term reversal after earnings: a replication</title>
+      <link>https://quant.example.com/2026/09/short-term-reversal-earnings/</link>
+      <dc:creator><![CDATA[Jane Doe, John Roe]]></dc:creator>
+      <pubDate>Tue, 29 Sep 2026 08:00:00 +0000</pubDate>
+      <category><![CDATA[Anomalies]]></category>
+      <guid isPermaLink="false">https://quant.example.com/?p=1201</guid>
+      <description><![CDATA[<p>We replicate the post-earnings reversal&#8230;</p>]]></description>
+      <content:encoded><![CDATA[<p>We replicate the <strong>post-earnings reversal</strong> effect on US stocks.</p>
+<p>Stocks in the bottom decile of the three-day announcement return outperform the top decile by 1.1% over the next month (t&nbsp;=&nbsp;3.2), 1990&ndash;2025.</p>
+<script>trackView();</script>
+<ul><li>Universe: Russell 3000</li><li>Rebalance: monthly</li></ul>]]></content:encoded>
+    </item>
+    <item>
+      <title>Value &amp; quality: still working?</title>
+      <guid>https://quant.example.com/2026/08/value-and-quality/</guid>
+      <author>editor@quant.example.com (Ed Editor)</author>
+      <pubDate>Mon, 17 Aug 2026 14:30:00 GMT</pubDate>
+      <description>A look at combining book-to-market with gross profitability &lt;b&gt;since 2010&lt;/b&gt;.</description>
+    </item>
+    <item>
+      <title>An old post about the January effect</title>
+      <link>https://quant.example.com/2019/01/january-effect/</link>
+      <pubDate>Wed, 02 Jan 2019 10:00:00 +0000</pubDate>
+      <description>Small caps in January.</description>
+    </item>
+    <item>
+      <description>An item with neither title nor link is skipped.</description>
+    </item>
+  </channel>
+</rss>

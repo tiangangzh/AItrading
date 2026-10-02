@@ -228,20 +228,44 @@ def _compound_onto(series: pd.Series, target: pd.DatetimeIndex, ppy: float) -> p
     return out
 
 
+# Monthly-or-coarser risk-free series are per-calendar-period rates; match them by period.
+_RF_PERIOD = {12.0: "M", 4.0: "Q", 1.0: "Y"}
+
+
 def _align_rf(rf: pd.Series, index: pd.DatetimeIndex, ppy: float) -> pd.Series:
     """Risk-free per-period rate on ``index`` (fractions per return period).
 
-    * rf finer than the returns (e.g. daily rf, monthly returns): compounded over each return
-      interval.
-    * same or coarser frequency: converted geometrically, (1 + rf) ** (rf_ppy / ppy) - 1, then
-      forward-filled ("as of") onto the return dates.
-    Dates before the first rf observation use the first available value; if rf has no data, 0.
+    * Monthly / quarterly / annual rf is a rate *for that calendar period*, whatever day it is
+      labelled with (the Kenneth French RF sits on the calendar month-end, FRED monthly series on
+      the 1st), so it is matched to the returns by calendar period - never as-of, which would
+      charge month m (returns dated on its last trading day, or daily returns inside it) the
+      rate of month m-1:
+      - same or coarser than the returns: (1 + rf) ** (rf_ppy / ppy) - 1 on every return date of
+        that period (e.g. a monthly rate spread geometrically over the days of the month);
+      - finer than the returns (monthly rf, quarterly returns): the periods are compounded into
+        the return interval that contains them.
+    * Daily / weekly rf: compounded over each return interval when finer than the returns,
+      otherwise converted geometrically and forward-filled ("as of") onto the return dates.
+    Return dates without rf (before its first or after its last period) take the nearest
+    available value (rf published with a lag keeps its latest rate); if rf has no data, 0.
     """
     rf = _clean(rf, "rf")
     if rf.empty:
         return pd.Series(0.0, index=index)
     rf_ppy = infer_periods_per_year(rf.index) if len(rf) >= 2 else ppy
-    if rf_ppy > 1.5 * ppy and len(index) >= 2:
+    code = _RF_PERIOD.get(float(rf_ppy)) if len(rf) >= 2 else None
+    finer = rf_ppy > 1.5 * ppy and len(index) >= 2
+    if code is not None:
+        by_period = rf.groupby(rf.index.to_period(code)).last()
+        if finer:
+            # label each period at its first day so a return dated on the last trading day
+            # (e.g. 2022-12-30) still owns its own calendar month's rate
+            starts = pd.Series(by_period.to_numpy(), index=by_period.index.to_timestamp(how="start"))
+            out = _compound_onto(starts, index, ppy)
+        else:
+            conv = (1.0 + by_period) ** (rf_ppy / ppy) - 1.0
+            out = pd.Series(conv.reindex(index.to_period(code)).to_numpy(), index=index)
+    elif finer:
         out = _compound_onto(rf, index, ppy)
     else:
         conv = (1.0 + rf) ** (rf_ppy / ppy) - 1.0
@@ -299,7 +323,9 @@ def performance_stats(
     * hit rate = share of periods with r > 0; best / worst single period.
     * skew / excess kurtosis = bias-corrected sample moments (pandas), ``None`` if n < 8.
     * mean_return_t_stat = Newey-West t-stat of the mean raw periodic return.
-    * avg_turnover_pct = mean of the given (one-way, per rebalance) turnover series, in %.
+    * avg_turnover_pct = mean of the given one-way turnover series (per rebalance, fraction of
+      book, e.g. ``SimulationResult.turnover`` = 0.5 * traded notional), in %; it is not halved
+      here, so do not pass the two-way traded notional.
     * benchmark (same periodicity, or finer - then compounded onto the return dates): beta =
       cov(r, b) / var(b), tracking error = std(r - b) * sqrt(ppy), IR = mean(r - b) / std(r - b)
       * sqrt(ppy), on the overlapping dates (>= 2 needed).

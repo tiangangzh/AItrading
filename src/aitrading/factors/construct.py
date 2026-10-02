@@ -20,7 +20,10 @@ a row that exists with NaN stays NaN.
 
 Market. ``Mkt-RF`` = value-weighted return of every name with a return in period ``s`` and a
 positive market cap at the end of period ``s-1``, minus ``RF`` of period ``s`` (when ``rf`` is
-not supplied, the raw market return is reported and a warning is issued).
+not supplied, the raw market return is reported and a warning is issued). ``RF`` must be a rate per
+return period: a finer ``rf`` (daily RF, monthly returns) is compounded over each return period
+``(previous date, date]`` (calendar months for monthly returns) with a warning, and periods it only
+partly covers are NaN; a coarser ``rf`` (monthly RF, daily returns) raises ``ValueError``.
 
 Value weights. Every portfolio return is value-weighted with weights = market cap at the end of
 the previous period (``market_cap.shift(1)``), renormalised over the members that have a return in
@@ -79,7 +82,14 @@ import numpy as np
 import pandas as pd
 
 from aitrading.backtest.models import FactorConstructionCheck
-from aitrading.factors.french import _find_column, factor_columns
+from aitrading.factors.french import (
+    _SPACING_RANK,
+    _canon,
+    _compound_onto,
+    _find_column,
+    _spacing,
+    factor_columns,
+)
 
 __all__ = [
     "MIN_NYSE_NAMES",
@@ -114,7 +124,9 @@ class CharacteristicsPanel:
     * ``investment`` - asset growth known at each date (ff5).
     * ``momentum_12_1`` - formation-period return (t-12..t-1) known at each date (carhart4).
     * ``exchange`` - ticker -> listing exchange ('NYSE', 'NASDAQ', ...), for NYSE breakpoints.
-    * ``rf`` - risk-free return per period (fractions), aligned with ``returns``.
+    * ``rf`` - risk-free return per period (fractions). At the returns' frequency it is matched by
+      date (by calendar month for monthly data); a finer series (e.g. the French daily RF with
+      monthly returns) is compounded over each return period; a coarser one raises ``ValueError``.
     """
 
     returns: pd.DataFrame
@@ -227,6 +239,36 @@ def _align_series(s: pd.Series, index: pd.DatetimeIndex) -> pd.Series:
     return out.astype(float)
 
 
+def _align_rf(rf: pd.Series, index: pd.DatetimeIndex) -> tuple[np.ndarray, list[str]]:
+    """Per-period risk-free returns on the returns ``index`` (+ warnings).
+
+    The spacing of ``rf`` and of the returns is inferred from the median gap between dates. Same
+    spacing: :func:`_align_series`. RF finer than the returns (e.g. the French daily RF with monthly
+    returns): RF is compounded over each return period (:func:`aitrading.factors.french._compound_onto`;
+    periods RF only partly covers are NaN) and a warning says so. RF coarser than the returns (a
+    monthly RF with daily returns): ``ValueError`` - a monthly rate is not a daily one.
+    """
+    if isinstance(rf.index, pd.PeriodIndex):
+        rf = pd.Series(rf.to_numpy(), index=rf.index.to_timestamp(how="end").normalize(), name=rf.name)
+    if not isinstance(rf.index, pd.DatetimeIndex):
+        raise TypeError("panel.rf must have a DatetimeIndex")
+    rf = rf[~rf.index.duplicated(keep="last")].sort_index().astype(float)
+    r_sp, s_sp = _spacing(index), _spacing(rf.index)
+    if r_sp is None or s_sp is None or r_sp == s_sp:
+        return _align_series(rf, index).to_numpy(), []
+    if _SPACING_RANK[s_sp] > _SPACING_RANK[r_sp]:
+        raise ValueError(
+            f"panel.rf is {s_sp} but panel.returns is {r_sp}: a {s_sp} risk-free rate cannot be used as the "
+            f"per-period rate of {r_sp} returns. Supply RF at the returns' frequency (e.g. the RF column of "
+            f"load_french_factors(model, 'daily') for daily returns)."
+        )
+    comp, n_partial = _compound_onto(rf.to_frame("RF"), index, r_sp)
+    msg = f"panel.rf is {s_sp} but panel.returns is {r_sp}: RF was compounded over each return period"
+    if n_partial:
+        msg += f" ({n_partial} period(s) only partly covered by RF were set to NaN)"
+    return comp["RF"].to_numpy(dtype=float), [msg]
+
+
 def _fmt(ts: pd.Timestamp) -> str:
     return pd.Timestamp(ts).strftime("%Y-%m-%d")
 
@@ -307,24 +349,37 @@ class _Builder:
         if not bps.from_nyse:
             self._fallbacks.setdefault(label, []).append(self.index[row])
 
-    def held_codes(self, sort: _SortSpec, rows: list[int], size_rows: list[np.ndarray], chars: list[np.ndarray]) -> np.ndarray:
-        """Codes held in each period: the portfolio formed at the latest formation row < period."""
+    def held_codes(
+        self, sort: _SortSpec, rows: list[int], size_rows: list[np.ndarray], chars: list[np.ndarray]
+    ) -> tuple[np.ndarray, int | None]:
+        """Codes held in each period (the portfolio formed at the latest formation row before it)
+        and the first formation row at which any name could be sorted (None if never)."""
         n, m = self.R.shape
         held = np.full((n, m), np.nan)
+        first: int | None = None
         for k, row in enumerate(rows):
+            end = rows[k + 1] if k + 1 < len(rows) else n - 1
+            if end <= row:
+                continue  # formed on the last date: never held
             codes, bps = _sort_codes(size_rows[k], chars[k], self.nyse, MIN_NYSE_NAMES)
             self._record(sort.title, bps, row)
-            end = rows[k + 1] if k + 1 < len(rows) else n - 1
-            if end > row:
-                held[row + 1 : end + 1, :] = np.where(codes >= 0, codes, np.nan)
-        return held
+            if bps is not None and first is None:
+                first = row
+            held[row + 1 : end + 1, :] = np.where(codes >= 0, codes, np.nan)
+        return held, first
 
-    def portfolios(self, sort: _SortSpec, held: np.ndarray, first_row: int | None, factors_using: dict[int, list[str]]) -> np.ndarray:
+    def portfolios(
+        self, sort: _SortSpec, held_first: tuple[np.ndarray, int | None], factors_using: dict[int, list[str]]
+    ) -> np.ndarray:
+        """Portfolio returns (rows x 6); thin portfolios (used by a factor) -> NaN + one warning."""
+        held, first_row = held_first
         rets, counts = _vw_portfolios(self.R, self.W, held, 6)
         if first_row is None:
             return rets
         thin = counts < self.min_names
-        thin[: first_row + 1, :] = False  # nothing is held before the first formation
+        thin[: first_row + 1, :] = False  # nothing was held before the first effective formation
+        unused = [k for k in range(6) if not factors_using.get(k)]
+        thin[:, unused] = False
         if thin.any():
             names = [f"{sz}/{lab}" for sz in ("S", "B") for lab in sort.labels]
             parts = [f"{names[k]}: {int(thin[:, k].sum())}" for k in range(6) if thin[:, k].any()]
@@ -377,7 +432,8 @@ def construct_factors(
     Returns ``(factors, warnings)``: a float frame indexed like ``panel.returns`` (sorted) with
     columns ``factor_columns(model)`` (+ ``"RF"`` when ``panel.rf`` is given), in fractions per
     period. Periods before the first formation (and the first period, which has no prior market
-    cap) are NaN.
+    cap) are NaN. Raises ``ValueError`` for an unknown model / formation, missing characteristics,
+    or a ``panel.rf`` coarser than the returns (see :class:`CharacteristicsPanel`).
     """
     if model not in ("capm", "ff3", "carhart4", "ff5"):
         raise ValueError(f"unknown factor model {model!r}; expected capm, ff3, carhart4 or ff5")
@@ -395,7 +451,8 @@ def construct_factors(
     b = _Builder(panel, min_names_per_portfolio)
     cols = factor_columns(model)
     n = len(b.index)
-    out: dict[str, np.ndarray] = {}
+    out: dict[str, np.ndarray] = {}  # keyed by canonical name: MKTRF, SMB, HML, RMW, CMA, MOM
+    mkt_name = cols[0]
 
     # --- market ---------------------------------------------------------------------------
     mkt, mcount = _vw_portfolios(b.R, b.W, np.zeros_like(b.R), 1)
@@ -403,21 +460,24 @@ def construct_factors(
     thin_mkt = (mcount[:, 0] < min_names_per_portfolio)
     thin_mkt[:1] = False
     if thin_mkt.any():
-        rows = np.flatnonzero(thin_mkt)
+        thin_rows = np.flatnonzero(thin_mkt)
         b.warnings.append(
-            f"market portfolio had fewer than {min_names_per_portfolio} names in {rows.size} period(s) "
-            f"(first {_fmt(b.index[rows[0]])}); {cols[0]} set to NaN there"
+            f"market portfolio had fewer than {min_names_per_portfolio} names in {thin_rows.size} period(s) "
+            f"(first {_fmt(b.index[thin_rows[0]])}); {mkt_name} set to NaN there"
         )
         mkt = np.where(thin_mkt, np.nan, mkt)
-    rf = _align_series(panel.rf, b.index).to_numpy() if panel.rf is not None else None
+    rf: np.ndarray | None = None
+    if panel.rf is not None:
+        rf, rf_warnings = _align_rf(panel.rf, b.index)
+        b.warnings.extend(rf_warnings)
     if rf is not None:
-        out[cols[0]] = mkt - rf
+        out["MKTRF"] = mkt - rf
         missing_rf = np.isnan(rf) & np.isfinite(mkt)
         if missing_rf.any():
-            b.warnings.append(f"risk-free rate missing in {int(missing_rf.sum())} period(s); {cols[0]} is NaN there")
+            b.warnings.append(f"risk-free rate missing in {int(missing_rf.sum())} period(s); {mkt_name} is NaN there")
     else:
-        out[cols[0]] = mkt
-        b.warnings.append(f"no risk-free rate supplied: {cols[0]} is the raw value-weighted market return (RF = 0)")
+        out["MKTRF"] = mkt
+        b.warnings.append(f"no risk-free rate supplied: {mkt_name} is the raw value-weighted market return (RF = 0)")
 
     # --- characteristic sorts ----------------------------------------------------------------
     if model != "capm":
@@ -446,7 +506,6 @@ def construct_factors(
         else:
             rows = list(range(n))
             denom_rows = rows
-        first_row = rows[0] if rows else None
         sizes = [b.ME[r] for r in rows]
 
         # B/M = book equity / (December or current) market cap; book equity <= 0 is excluded
@@ -455,7 +514,8 @@ def construct_factors(
         n_neg = 0
         for r, d, size in zip(rows, denom_rows, sizes):
             be, me_d = BE[r], b.ME[d]
-            n_neg += int((np.isfinite(be) & (be <= 0) & np.isfinite(size) & (size > 0)).sum())
+            if r < n - 1:  # count only formations that are held for at least one period
+                n_neg += int((np.isfinite(be) & (be <= 0) & np.isfinite(size) & (size > 0)).sum())
             with np.errstate(invalid="ignore", divide="ignore"):
                 bm_chars.append(np.where((be > 0) & (me_d > 0), be / np.where(me_d > 0, me_d, 1.0), np.nan))
         if n_neg:
@@ -463,7 +523,7 @@ def construct_factors(
                 f"{n_neg} name-formation(s) with non-positive book equity were excluded from the B/M sorts"
             )
         bm_held = b.held_codes(_SORTS["bm"], rows, sizes, bm_chars)
-        bm_rets = b.portfolios(_SORTS["bm"], bm_held, first_row,
+        bm_rets = b.portfolios(_SORTS["bm"], bm_held,
                                {k: ["SMB"] + (["HML"] if k in (0, 2, 3, 5) else []) for k in range(6)})
         smb_bm = _smb(bm_rets)
         hml = _spread(bm_rets, high=2, low=0)
@@ -473,30 +533,31 @@ def construct_factors(
             INV = _asof(panel.investment, b.index, b.tickers, "investment")
             assert OP is not None and INV is not None
             op_held = b.held_codes(_SORTS["op"], rows, sizes, [OP[r] for r in rows])
-            op_rets = b.portfolios(_SORTS["op"], op_held, first_row,
+            op_rets = b.portfolios(_SORTS["op"], op_held,
                                    {k: ["SMB"] + (["RMW"] if k in (0, 2, 3, 5) else []) for k in range(6)})
             inv_held = b.held_codes(_SORTS["inv"], rows, sizes, [INV[r] for r in rows])
-            inv_rets = b.portfolios(_SORTS["inv"], inv_held, first_row,
+            inv_rets = b.portfolios(_SORTS["inv"], inv_held,
                                     {k: ["SMB"] + (["CMA"] if k in (0, 2, 3, 5) else []) for k in range(6)})
-            out[cols[1]] = (smb_bm + _smb(op_rets) + _smb(inv_rets)) / 3.0
-            out[cols[2]] = hml
-            out[cols[3]] = _spread(op_rets, high=2, low=0)   # RMW: robust minus weak
-            out[cols[4]] = _spread(inv_rets, high=0, low=2)  # CMA: conservative minus aggressive
+            out["SMB"] = (smb_bm + _smb(op_rets) + _smb(inv_rets)) / 3.0
+            out["RMW"] = _spread(op_rets, high=2, low=0)   # robust minus weak
+            out["CMA"] = _spread(inv_rets, high=0, low=2)  # conservative minus aggressive
         else:
-            out[cols[1]] = smb_bm
-            out[cols[2]] = hml
+            out["SMB"] = smb_bm
+        out["HML"] = hml
 
         if model == "carhart4":
             MOM = _asof(panel.momentum_12_1, b.index, b.tickers, "momentum_12_1")
             assert MOM is not None
             mrows = list(range(n))
             mom_held = b.held_codes(_SORTS["mom"], mrows, [b.ME[r] for r in mrows], [MOM[r] for r in mrows])
-            mom_rets = b.portfolios(_SORTS["mom"], mom_held, 0 if n else None,
-                                    {k: ["Mom"] for k in (0, 2, 3, 5)})
-            out[cols[3]] = _spread(mom_rets, high=2, low=0)
+            mom_rets = b.portfolios(_SORTS["mom"], mom_held, {k: ["Mom"] for k in (0, 2, 3, 5)})
+            out["MOM"] = _spread(mom_rets, high=2, low=0)
 
     b.finish_warnings()
-    frame = pd.DataFrame({c: out[c] for c in cols}, index=b.index)
+    missing = [c for c in cols if _canon(c) not in out]
+    if missing:
+        raise ValueError(f"factor_columns({model!r}) has columns {missing} this module cannot construct")
+    frame = pd.DataFrame({c: out[_canon(c)] for c in cols}, index=b.index)
     if rf is not None:
         frame["RF"] = rf
     frame = frame.astype(float)

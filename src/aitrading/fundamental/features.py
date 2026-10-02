@@ -10,9 +10,9 @@ Conventions
 * Ratios are NaN when the denominator is missing, zero or negative (market cap, price, revenue,
   EBITDA, net income, equity, consensus revenue); numerators may be negative (negative FCF gives a
   negative FCF yield, a loss gives a negative earnings yield / operating margin).
-* Market cap, price, target price, revenue estimates, debt, cash, interest expense, share counts and
-  analyst counts must be >= 0 (> 0 where used as a denominator); a negative value is a data error
-  and is treated as missing.
+* Market cap, price, target price, revenue estimates, capex, debt, cash, interest expense and the
+  analyst count must be >= 0 (> 0 where used as a denominator); a negative value is a data error
+  and is treated as missing. Non-numeric or infinite inputs are missing too.
 * FCF is ``fcf_ttm``; when that is missing it falls back to ``cfo_ttm - capex_ttm``.
 * Enterprise value = market cap + total debt - cash; it may be negative (net cash above market
   cap). ev_to_ebitda / ev_to_sales keep that sign: only the catalog's denominator guards apply.

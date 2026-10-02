@@ -141,24 +141,41 @@ def quantile_analysis(
 
 
 def forward_returns_from_close(
-    close: pd.DataFrame, dates: list[pd.Timestamp], execution_lag: int = 1
+    close: pd.DataFrame,
+    dates: list[pd.Timestamp],
+    execution_lag: int = 1,
+    *,
+    delisting_return: float = 0.0,
 ) -> dict[pd.Timestamp, pd.Series]:
     """Forward holding-period returns per signal date, consistent with ``engine.simulate``.
 
     For consecutive signal dates t_i < t_{i+1} the forward return of a name is measured from the
     close ``execution_lag`` sessions after t_i (its execution day, see
     ``engine.execution_index``) to the close of the execution day of t_{i+1}. Only names with a
-    valid price on the entry execution day are included. A name whose price goes missing during
-    the period (delisting / data gap) is valued at its last valid price from then on - exactly as
-    ``simulate`` does - so delisted losers are not silently dropped (no survivorship bias).
+    valid price on the entry execution day are included. Missing prices are handled like
+    ``simulate`` does:
+
+    * interior gap (trading halt / missing print, a later valid price exists): the name keeps its
+      exposure; if its price is missing on the exit day it cannot be sold there and is exited at
+      its next valid price (the move during the halt counts, as in ``simulate``, which carries
+      the position until trading resumes);
+    * terminal delisting (no later valid price in ``close``): the name is marked at its last
+      price times ``1 + delisting_return``. Delisted names are kept (no look-ahead universe
+      filtering), but with the default ``delisting_return=0.0`` no delisting return is applied,
+      which is optimistic for performance-related delistings (Shumway 1997) - pass e.g. -0.3 to
+      haircut them.
+
     The last signal date (no following date) and dates whose executions fall outside the price
     data are omitted. Keys are the signal dates t_i.
     """
-    from aitrading.backtest.engine import _frozen_growth, _prepare_close, execution_index
+    from aitrading.backtest.engine import _prepare_close, _price_state, execution_index
 
+    if not np.isfinite(delisting_return) or delisting_return <= -1.0:
+        raise ValueError("delisting_return must be a finite fraction > -1")
     close = _prepare_close(close)
     idx = close.index
-    arr = close.to_numpy(dtype=float)
+    arr, filled, last_valid = _price_state(close.to_numpy(dtype=float))
+    next_px = pd.DataFrame(arr).bfill().to_numpy(dtype=float)  # next valid price at or after a row
     cols = close.columns
     ds = sorted({pd.Timestamp(d) for d in dates})
     pos = [execution_index(idx, d, execution_lag) for d in ds]
@@ -168,9 +185,15 @@ def forward_returns_from_close(
         if p0 is None or p1 is None or p1 <= p0:
             continue
         entry = arr[p0]
-        valid = np.isfinite(entry) & (entry > 0)
-        if not valid.any():
+        valid = np.flatnonzero(np.isfinite(entry) & (entry > 0))
+        if not valid.size:
             continue
-        growth, _ = _frozen_growth(arr[p0 : p1 + 1][:, valid])
-        out[ds[i]] = pd.Series(growth[-1] - 1.0, index=cols[valid], name=ds[i])
+        lv = last_valid[valid]
+        delisted = p1 > lv
+        halted = ~np.isfinite(arr[p1, valid]) & ~delisted
+        exit_px = np.where(halted, next_px[p1, valid], filled[p1, valid])
+        growth = exit_px / entry[valid]
+        if delisting_return != 0.0:
+            growth = np.where(delisted, growth * (1.0 + delisting_return), growth)
+        out[ds[i]] = pd.Series(growth - 1.0, index=cols[valid], name=ds[i])
     return out
