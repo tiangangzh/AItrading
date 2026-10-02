@@ -257,9 +257,11 @@ def test_offline_artifacts_written(offline):
             datetime.fromisoformat(d["published_at"])
 
 
-def test_offline_warnings_list_withheld_documents(offline):
+def test_offline_warnings_summarise_capped_documents(offline):
     _, r, _ = offline
-    assert any("withheld" in w and "max_documents_per_ticker" in w for w in r.warnings)
+    capped = [w for w in r.warnings if "not shown to the explainer" in w and "per ticker" in w]
+    assert len(capped) == 1  # one summary line, not one warning per routine cap
+    assert not any("over max_documents_per_ticker" in w for w in r.warnings)
     assert len(r.warnings) == len(set(r.warnings))
 
 

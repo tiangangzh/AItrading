@@ -146,6 +146,7 @@ class ResearchPipeline:
         self.catalog = catalog or default_catalog()
         self.out_dir = Path(out_dir) if out_dir is not None else None
         self.explain_top_k = explain_top_k
+        self._capped_documents = 0
         self.documents_lookback_days = documents_lookback_days
         self.max_doc_chars_total = max_doc_chars_total
         self.clock = clock or _utcnow
@@ -171,6 +172,15 @@ class ResearchPipeline:
             if llm is not None and isinstance(getattr(llm, "calls", None), list) and all(llm is not o for o in out):
                 out.append(llm)
         return out
+
+    def _capped_note(self) -> list[str]:
+        """One summary line for documents skipped only because of the per-ticker document cap
+        (routine, not a data-quality problem), instead of one warning per document."""
+        n, self._capped_documents = self._capped_documents, 0
+        if not n:
+            return []
+        cap = getattr(self.boundary, "max_documents_per_ticker", "?")
+        return [f"{n} older or lower-priority document(s) were not shown to the explainer (limit {cap} per ticker; see documents.json)"]
 
     def _claim_run_dir(self, base: str) -> tuple[str, Path | None]:
         if self.out_dir is None:
@@ -367,7 +377,7 @@ class ResearchPipeline:
             ideas=ideas,
             llm_calls=calls,
             pushdown_query=pushdown_query,
-            warnings=_dedupe(warnings),
+            warnings=_dedupe(warnings + self._capped_note()),
             started_at=started_at,
             finished_at=self.clock(),
         )
@@ -398,7 +408,9 @@ class ResearchPipeline:
         for d in bundle.documents:
             if not boundary.permits(d):  # gather_documents already filters; never let one through
                 warnings.append(f"{ticker}: {d.doc_id} dropped: {d.kind.value} not permitted by the data boundary")
-        warnings += [f"{ticker}: withheld {w}" for w in bundle.withheld]
+        capped = [w for w in bundle.withheld if "over max_documents_per_ticker" in w]
+        warnings += [f"{ticker}: withheld {w}" for w in bundle.withheld if w not in capped]
+        self._capped_documents += len(capped)
         excerpts = build_bundle_excerpts(
             NarrativeBundle(ticker=ticker, documents=permitted, withheld=list(bundle.withheld)),
             max_chars_total=self.max_doc_chars_total,
