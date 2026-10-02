@@ -1,0 +1,676 @@
+{
+  "vendor": "bloomberg",
+  "schema": 1,
+  "version": "2026-10-02",
+  "source": "docs/VENDOR_REFERENCE.md section 1 (Bloomberg: 1.1 entry points, 1.2 push-down grammar, 1.3 field map) and section 4; ADR-001 grafts 1-4. Statuses are copied from table 1.3; an entry not in that table says where it comes from in 'notes'. Template placeholders: {as_of} = absolute ISO as-of date; {d<N>} = as_of minus N calendar days; {as_of_1y} = as_of minus one calendar year; {start}/{end} = history window; {benchmark} = benchmark security. Every date is absolute (ADR graft 4: never '0D').",
+  "status_meaning": {
+    "confirmed": "Seen in vendor-authored code or docs in the form shown. May be compiled; still needs a field_validation_log entry (gate G5, see BloombergProvider.verify_fields) before production use as a filter predicate.",
+    "corrected": "Verified only in the form shown here. Use exactly this form; parts listed under 'verify' stay configurable.",
+    "unverifiable": "Could not be confirmed. Configurable only, never hard-coded; preflighted on test_security before use; a failure suspends the leg (LEG NOT EVALUATED); never pushed as a BQL threshold."
+  },
+  "test_security": "IBM US Equity",
+
+  "universe": {
+    "base": {
+      "expression": "equitiesuniv(['ACTIVE','PRIMARY'])",
+      "status": "confirmed",
+      "notes": "Must always be wrapped in filter() (1.2). It is today's universe: equitiesuniv(dates=) is UNVERIFIED, so a historical as_of is survivorship-biased. For backtests pass universe_expr=\"members('RAY Index', dates='{as_of}')\" (subject to index entitlement)."
+    },
+    "backtest_example": {
+      "expression": "members('RAY Index', dates='{as_of}')",
+      "status": "confirmed",
+      "notes": "members(idx, dates=) is the confirmed point-in-time universe (1.3 'Universe'). Not used unless passed as universe_expr."
+    },
+    "country": {
+      "expression": "cntry_of_risk()",
+      "status": "corrected",
+      "notes": "Compiled as cntry_of_risk()=='<UniverseSpec.country>' in the inner (static) filter, exactly as the reference universe push-down does. cntry_of_risk() is ECONOMIC EXPOSURE, not the listing country (country_iso() semantics for equities UNVERIFIED): it only narrows the vendor universe; the canonical 'country' column (listing) is derived from the security's exchange code and the local engine re-checks it."
+    },
+    "probe": {
+      "expression": "cur_mkt_cap(currency='USD', dates='{as_of}', fill='prev')",
+      "status": "confirmed",
+      "notes": "Item placed in get() when no feature condition is pushed (get and for are mandatory). get() never filters."
+    }
+  },
+
+  "helpers": {
+    "px_2y": {
+      "expression": "px_last(dates=range('{d730}','{as_of}'), fill='prev', ca_adj='full')",
+      "status": "confirmed",
+      "notes": "Two-year adjusted close series (a 200d SMA needs ~290 calendar days). Reference form with absolute dates. Helpers are expanded inline wherever a feature expression references #<helper>."
+    },
+    "px_asof": {
+      "expression": "px_last(dates='{as_of}', fill='prev')",
+      "status": "confirmed",
+      "notes": "Close on as_of at BQL's default adjustment, the same basis as the confirmed 52-week-high form (which carries no ca_adj)."
+    },
+    "vol_5d": {
+      "expression": "px_volume(dates=range('{d14}','{as_of}')).dropna().last(5).avg()",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "Avg volume N-day row: built from confirmed primitives."
+    },
+    "vol_60d": {
+      "expression": "px_volume(dates=range('{d95}','{as_of}')).dropna().last(60).avg()",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "Avg volume N-day row."
+    },
+    "vol_20d": {
+      "expression": "px_volume(dates=range('{d40}','{as_of}')).dropna().last(20).avg()",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "Avg volume N-day row."
+    },
+    "vol_120d": {
+      "expression": "px_volume(dates=range('{d190}','{as_of}')).dropna().last(120).avg()",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "Avg volume N-day row."
+    }
+  },
+
+  "features": {
+    "market_cap_usd_bn": {
+      "expression": "cur_mkt_cap(currency='USD', dates='{as_of}', fill='prev')",
+      "unit": "USD, raw currency units",
+      "catalog_unit": "USD bn",
+      "threshold_scale": 1000000000,
+      "stage": "static",
+      "status": "confirmed",
+      "notes": "Market cap row: raw currency units, plain-number thresholds (catalog USD bn x 1e9; never '2B'). dates=/fill= anchor the value to as_of (grammar 1.2, graft 4)."
+    },
+    "gics_sector": {
+      "expression": "gics_sector_name()",
+      "unit": "label",
+      "catalog_unit": "label",
+      "stage": "static",
+      "status": "confirmed",
+      "allowed_values": ["Communication Services", "Consumer Discretionary", "Consumer Staples", "Energy", "Financials", "Health Care", "Industrials", "Information Technology", "Materials", "Real Estate", "Utilities"],
+      "notes": "GICS / BICS row. Pushed only as a single-label == / in (infix 'or' and '!=' in string BQL are not in the reference); the label must match allowed_values (case-insensitive) and is emitted in this canonical spelling, so no spec text is ever interpolated."
+    },
+    "gics_industry": {
+      "expression": "gics_industry_name()",
+      "unit": "label",
+      "catalog_unit": "label",
+      "stage": "static",
+      "status": "unverifiable",
+      "notes": "classification_name('GICS',n) and gics_industry_name() unverifiable (1.3). Local only."
+    },
+    "exchange": {
+      "expression": "exch_code()",
+      "unit": "Bloomberg exchange code",
+      "catalog_unit": "label",
+      "stage": "static",
+      "status": "unverifiable",
+      "notes": "Country/exchange (other) row: exch_code() unverifiable. Local only."
+    },
+    "price": {
+      "expression": "px_last(dates='{as_of}', fill='prev', ca_adj='full')",
+      "unit": "USD (trading currency), fully adjusted",
+      "catalog_unit": "USD",
+      "threshold_scale": 1,
+      "stage": "series",
+      "status": "confirmed",
+      "notes": "Last price row; px_last with dates=/fill=/ca_adj= as in the confirmed series form, anchored to as_of. Same adjustment basis as the SMA series. Also used for UniverseSpec.min_price."
+    },
+    "sma_20": {
+      "expression": "smavg(#px_2y, period=20).last('1')",
+      "unit": "USD",
+      "catalog_unit": "USD",
+      "threshold_scale": 1,
+      "stage": "series",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "SMA row: smavg(<px series, 2Y>, period=N).last('1'). The bare smavg(period=N) form is unverifiable and never used."
+    },
+    "sma_50": {
+      "expression": "smavg(#px_2y, period=50).last('1')",
+      "unit": "USD",
+      "catalog_unit": "USD",
+      "threshold_scale": 1,
+      "stage": "series",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "SMA 50/200 row."
+    },
+    "sma_200": {
+      "expression": "smavg(#px_2y, period=200).last('1')",
+      "unit": "USD",
+      "catalog_unit": "USD",
+      "threshold_scale": 1,
+      "stage": "series",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "SMA 50/200 row."
+    },
+    "price_vs_sma_50_pct": {
+      "expression": "#price/#sma_50 - 1",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "Ratio of confirmed/corrected items on one adjustment basis; fraction, so catalog percent x 0.01."
+    },
+    "price_vs_sma_200_pct": {
+      "expression": "#price/#sma_200 - 1",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "As price_vs_sma_50_pct."
+    },
+    "sma_50_vs_sma_200_pct": {
+      "expression": "#sma_50/#sma_200 - 1",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "SMA50 > SMA200 push-down (section 4: push smavg(...).last('1'))."
+    },
+    "high_52w": {
+      "expression": "max(px_high(dates=range('{d365}','{as_of}'), fill='prev'))",
+      "unit": "USD",
+      "catalog_unit": "USD",
+      "threshold_scale": 1,
+      "stage": "series",
+      "status": "confirmed",
+      "notes": "52w high row, confirmed max(px_high(dates=range(-52W,0D), fill=prev)) form with absolute dates. The maxmin(...).with_additional_parameters(period=260)['maxline'] form is object-API only."
+    },
+    "drawdown_from_52w_high_pct": {
+      "expression": "#px_asof/#high_52w - 1",
+      "unit": "fraction (negative below the high)",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "confirmed",
+      "notes": "Drawdown from high row: px_last()/hi52 - 1, a fraction, so catalog percent x 0.01 (-45 % -> -0.45). Price and high both use BQL's default adjustment (the confirmed forms carry no ca_adj): a split inside the window can distort the vendor value; the push-down only narrows and the local evaluator re-checks on adjusted data."
+    },
+    "rsi_14": {
+      "expression": "rsi(#px_2y, period=14).last('1')",
+      "unit": "0-100",
+      "catalog_unit": "0-100",
+      "threshold_scale": 1,
+      "stage": "series",
+      "status": "corrected",
+      "verify": ["anchored-series PIT form RSI(<series>, period=14): VERIFY shape (1.2)", ".last() in string form is UNVERIFIED (1.3 SMA row)", "smoothing method vs Wilder unverified"],
+      "notes": "RSI 14 row lists rsi(close=px_last(), period=14) and RSI(<series>, period=14) as confirmed; the unanchored px_last() form would read today's prices, so the anchored series form is used. Period always passed explicitly."
+    },
+    "rel_volume_5d": {
+      "expression": "#vol_5d/#vol_60d",
+      "unit": "x",
+      "catalog_unit": "x",
+      "threshold_scale": 1,
+      "stage": "series",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "Volume ratio push-down (section 4): 5-session over 60-session average volume, as in the reference crit v5 > vol_mult * v60."
+    },
+    "rel_volume_20d": {
+      "expression": "#vol_20d/#vol_120d",
+      "unit": "x",
+      "catalog_unit": "x",
+      "threshold_scale": 1,
+      "stage": "series",
+      "status": "corrected",
+      "verify": [".last() in string form is UNVERIFIED (1.3 SMA row)"],
+      "notes": "Built from the corrected Avg volume N-day primitives."
+    },
+    "return_1m_pct": {
+      "expression": "total_return(calc_interval=range('{d30}','{as_of}'))",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "confirmed",
+      "notes": "Total return row: fraction. The calendar window approximates 21 sessions: borderline names may differ from the local evaluator (which re-checks every survivor). Set pushdown=false in an override to keep it local."
+    },
+    "return_3m_pct": {
+      "expression": "total_return(calc_interval=range('{d91}','{as_of}'))",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "confirmed",
+      "notes": "As return_1m_pct (91 calendar days ~ 63 sessions)."
+    },
+    "return_6m_pct": {
+      "expression": "total_return(calc_interval=range('{d182}','{as_of}'))",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "confirmed",
+      "notes": "As the reference R6M item (D(182))."
+    },
+    "return_12m_pct": {
+      "expression": "total_return(calc_interval=range('{d365}','{as_of}'))",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "confirmed",
+      "notes": "As return_1m_pct."
+    },
+    "return_12m_ex_1m_pct": {
+      "expression": "total_return(calc_interval=range('{d365}','{d30}'))",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "confirmed",
+      "notes": "total_return over an absolute range ending one month before as_of."
+    },
+    "rel_strength_3m_pp": {
+      "expression": "total_return(calc_interval=range('{d91}','{as_of}')) - value(total_return(calc_interval=range('{d91}','{as_of}')), list(['{benchmark}']))",
+      "unit": "fraction difference",
+      "catalog_unit": "pp",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "confirmed",
+      "pushdown": false,
+      "notes": "Relative strength row: broadcasting value() inside filter() is untested, so keep it as a column (never pushed)."
+    },
+    "rel_strength_6m_pp": {
+      "expression": "total_return(calc_interval=range('{d182}','{as_of}')) - value(total_return(calc_interval=range('{d182}','{as_of}')), list(['{benchmark}']))",
+      "unit": "fraction difference",
+      "catalog_unit": "pp",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "confirmed",
+      "pushdown": false,
+      "notes": "As rel_strength_3m_pp."
+    },
+    "rel_strength_12m_pp": {
+      "expression": "total_return(calc_interval=range('{d365}','{as_of}')) - value(total_return(calc_interval=range('{d365}','{as_of}')), list(['{benchmark}']))",
+      "unit": "fraction difference",
+      "catalog_unit": "pp",
+      "threshold_scale": 0.01,
+      "stage": "series",
+      "status": "confirmed",
+      "pushdown": false,
+      "notes": "As rel_strength_3m_pp."
+    },
+    "volatility_20d_pct": {
+      "expression": "volatility(calc_interval=range('{d30}','{as_of}'))",
+      "unit": "UNVERIFIED (percent presumed)",
+      "catalog_unit": "%",
+      "threshold_scale": 1,
+      "stage": "series",
+      "status": "confirmed",
+      "units_verified": false,
+      "notes": "Realized vol row confirms volatility(calc_interval='252d'); an absolute calc_interval=range(...) is the grammar's form for risk items. Units unstated: z-score only until admitted. BDP VOLATILITY_30D unverifiable."
+    },
+    "volatility_60d_pct": {
+      "expression": "volatility(calc_interval=range('{d90}','{as_of}'))",
+      "unit": "UNVERIFIED (percent presumed)",
+      "catalog_unit": "%",
+      "threshold_scale": 1,
+      "stage": "series",
+      "status": "confirmed",
+      "units_verified": false,
+      "notes": "As volatility_20d_pct."
+    },
+    "iv_30d_pct": {
+      "expression": "implied_volatility(expiry='30d', delta='50', dates='{as_of}')",
+      "unit": "UNVERIFIED (percent presumed)",
+      "catalog_unit": "%",
+      "threshold_scale": 1,
+      "stage": "series",
+      "status": "corrected",
+      "units_verified": false,
+      "verify": ["dates= anchoring on implied_volatility is not shown in the reference"],
+      "notes": "Implied vol 30d ATM row: the '<N>d' expiry format is confirmed; pct_moneyness unverifiable. Units unstated: never a threshold until admitted."
+    },
+    "fcf_yield_pct": {
+      "expression": "free_cash_flow_yield(dates='{as_of}', fill='prev')",
+      "unit": "UNKNOWN",
+      "catalog_unit": "%",
+      "threshold_scale": 1,
+      "stage": "static",
+      "status": "unverifiable",
+      "units_verified": false,
+      "notes": "FCF yield row: free_cash_flow_yield() is not in the cited notebooks; name and units unknown. Residual (section 4): admit it, or build it from admitted items, before it is ever a threshold."
+    },
+    "ev_to_ebitda": {
+      "expression": "curr_entp_val(dates='{as_of}', fill='prev')/avail(ebitda(fpt='LTM', dates='{as_of}', fill='prev'), is_oper_inc(fpt='LTM', dates='{as_of}', fill='prev'))",
+      "unit": "x",
+      "catalog_unit": "x",
+      "threshold_scale": 1,
+      "stage": "static",
+      "status": "corrected",
+      "notes": "EV/EBITDA row (corrected form), anchored to as_of. avail() falls back to operating income where EBITDA is missing and a negative EBITDA gives a negative ratio; the catalog value is NaN in both cases, so the vendor side can only keep extra names (the local evaluator drops them), never drop a name the catalog would keep. BDP EV_TO_T12M_EBITDA / BEST_CUR_EV_TO_EBITDA unverifiable."
+    },
+    "ev_to_sales": {
+      "expression": "curr_entp_val(dates='{as_of}', fill='prev')/sales_rev_turn(fpt='LTM', dates='{as_of}', fill='prev')",
+      "unit": "x",
+      "catalog_unit": "x",
+      "threshold_scale": 1,
+      "stage": "static",
+      "status": "confirmed",
+      "notes": "EV/Sales row, anchored. BDP EV_TO_T12M_SALES unverifiable."
+    },
+    "enterprise_value_usd_bn": {
+      "expression": "curr_entp_val(dates='{as_of}', fill='prev')",
+      "unit": "raw units of the security's currency (currency conversion not shown)",
+      "catalog_unit": "USD bn",
+      "threshold_scale": 1000000000,
+      "stage": "static",
+      "status": "confirmed",
+      "units_verified": false,
+      "notes": "Enterprise value row. No currency='USD' form is shown for curr_entp_val(), so it is not pushed as a USD threshold until admitted."
+    },
+    "net_debt_usd_bn": {
+      "expression": "net_debt(dates='{as_of}', fill='prev')",
+      "unit": "raw units of the reporting currency (conversion not shown)",
+      "catalog_unit": "USD bn",
+      "threshold_scale": 1000000000,
+      "stage": "static",
+      "status": "confirmed",
+      "units_verified": false,
+      "notes": "Net debt row. Currency not shown: z-score only until admitted."
+    },
+    "net_debt_to_ebitda": {
+      "expression": "net_debt(dates='{as_of}', fill='prev')/ebitda(fpt='LTM', dates='{as_of}', fill='prev')",
+      "unit": "x",
+      "catalog_unit": "x",
+      "threshold_scale": 1,
+      "stage": "static",
+      "status": "corrected",
+      "notes": "Net debt / EBITDA row (corrected form). net_debt_to_ebitda() and BDP NET_DEBT_TO_EBITDA are unverifiable and never used. A negative EBITDA gives a negative vendor ratio where the catalog value is NaN, which can only keep extra names."
+    },
+    "operating_margin_pct": {
+      "expression": "is_oper_inc(fpt='LTM', dates='{as_of}', fill='prev')/sales_rev_turn(fpt='LTM', dates='{as_of}', fill='prev')",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "static",
+      "status": "corrected",
+      "notes": "Operating margin row: oper_margin() / BDP OPER_MARGIN unverifiable; the alternative from confirmed items is used. Fraction, so catalog percent x 0.01."
+    },
+    "gross_margin_pct": {
+      "expression": "gross_margin(fpt='LTM', dates='{as_of}', fill='prev')",
+      "unit": "UNVERIFIED (percent presumed)",
+      "catalog_unit": "%",
+      "threshold_scale": 1,
+      "stage": "static",
+      "status": "confirmed",
+      "units_verified": false,
+      "verify": ["fpt='LTM' for gross_margin (the reference shows gross_margin(fpt=..., fpo=...))"],
+      "notes": "Gross margin row. Units unstated: z-score only until admitted."
+    },
+    "revenue_growth_yoy_pct": {
+      "expression": "sales_rev_turn(fpt='LTM', dates='{as_of}', fill='prev')/sales_rev_turn(fpt='LTM', dates='{as_of_1y}', fill='prev') - 1",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "static",
+      "status": "corrected",
+      "pushdown": false,
+      "notes": "Revenue growth, trailing row: components confirmed; admit the combination in BQLX. Residual in section 4 and ADR step 4 until admitted (then set pushdown=true in an override). sales_growth(fpt='A', fpo='1') is FY1 FORWARD growth and is never substituted."
+    },
+    "revenue_growth_ntm_est_pct": {
+      "expression": "sales_rev_turn(fpt='BT', fpo='1', dates='{as_of}', fill='prev')/sales_rev_turn(fpt='LTM', dates='{as_of}', fill='prev') - 1",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "static",
+      "status": "corrected",
+      "pushdown": false,
+      "notes": "NTM consensus (Revenue NTM row, confirmed) over LTM revenue (confirmed component). The combination is not admitted, so residual. Not sales_growth(fpt='A', fpo='1') (FY1, a different meaning)."
+    },
+    "revenue_revision_3m_pct": {
+      "expression": "sales_rev_turn(fpt='BT', fpo='1', dates=range('{d91}','{as_of}'), fill='prev').pct_chg()",
+      "unit": "UNVERIFIED",
+      "catalog_unit": "%",
+      "threshold_scale": 1,
+      "stage": "static",
+      "status": "confirmed",
+      "units_verified": false,
+      "notes": "Estimate revisions row: <dated estimate>.pct_chg(); pct_chg units UNVERIFIED, so z-score only."
+    },
+    "target_price_upside_pct": {
+      "expression": "best_target_price(dates='{as_of}', fill='prev')/px_last(dates='{as_of}', fill='prev') - 1",
+      "unit": "fraction",
+      "catalog_unit": "%",
+      "threshold_scale": 0.01,
+      "stage": "static",
+      "status": "confirmed",
+      "notes": "Analyst target row: the reference 'Upside' item best_target_price()/px_last() - 1, anchored to as_of."
+    },
+    "short_interest_pct_float": {
+      "expression": null,
+      "unit": "fraction (SHORT_INT/EQY_FLOAT, computed locally)",
+      "catalog_unit": "%",
+      "stage": "series",
+      "status": "unverifiable",
+      "notes": "No BQL item known; BDP SHORT_INT / EQY_FLOAT (community code only, may need a securities-finance entitlement). Residual: evaluated locally on ALL push-down survivors before any ranking or top-N (ADR graft 2). If a BQL item is admitted, set expression/status here and the compiler pushes it inside filter(), still before any ranking."
+    },
+    "days_to_cover": {
+      "expression": null,
+      "unit": "days",
+      "catalog_unit": "days",
+      "stage": "series",
+      "status": "unverifiable",
+      "notes": "BDP SHORT_INT_RATIO is unverifiable and its volume denominator may differ from the catalog's 20-session average. Computed locally."
+    },
+    "put_call_volume_ratio": {
+      "expression": null,
+      "unit": "x",
+      "catalog_unit": "x",
+      "stage": "series",
+      "status": "unverifiable",
+      "notes": "BDP PUT_CALL_VOLUME_RATIO_CUR_DAY; BQL options() + put_call(): unverifiable."
+    },
+    "put_call_oi_ratio": {
+      "expression": null,
+      "unit": "x",
+      "catalog_unit": "x",
+      "stage": "series",
+      "status": "unverifiable",
+      "notes": "BDP PUT_CALL_OPEN_INTEREST_RATIO; BQL open_int(): unverifiable."
+    },
+    "macd_line": {
+      "expression": null,
+      "unit": "USD",
+      "catalog_unit": "USD",
+      "stage": "series",
+      "status": "unverifiable",
+      "notes": "macd(<series>)['MACD2'] is confirmed only as a column name; whether MACD2 is the MACD line is not. Computed locally (fallback emavg(12)-emavg(26))."
+    },
+    "avg_dollar_volume_20d_usd_mn": {
+      "expression": null,
+      "unit": "USD mn",
+      "catalog_unit": "USD mn",
+      "stage": "series",
+      "status": "unverifiable",
+      "notes": "No verified single item (close x volume); computed locally. UniverseSpec.min_avg_dollar_volume_usd_mn therefore stays a local filter."
+    }
+  },
+
+  "raw": {
+    "universe": {
+      "name": {
+        "bql": {"expression": "name()", "kind": "label", "status": "unverifiable", "notes": "Used in the reference representative screen (1.2) but not a row of table 1.3. Preflighted."}
+      },
+      "gics_sector": {
+        "bql": {"expression": "gics_sector_name()", "kind": "label", "status": "confirmed", "notes": "GICS / BICS row."}
+      },
+      "gics_industry": {
+        "bql": {"expression": "gics_industry_name()", "kind": "label", "status": "unverifiable", "notes": "gics_industry_name() unverifiable (1.3). Preflighted."}
+      },
+      "exchange": {
+        "bql": {
+          "expression": "exch_code()",
+          "kind": "label",
+          "status": "unverifiable",
+          "value_map": {"UN": "NYSE", "UW": "NASDAQ", "UQ": "NASDAQ", "UR": "NASDAQ", "UA": "NYSE American", "UP": "NYSE Arca", "UV": "OTC"},
+          "notes": "exch_code() unverifiable (1.3). value_map: Bloomberg exchange codes to canonical labels (not in VENDOR_REFERENCE; verify). Unmapped codes pass through unchanged."
+        }
+      },
+      "country": {
+        "derived": {
+          "from": "vendor_id_exchange_code",
+          "kind": "label",
+          "value_map": {"US": "US", "UN": "US", "UW": "US", "UQ": "US", "UR": "US", "UA": "US", "UP": "US", "UV": "US"},
+          "status": "unverifiable",
+          "notes": "Listing country from the exchange code inside the Bloomberg id ('AAPL US Equity' -> 'US'). Not a vendor field: cntry_of_risk() is economic exposure and country_iso() is UNVERIFIED, so neither is substituted for the listing country. Unmapped codes give NaN (excluded by the local country filter)."
+        }
+      },
+      "currency": {
+        "derived": {
+          "from": "vendor_id_exchange_code",
+          "kind": "label",
+          "value_map": {"US": "USD", "UN": "USD", "UW": "USD", "UQ": "USD", "UR": "USD", "UA": "USD", "UP": "USD", "UV": "USD"},
+          "status": "unverifiable",
+          "notes": "Trading currency of a US listing. Not a vendor field."
+        }
+      },
+      "security_type": {
+        "bql": {
+          "expression": null,
+          "assume": "common_stock",
+          "kind": "label",
+          "status": "unverifiable",
+          "notes": "No BQL security-type item is verified and 'ADR/REIT exclusion not yet possible in BQL' (1.3). Members of equitiesuniv(['ACTIVE','PRIMARY']) are LABELLED with 'assume' (a warning says ADRs/REITs are not excluded) so the local common-stock filter does not empty the universe. Set expression to an admitted item to classify instead."
+        },
+        "bdp": {
+          "code": "SECURITY_TYP",
+          "kind": "label",
+          "status": "unverifiable",
+          "value_map": {"Common Stock": "common_stock", "ADR": "adr", "GDR": "adr", "NY Reg Shrs": "adr", "REIT": "reit", "ETP": "etf", "Preference": "preferred", "Closed-End Fund": "fund", "Mutual Fund": "fund", "Open-End Fund": "fund", "MLP": "mlp", "Tracking Stk": "tracking_stock"},
+          "notes": "Country/exchange (other) row: BDP SECURITY_TYP unverifiable. value_map (Bloomberg labels to canonical) is not in VENDOR_REFERENCE; unmapped labels are lower-cased with underscores."
+        }
+      },
+      "market_cap": {
+        "bql": {"expression": "cur_mkt_cap(currency='USD', dates='{as_of}', fill='prev')", "unit": "USD, raw units", "to_canonical": 1, "status": "confirmed", "plausible": [100000, 20000000000000], "notes": "Market cap row: raw currency units."},
+        "bdp": {"code": "CUR_MKT_CAP", "unit": "raw units of the quote currency (USD for US listings)", "to_canonical": 1, "status": "confirmed", "plausible": [100000, 20000000000000], "notes": "Market cap row. BDP is a current snapshot: blank for a historical as_of."}
+      }
+    },
+    "prices": {
+      "open": {
+        "bql": {"expression": "px_open(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "px_open is not in VENDOR_REFERENCE. Preflighted; NaN when it fails."},
+        "bdh": {"code": "PX_OPEN", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "Not in VENDOR_REFERENCE. Preflighted."}
+      },
+      "high": {
+        "bql": {"expression": "px_high(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "px_high is confirmed (52w high row) but ca_adj='full' on it is not shown; needed so OHLC share the close's adjustment. Preflighted."},
+        "bdh": {"code": "PX_HIGH", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "Not in VENDOR_REFERENCE. Preflighted."}
+      },
+      "low": {
+        "bql": {"expression": "px_low(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "As high."},
+        "bdh": {"code": "PX_LOW", "unit": "USD (trading currency)", "to_canonical": 1, "status": "unverifiable", "notes": "Not in VENDOR_REFERENCE. Preflighted."}
+      },
+      "close": {
+        "bql": {"expression": "px_last(dates=range('{start}','{end}'), fill='prev', ca_adj='full')", "unit": "USD (trading currency), split- and dividend-adjusted", "to_canonical": 1, "status": "confirmed", "notes": "Last price row, confirmed series form (ca_adj='full')."},
+        "bdh": {"code": "PX_LAST", "unit": "USD (trading currency)", "to_canonical": 1, "status": "confirmed", "notes": "BDH example in 1.1. Adjustment depends on requests.history_adjustment."}
+      },
+      "volume": {
+        "bql": {"expression": "px_volume(dates=range('{start}','{end}'))", "unit": "shares", "to_canonical": 1, "status": "confirmed", "notes": "Daily volume row. Split adjustment of px_volume is not documented. Sessions = dates on which any requested security has a volume (fill='prev' on prices would otherwise create holiday rows)."},
+        "bdh": {"code": "PX_VOLUME", "unit": "shares", "to_canonical": 1, "status": "confirmed", "notes": "BDH example in 1.1."}
+      }
+    },
+    "fundamentals": {
+      "report_date": {
+        "bdp": {"code": "LATEST_ANNOUNCEMENT_DT", "kind": "date", "status": "unverifiable", "notes": "Earnings dates row (unverifiable): latest earnings announcement, used as the date the latest quarter became public. A date after as_of blanks the row (look-ahead guard)."}
+      },
+      "revenue_ttm": {
+        "bql": {"expression": "sales_rev_turn(fpt='LTM', dates='{as_of}', fill='prev')", "unit": "raw units of the reporting currency", "to_canonical": 1, "status": "confirmed", "plausible": [0, 5000000000000], "notes": "Revenue growth, trailing row component (confirmed). Raw units: the confirmed EV/Sales formula divides curr_entp_val() by it. Reporting currency (US filers report in USD); not converted."}
+      },
+      "revenue_ttm_prior_year": {
+        "bql": {"expression": "sales_rev_turn(fpt='LTM', dates='{as_of_1y}', fill='prev')", "unit": "raw units of the reporting currency", "to_canonical": 1, "status": "confirmed", "plausible": [0, 5000000000000], "notes": "LTM revenue as known one year before as_of (the reference's RevLTM_1Y item); approximates the TTM ending a year before period_end."}
+      },
+      "operating_income_ttm": {
+        "bql": {"expression": "is_oper_inc(fpt='LTM', dates='{as_of}', fill='prev')", "unit": "raw units of the reporting currency", "to_canonical": 1, "status": "confirmed", "notes": "Operating margin row: is_oper_inc(fpt='LTM') listed among confirmed items."}
+      },
+      "operating_income_ttm_prior_year": {
+        "bql": {"expression": "is_oper_inc(fpt='LTM', dates='{as_of_1y}', fill='prev')", "unit": "raw units of the reporting currency", "to_canonical": 1, "status": "confirmed", "notes": "As operating_income_ttm, one year earlier."}
+      },
+      "ebitda_ttm": {
+        "bql": {"expression": "ebitda(fpt='LTM', dates='{as_of}', fill='prev')", "unit": "raw units of the reporting currency", "to_canonical": 1, "status": "corrected", "notes": "ebitda(fpt='LTM') as in the corrected EV/EBITDA and Net debt / EBITDA rows."}
+      },
+      "fcf_ttm": {
+        "bql": {"expression": "cf_free_cash_flow(fpt='LTM', dates='{as_of}', fill='prev')", "unit": "UNVERIFIED", "to_canonical": 1, "units_verified": false, "status": "unverifiable", "notes": "FCF TTM row (unverifiable). Bloomberg's FCF definition may differ from the canonical CFO - capex. Not served until admitted."},
+        "bdp": {"code": "CF_FREE_CASH_FLOW", "unit": "UNVERIFIED", "to_canonical": 1, "units_verified": false, "status": "unverifiable", "notes": "FCF TTM row (unverifiable). Not served until admitted."}
+      }
+    },
+    "estimates": {
+      "revenue_ntm_est": {
+        "bql": {"expression": "sales_rev_turn(fpt='BT', fpo='1', dates='{as_of}', fill='prev')", "unit": "raw units of the reporting currency", "to_canonical": 1, "status": "confirmed", "plausible": [0, 5000000000000], "notes": "Revenue NTM row (est_source='BST' default), anchored to as_of."},
+        "bdp": {"code": "BEST_SALES", "overrides": {"BEST_FPERIOD_OVERRIDE": "1BF"}, "unit": "UNVERIFIED (BEst figures are conventionally quoted in millions)", "to_canonical": 1000000, "units_verified": false, "status": "confirmed", "plausible": [0, 5000000000000], "notes": "Revenue NTM row: BEST_SALES + BEST_FPERIOD_OVERRIDE='1BF' (confirmed). Units unstated: not served until admitted."}
+      },
+      "revenue_ntm_est_3m_ago": {
+        "bql": {"expression": "sales_rev_turn(fpt='BT', fpo='1', dates='{d91}', fill='prev')", "unit": "raw units of the reporting currency", "to_canonical": 1, "status": "confirmed", "plausible": [0, 5000000000000], "notes": "NTM consensus as of 91 days before as_of (dated estimate, as in the reference RevNTM_3mChg item)."}
+      },
+      "eps_ntm_est": {
+        "bdp": {"code": "BEST_EPS", "overrides": {"BEST_FPERIOD_OVERRIDE": "1BF"}, "unit": "currency per share", "to_canonical": 1, "status": "confirmed", "notes": "BEst forward 12M via override (1.1, confirmed). Current snapshot: blank for a historical as_of."}
+      },
+      "target_price_mean": {
+        "bql": {"expression": "best_target_price(dates='{as_of}', fill='prev')", "unit": "currency per share", "to_canonical": 1, "status": "confirmed", "notes": "Analyst target row."},
+        "bdp": {"code": "BEST_TARGET_PRICE", "unit": "currency per share", "to_canonical": 1, "status": "unverifiable", "notes": "Community-sourced (1.3 Analyst target row)."}
+      },
+      "last_earnings_date": {
+        "bdp": {"code": "LATEST_ANNOUNCEMENT_DT", "kind": "date", "status": "unverifiable", "notes": "Earnings dates row (unverifiable)."}
+      },
+      "next_earnings_date": {
+        "bdp": {"code": "EXPECTED_REPORT_DT", "kind": "date", "status": "unverifiable", "notes": "Earnings dates row (unverifiable)."}
+      }
+    },
+    "short_interest": {
+      "short_interest_shares": {
+        "bdp": {"code": "SHORT_INT", "unit": "shares", "to_canonical": 1, "status": "unverifiable", "notes": "Short interest row: community code only; FLDS check before use; may need a securities-finance entitlement. US data is bi-monthly. Settlement after as_of blanks the row."}
+      },
+      "float_shares": {
+        "bdp": {"code": "EQY_FLOAT", "unit": "UNVERIFIED (the reference computes SHORT_INT/EQY_FLOAT as a fraction, implying shares; Bloomberg float figures are often quoted in millions)", "to_canonical": 1, "units_verified": false, "status": "unverifiable", "plausible": [1000, 100000000000], "notes": "Not served until admitted: confirm with verify_fields, then set units_verified=true and the right to_canonical (1 or 1e6) in an override."}
+      },
+      "settlement_date": {
+        "bdp": {"code": "SHORT_INT_DT", "kind": "date", "status": "unverifiable", "notes": "US short interest always carries SHORT_INT_DT (ADR graft 4)."}
+      }
+    },
+    "options": {
+      "iv_30d_atm": {
+        "bql": {"expression": "implied_volatility(expiry='30d', delta='50', dates='{as_of}')", "unit": "UNVERIFIED (vol points presumed)", "to_canonical": 0.01, "units_verified": false, "status": "corrected", "plausible": [0.02, 3.0], "notes": "Implied vol 30d ATM row. Units unstated: not served until admitted."},
+        "bdp": {"code": "30DAY_IMPVOL_100.0%MNY_DF", "unit": "UNVERIFIED (vol points presumed)", "to_canonical": 0.01, "units_verified": false, "status": "unverifiable", "plausible": [0.02, 3.0], "notes": "Implied vol (BDP) row: unverifiable."}
+      }
+    }
+  },
+
+  "requests": {
+    "refdata_service": {"value": "//blp/refdata", "status": "confirmed", "notes": "Desktop API reference/history service (1.1). //blp/bqlsvc is PROHIBITED (ADR section 7) and never used."},
+    "host": {"value": "localhost", "status": "confirmed", "notes": "Desktop API session host (1.1)."},
+    "port": {"value": 8194, "status": "confirmed", "notes": "Desktop API session port (1.1)."},
+    "timeout_ms": {"value": 30000, "status": "confirmed", "notes": "nextEvent timeout used by the reference bdp()."},
+    "history": {"elements": {"periodicitySelection": "DAILY"}, "status": "confirmed", "notes": "HistoricalDataRequest with startDate/endDate as YYYYMMDD (1.1 BDH example)."},
+    "history_adjustment": {
+      "enabled": true,
+      "elements": {"adjustmentNormal": true, "adjustmentAbnormal": true, "adjustmentSplit": true},
+      "status": "unverifiable",
+      "notes": "Element names from the BLPAPI Core Developer Guide; not fact-checked in VENDOR_REFERENCE. Without them BDH prices are not dividend-adjusted. If the request rejects them the adapter retries without and warns."
+    },
+    "beqs": {
+      "screen_type": "PRIVATE",
+      "group": null,
+      "as_of_date_format": "%Y%m%d",
+      "status": "corrected",
+      "notes": "BeqsRequest elements screenName, screenType (PRIVATE/GLOBAL), Group, optional asOfDate (no languageId). Used by the blpapi backend when universe_expr names a saved EQS screen. The asOfDate string format is not in the reference (VERIFY)."
+    }
+  },
+
+  "benchmark": {
+    "security": "SPX Index",
+    "status": "confirmed",
+    "notes": "Benchmark in the reference relative-strength item. A price index (not total return)."
+  },
+
+  "documents": {
+    "transcript": {"api": null, "licence_class": "L4/L3", "status": "confirmed", "notes": "No BQL/BDP item. Terminal DS/CF/EVTS, ASKB, Document Insights; BQuant Enterprise Textual Analytics. API undocumented and LLM export rights unconfirmed: not fetched by this adapter."},
+    "news": {"api": null, "licence_class": "L5", "status": "confirmed", "notes": "EDF Textual News is black-box use only (L5): never reaches the model."},
+    "research": {"api": null, "licence_class": "L6", "status": "confirmed", "notes": "Broker research is Terminal BRC/DS/ASKB only (L6): never reaches the model."},
+    "filing": {"api": null, "licence_class": "L0", "status": "confirmed", "notes": "Use SEC EDGAR directly (public, L0): aitrading.data.sec_edgar / the free provider."}
+  }
+}

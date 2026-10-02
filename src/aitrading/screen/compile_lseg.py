@@ -224,9 +224,10 @@ def _unpushable_reason(entry: Mapping[str, Any] | None, preflight: Mapping[str, 
         return "no LSEG expression in the field map"
     expr = entry.get("expression")
     if not expr:
-        how = entry.get("compute", "local")
+        how = {"local": "computed locally", "survivors": "fetched for survivors only"}.get(
+            str(entry.get("compute", "local")), f"computed {entry.get('compute')}")
         note = str(entry.get("notes", "")).strip()
-        return f"computed {how} (field map has no SCREEN expression)" + (f": {note}" if note else "")
+        return f"{how} (field map has no SCREEN expression)" + (f": {note}" if note else "")
     status = entry.get("status")
     if status not in PUSHABLE_STATUSES:
         return f"field map status '{status}' for {expr}: never pushed (preflight + admission first)"
@@ -297,7 +298,7 @@ def _compile_numeric(cond: Condition, expr: str, entry: Mapping[str, Any]) -> tu
     return [], f"operator '{cond.op}' does not apply to a numeric feature"
 
 
-def _compile_category(cond: Condition, expr: str) -> tuple[list[str], str | None]:
+def _compile_category(cond: Condition, expr: str, entry: Mapping[str, Any]) -> tuple[list[str], str | None]:
     if cond.other_feature is not None:
         return [], "category features cannot be compared to another feature"
     if cond.values:
@@ -306,6 +307,15 @@ def _compile_category(cond: Condition, expr: str) -> tuple[list[str], str | None
         labels = [f"{cond.value:g}"]
     else:
         return [], "category condition without values (local engine reports it)"
+    known = entry.get("labels")
+    if known:
+        # SCREEN label matching is exact while the local engine is case-insensitive: push only labels
+        # that resolve (case-insensitively) to a vendor label listed in the field map.
+        canon = {str(k).strip().casefold(): str(k) for k in known}
+        unknown = [v for v in labels if str(v).strip().casefold() not in canon]
+        if unknown:
+            return [], f"label(s) {unknown} not among the field map's vendor labels for {expr}"
+        labels = [canon[str(v).strip().casefold()] for v in labels]
     quoted = [_quote(v) for v in labels]
     if any(q is None for q in quoted):
         return [], "category label is empty or contains a double quote"
@@ -332,7 +342,7 @@ def _compile_condition(cond: Condition, fm: Mapping[str, Any], catalog: FeatureC
     if catalog[cond.feature].dtype == "category" or cond.op in ("in", "not_in"):
         if catalog[cond.feature].dtype != "category":
             return [], "", f"'{cond.op}' only applies to category features (local engine reports it)"
-        preds, why = _compile_category(cond, expr)
+        preds, why = _compile_category(cond, expr, entry)
     else:
         preds, why = _compile_numeric(cond, expr, entry)
     if why:
@@ -353,7 +363,7 @@ def _listing(universe: UniverseSpec, fm: Mapping[str, Any], b: _Builder) -> None
     if country:
         entry = scr.get("country")
         if _status_ok(entry) and entry.get("template") and _quote(country) is not None:
-            b.push(label, [str(entry["template"]).format(value=str(country).strip())], "", str(entry["status"]))
+            b.push(label, [str(entry["template"]).format(value=str(country).strip().upper())], "", str(entry["status"]))
         else:
             b.keep_local(label, "country predicate is not a confirmed/corrected field-map template")
     types = list(universe.security_types or [])

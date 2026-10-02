@@ -111,7 +111,8 @@
       "unit": "label",
       "status": "corrected",
       "screen": "preflight",
-      "notes": "TR.GICSIndustry / SubIndustry / SectorCode unverifiable. Pushed only as single-value IN / NOT_IN after a passing preflight."
+      "labels": ["Communication Services", "Consumer Discretionary", "Consumer Staples", "Energy", "Financials", "Health Care", "Industrials", "Information Technology", "Materials", "Real Estate", "Utilities"],
+      "notes": "TR.GICSIndustry / SubIndustry / SectorCode unverifiable. Pushed only as single-value IN / NOT_IN after a passing preflight, and only for labels in 'labels' (the 11 GICS sector names; SCREEN matching is exact, the local engine is case-insensitive). Confirm the returned spelling with verify_fields."
     },
     "high_52w": {
       "expression": "TR.Price52WeekHigh",
@@ -265,7 +266,7 @@
         "kind": "label",
         "status": "confirmed",
         "value_map": {"ORD": "common_stock"},
-        "notes": "Only ORD is verified; other codes pass through lower-cased (they never match 'common_stock')."
+        "notes": "Only ORD is verified; other codes pass through unchanged (they never match 'common_stock')."
       },
       "market_cap": {
         "code": "TR.CompanyMarketCap(Scale=6)",

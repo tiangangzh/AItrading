@@ -1,0 +1,662 @@
+{
+  "vendor": "capiq",
+  "schema": 1,
+  "version": "2026-10-02",
+  "source": "docs/VENDOR_REFERENCE.md section 3 (S&P Global Market Intelligence: Capital IQ GDS REST API and the Kensho LLM-ready API). Statuses are copied from tables 3.1 and 3.3. An entry that is not a row of those tables says so in 'notes' and is 'unverifiable'. Derived entries (combinations of mnemonics) are 'unverifiable' because the reference does not list the combination; each input keeps the status of its own row.",
+  "status_meaning": {
+    "confirmed": "Seen in vendor-authored code or docs in the form shown. May be compiled; still needs a field_validation_log entry (gate G5) before it is used as a filter predicate.",
+    "corrected": "Verified only in the form shown here. Use exactly this form; parts noted VERIFY stay configurable.",
+    "unverifiable": "Could not be confirmed. Configurable only, never hard-coded; preflighted alone on test_identifier before every bulk use; a failure suspends the leg (LEG NOT EVALUATED, NaN); never a threshold until admitted."
+  },
+  "units_convention": "canonical value = vendor value x to_canonical (raw sections) or x to_catalog (features section). CapIQ amounts default to millions (VENDOR_REFERENCE 3.2 SQL: 'assumes millions: VERIFY units'; 3.3 market cap: 'Units (millions?) UNVERIFIED'), so monetary items and share counts carry x1e6 and units_verified=false until admitted (G5). Values outside 'plausible' (canonical units) are blanked: that catches a wrong 1e6 scale or a flipped sign.",
+  "test_identifier": "IBM:NYSE",
+
+  "api": {
+    "base_url": {
+      "value": "https://api-ciq.marketintelligence.spglobal.com/gdsapi/rest",
+      "status": "confirmed",
+      "notes": "VENDOR_REFERENCE 3.1 [M]. CapIQProvider(base_url=...) overrides it."
+    },
+    "data_path": {
+      "value": "/v3/clientservice.json",
+      "status": "confirmed",
+      "notes": "POST, JSON body {\"inputRequests\": [{function, identifier, mnemonic, properties}]}; response {\"GDSSDKResponse\": [...]} in request order (3.1) [M]. A single element with only ErrMsg is a whole-call error (e.g. 'Daily Request Limit of 10000 Exceeded')."
+    },
+    "token_path": {
+      "value": "/authenticate/api/v1/token",
+      "status": "corrected",
+      "notes": "POST form-urlencoded username/password -> JSON access_token, then 'Authorization: Bearer <token>'. /tokenRefresh and the 60-min lifetime are UNVERIFIED: the adapter re-authenticates once on HTTP 401 instead."
+    },
+    "usage_path": {
+      "value": "/v3/usageservice.json",
+      "mnemonic": "USAGE_METRICS",
+      "status": "unverifiable",
+      "notes": "[M] community, citing the May 2026 guide. Body {\"inputRequests\": [{\"mnemonic\": \"USAGE_METRICS\"}]}. Used only by CapIQProvider.usage() to read the real limits."
+    },
+    "functions": {
+      "value": ["GDSP", "GDSPV", "GDSHE", "GDSHV", "GDST", "GDSG"],
+      "status": "confirmed",
+      "notes": "Confirmed functions (3.1). There is NO screen function: this adapter has no push-down. GDSP/GDSPV serve point values (raw and features sections), GDSHE price history, GDSHV index constituents."
+    },
+    "date_format": {
+      "value": "%m/%d/%Y",
+      "status": "confirmed",
+      "notes": "startDate/endDate as MM/DD/YYYY in the 3.1 example ('09/01/2025'). asOfDate is rendered the same way (its format is not shown: VERIFY)."
+    },
+    "max_requests_per_call": {
+      "value": 100,
+      "status": "unverifiable",
+      "notes": "VENDOR_REFERENCE documents no per-call cap on inputRequests. Conservative default; raise it in an override only after testing."
+    },
+    "daily_request_limit": {
+      "value": 10000,
+      "warn_fraction": 0.8,
+      "status": "unverifiable",
+      "notes": "Observed limit [M] (ADR-001 section 1; ErrMsg 'Daily Request Limit of 10000 Exceeded'). Every identifier x mnemonic inputRequest counts (3.2: ~4,000 names x 20 fields = ~80,000 requests). The adapter counts the requests it sends, warns at warn_fraction and refuses a call that would exceed the limit. Read the account's real limit with CapIQProvider.usage()."
+    },
+    "history_row": {
+      "value_index": 0,
+      "date_index": 1,
+      "status": "unverifiable",
+      "notes": "GDSHE row layout [value, date] from the community clients cited in VENDOR_REFERENCE (faaez/capiq-python); not shown in the reference itself. verify_fields() prints the first history row."
+    },
+    "missing_values": {
+      "value": ["Data Unavailable", "NA", "N/A", "NM", "-", "--"],
+      "status": "unverifiable",
+      "notes": "Community-sourced placeholder strings, treated as missing for label and date columns. Numeric columns treat ANY non-numeric value as missing (never 0)."
+    },
+    "entitlement_values": {
+      "value": ["CapabilityNeeded"],
+      "status": "unverifiable",
+      "notes": "Community-sourced value meaning the account lacks the entitlement for an item: NaN plus an entitlement warning."
+    }
+  },
+
+  "identifiers": {
+    "ticker_template": {
+      "value": "{ticker}:",
+      "status": "confirmed",
+      "notes": "Identifier forms TICKER:EXCH, TICKER:, IQ<id>, I_<ISIN>, CSP_<CUSIP>, GV<gvkey>, IQT<tradingItemId>, ^<index> (3.1, confirmed). A canonical ticker becomes 'TICKER:' (CapIQ picks the listing). Pin a listing or use company ids through CapIQProvider(identifiers={ticker: 'IBM:NYSE' | 'IQ<id>'}) - the maintained symbology table of ADR graft 6."
+    },
+    "share_class_separator": {
+      "value": ".",
+      "status": "unverifiable",
+      "notes": "Canonical 'BRK-B' is sent as 'BRK.B:'. Not in VENDOR_REFERENCE: VERIFY on a dual-class name."
+    }
+  },
+
+  "universe": {
+    "constituents": {
+      "function": "GDSHV",
+      "mnemonic": "IQ_CONSTITUENTS",
+      "properties": {"StartRank": "{start_rank}", "EndRank": "{end_rank}"},
+      "page_size": 600,
+      "max_pages": 10,
+      "value_index": 0,
+      "status": "corrected",
+      "notes": "Index constituents row (corrected): IQ_CONSTITUENTS via GDSHV (not GDSHE) + StartRank/EndRank, exactly as in the 3.1 example (^SPX, 1..600). ^SPX / Russell coverage untested. Paged in page_size blocks until a short page. The members are TODAY's (a historical as_of is survivorship-biased). Values that are not 'TICKER:EXCH' identifiers (e.g. IQ<id>) need the identifiers= symbology table, otherwise they are dropped and flagged (ADR graft 6)."
+    }
+  },
+
+  "screen": {
+    "pushdown": false,
+    "status": "confirmed",
+    "notes": "No S&P REST API screens the universe (3.2): GDS is per identifier x mnemonic with no screen function, Kensho offers only categorical ticker groups, =SPGScreen exists only in Excel. The only S&P push-down is SQL over Xpressfeed/Snowflake, which is OUT OF SCOPE for this adapter (CapIQProvider does not implement ScreenPushdown). Universe = explicit tickers, or index constituents via IQ_CONSTITUENTS."
+  },
+
+  "raw": {
+    "universe": {
+      "name": {
+        "mnemonic": "IQ_COMPANY_NAME",
+        "kind": "label",
+        "status": "unverifiable",
+        "notes": "Not in VENDOR_REFERENCE (Capital IQ glossary name). Preflighted; NaN when it fails."
+      },
+      "gics_sector": {
+        "mnemonic": "IQ_INDUSTRY_SECTOR",
+        "kind": "label",
+        "status": "unverifiable",
+        "notes": "GICS / industry row (unverifiable; the Kensho tickers(gics=...) route is the verified one). This is CapIQ's industry classification and may not spell or cut sectors like GICS: check the labels with verify_fields() before using it in a sector filter."
+      },
+      "gics_industry": {
+        "mnemonic": "IQ_INDUSTRY",
+        "kind": "label",
+        "status": "unverifiable",
+        "notes": "GICS / industry row (unverifiable). IQ_PRIMARY_INDUSTRY is the other listed candidate. Same GICS caveat as gics_sector."
+      },
+      "exchange": {
+        "mnemonic": "IQ_EXCHANGE",
+        "kind": "label",
+        "status": "confirmed",
+        "value_map": {
+          "NYSE": "NYSE",
+          "New York Stock Exchange": "NYSE",
+          "NasdaqGS": "NASDAQ",
+          "NasdaqGM": "NASDAQ",
+          "NasdaqCM": "NASDAQ",
+          "Nasdaq": "NASDAQ",
+          "NYSEAM": "NYSE American",
+          "AMEX": "NYSE American",
+          "NYSE American": "NYSE American",
+          "NYSEArca": "NYSE Arca",
+          "ARCA": "NYSE Arca",
+          "BATS": "CBOE",
+          "Cboe BZX": "CBOE",
+          "OTCPK": "OTC",
+          "OTCQX": "OTC",
+          "OTCQB": "OTC"
+        },
+        "unmapped": "pass",
+        "notes": "US listing row: IQ_EXCHANGE confirmed. value_map (CapIQ exchange names -> canonical labels) is NOT in VENDOR_REFERENCE: verify; unmapped names pass through unchanged. When the item is missing, the exchange part of a 'TICKER:EXCH' identifier is used."
+      },
+      "country": {
+        "from_column": "exchange",
+        "kind": "label",
+        "value_map": {"NYSE": "US", "NASDAQ": "US", "NYSE American": "US", "NYSE Arca": "US", "CBOE": "US", "OTC": "US"},
+        "unmapped": "nan",
+        "status": "unverifiable",
+        "notes": "Listing country derived from the canonical exchange label: not a vendor field (Kensho country = HQ country, a different meaning, and Xpressfeed countryId=213 is SQL-only). Unmapped exchanges give NaN, which the local country filter excludes."
+      },
+      "currency": {
+        "from_column": "exchange",
+        "kind": "label",
+        "value_map": {"NYSE": "USD", "NASDAQ": "USD", "NYSE American": "USD", "NYSE Arca": "USD", "CBOE": "USD", "OTC": "USD"},
+        "unmapped": "nan",
+        "status": "unverifiable",
+        "notes": "Trading currency of a US listing, derived from the exchange. Every amount is requested with currencyId=USD regardless."
+      },
+      "security_type": {
+        "assume": "common_stock",
+        "kind": "label",
+        "status": "unverifiable",
+        "notes": "No GDS security-type mnemonic is verified (Xpressfeed securitySubTypeId=1 is SQL-only). Explicit tickers and index members are LABELLED common_stock with a warning: ADRs, REITs and funds are NOT excluded. Replace with an admitted mnemonic in an override to classify instead."
+      },
+      "market_cap": {
+        "mnemonic": "IQ_MARKETCAP",
+        "properties": {"currencyId": "USD", "asOfDate": "{as_of}"},
+        "unit": "USD millions (ASSUMED)",
+        "to_canonical": 1000000,
+        "units_verified": false,
+        "plausible": [1000000, 10000000000000],
+        "status": "confirmed",
+        "notes": "Market cap row: IQ_MARKETCAP confirmed; 'Units (millions?) UNVERIFIED. Pass currencyId=USD.' (also an ADR known unknown). x1e6 -> USD absolute. asOfDate anchors the value to as_of (asOfDate on GDSP is listed only in the estimate-revisions row: VERIFY)."
+      }
+    },
+
+    "fundamentals": {
+      "period_end": {"available": false, "status": "unverifiable", "notes": "No period-date mnemonic in VENDOR_REFERENCE: NaN. Point-in-time comes from asOfDate on every amount."},
+      "report_date": {"available": false, "status": "unverifiable", "notes": "No filing-date mnemonic in VENDOR_REFERENCE: NaN."},
+      "revenue_ttm": {
+        "mnemonic": "IQ_TOTAL_REV",
+        "properties": {"periodType": "IQ_LTM", "currencyId": "USD", "asOfDate": "{as_of}"},
+        "unit": "USD millions (ASSUMED)",
+        "to_canonical": 1000000,
+        "units_verified": false,
+        "plausible": [0, 2000000000000],
+        "status": "unverifiable",
+        "notes": "Not a row of 3.3: the reference cites IQ_TOTAL_REV_1YR_ANN_GROWTH, IQ_TEV_TOTAL_REV and the Kensho fallback total_revenue (dataItemId 28). Preflighted on test_identifier."
+      },
+      "revenue_ttm_prior_year": {
+        "derive": "divide_by_one_plus",
+        "inputs": [
+          {"column": "revenue_ttm"},
+          {
+            "mnemonic": "IQ_TOTAL_REV_1YR_ANN_GROWTH",
+            "properties": {"periodType": "IQ_LTM", "asOfDate": "{as_of}"},
+            "unit": "percent (ASSUMED)",
+            "to_canonical": 0.01,
+            "units_verified": false,
+            "plausible": [-1, 100],
+            "status": "confirmed",
+            "notes": "Revenue growth YoY row (confirmed), with periodType IQ_LTM exactly as in the 3.1 example. The reference's residual leg for trailing growth."
+          }
+        ],
+        "unit": "USD",
+        "status": "unverifiable",
+        "notes": "Derived revenue_ttm / (1 + growth), so revenue_growth_yoy_pct reproduces IQ_TOTAL_REV_1YR_ANN_GROWTH. The combination is not in the reference."
+      },
+      "revenue_last_q": {"available": false, "status": "unverifiable", "notes": "Quarterly periodType syntax (e.g. IQ_FQ) is not in VENDOR_REFERENCE: NaN. Add an entry in an override after admission."},
+      "revenue_last_q_prior_year": {"available": false, "status": "unverifiable", "notes": "As revenue_last_q."},
+      "gross_profit_ttm": {
+        "derive": "multiply",
+        "inputs": [
+          {"column": "revenue_ttm"},
+          {
+            "mnemonic": "IQ_GROSS_MARGIN",
+            "properties": {"periodType": "IQ_LTM", "asOfDate": "{as_of}"},
+            "unit": "percent (ASSUMED)",
+            "to_canonical": 0.01,
+            "units_verified": false,
+            "plausible": [-50, 1],
+            "status": "confirmed",
+            "notes": "Gross margin row: IQ_GROSS_MARGIN (IQ_LTM) confirmed."
+          }
+        ],
+        "unit": "USD",
+        "status": "unverifiable",
+        "notes": "Derived revenue_ttm x gross margin, so gross_margin_pct equals IQ_GROSS_MARGIN. The combination is not in the reference."
+      },
+      "gross_profit_ttm_prior_year": {"available": false, "status": "unverifiable", "notes": "No prior-year period syntax in VENDOR_REFERENCE: NaN."},
+      "operating_income_ttm": {
+        "mnemonic": "IQ_OPER_INC",
+        "properties": {"periodType": "IQ_LTM", "currencyId": "USD", "asOfDate": "{as_of}"},
+        "unit": "USD millions (ASSUMED)",
+        "to_canonical": 1000000,
+        "units_verified": false,
+        "plausible": [-1000000000000, 1000000000000],
+        "status": "confirmed",
+        "notes": "Operating margin row: IQ_OPER_INC confirmed (IQ_EBIT_MARGIN is the margin form)."
+      },
+      "operating_income_ttm_prior_year": {"available": false, "status": "unverifiable", "notes": "No prior-year period syntax in VENDOR_REFERENCE: NaN."},
+      "ebitda_ttm": {
+        "derive": "divide",
+        "inputs": [
+          {
+            "mnemonic": "IQ_TEV",
+            "properties": {"currencyId": "USD", "asOfDate": "{as_of}"},
+            "unit": "USD millions (ASSUMED)",
+            "to_canonical": 1000000,
+            "units_verified": false,
+            "plausible": [-1000000000000, 20000000000000],
+            "status": "confirmed",
+            "notes": "Enterprise value row: IQ_TEV confirmed."
+          },
+          {
+            "mnemonic": "IQ_TEV_EBITDA",
+            "properties": {"asOfDate": "{as_of}"},
+            "unit": "x",
+            "to_canonical": 1,
+            "status": "confirmed",
+            "notes": "EV/EBITDA row: IQ_TEV_EBITDA confirmed (GDS parity [M])."
+          }
+        ],
+        "unit": "USD",
+        "status": "unverifiable",
+        "notes": "Derived IQ_TEV / IQ_TEV_EBITDA = CapIQ's own LTM EBITDA, built only from confirmed items (no EBITDA mnemonic is listed). NaN where the multiple is missing or not meaningful (negative EBITDA). Precision is limited by the multiple's rounding."
+      },
+      "net_income_ttm": {"available": false, "status": "unverifiable", "notes": "No net-income mnemonic in VENDOR_REFERENCE: NaN (net margin, ROE and FCF conversion are not evaluated)."},
+      "cfo_ttm": {
+        "mnemonic": "IQ_CASH_OPER",
+        "properties": {"periodType": "IQ_LTM", "currencyId": "USD", "asOfDate": "{as_of}"},
+        "unit": "USD millions (ASSUMED)",
+        "to_canonical": 1000000,
+        "units_verified": false,
+        "plausible": [-1000000000000, 1000000000000],
+        "status": "corrected",
+        "notes": "FCF TTM row (corrected): IQ_CASH_OPER + IQ_CAPEX."
+      },
+      "capex_ttm": {
+        "mnemonic": "IQ_CAPEX",
+        "properties": {"periodType": "IQ_LTM", "currencyId": "USD", "asOfDate": "{as_of}"},
+        "unit": "USD millions, negative = cash spent (ASSUMED)",
+        "to_canonical": -1000000,
+        "units_verified": false,
+        "plausible": [0, 1000000000000],
+        "status": "corrected",
+        "notes": "FCF TTM row (corrected). Capex sign UNVERIFIED: the reference's IQ_CASH_OPER + IQ_CAPEX implies capex comes back negative, so x -1e6 gives the canonical positive cash spent. A positive vendor value lands outside 'plausible' and is blanked with a warning (sign check)."
+      },
+      "fcf_ttm": {
+        "mnemonic": "IQ_LEVERED_FCF",
+        "properties": {"periodType": "IQ_LTM", "currencyId": "USD", "asOfDate": "{as_of}"},
+        "unit": "USD millions (ASSUMED)",
+        "to_canonical": 1000000,
+        "units_verified": false,
+        "plausible": [-1000000000000, 1000000000000],
+        "status": "corrected",
+        "notes": "FCF TTM row (corrected): IQ_LEVERED_FCF (IQ_LTM). CapIQ levered FCF; its definition may differ from the canonical CFO - capex (the feature layer prefers fcf_ttm and falls back to cfo_ttm - capex_ttm). kFinance has no FCF line item."
+      },
+      "total_debt": {
+        "mnemonic": "IQ_TOTAL_DEBT",
+        "properties": {"currencyId": "USD", "asOfDate": "{as_of}"},
+        "unit": "USD millions (ASSUMED)",
+        "to_canonical": 1000000,
+        "units_verified": false,
+        "plausible": [0, 5000000000000],
+        "status": "confirmed",
+        "notes": "Net debt row: IQ_TOTAL_DEBT (dataItemId 4173) confirmed."
+      },
+      "cash_and_equivalents": {
+        "mnemonic": "IQ_CASH_EQUIV",
+        "properties": {"currencyId": "USD", "asOfDate": "{as_of}"},
+        "unit": "USD millions (ASSUMED)",
+        "to_canonical": 1000000,
+        "units_verified": false,
+        "plausible": [0, 2000000000000],
+        "status": "confirmed",
+        "notes": "Net debt row: IQ_CASH_EQUIV (dataItemId 1096) confirmed."
+      },
+      "interest_expense_ttm": {"available": false, "status": "unverifiable", "notes": "No interest-expense mnemonic in VENDOR_REFERENCE: NaN."},
+      "total_equity": {"available": false, "status": "unverifiable", "notes": "No equity mnemonic in VENDOR_REFERENCE: NaN."},
+      "shares_outstanding": {
+        "mnemonic": "IQ_SHARESOUTSTANDING",
+        "properties": {"asOfDate": "{as_of}"},
+        "unit": "millions of shares (ASSUMED)",
+        "to_canonical": 1000000,
+        "units_verified": false,
+        "plausible": [10000, 100000000000],
+        "status": "confirmed",
+        "notes": "Shares outstanding row: IQ_SHARESOUTSTANDING confirmed (Kensho shares_outstanding)."
+      }
+    },
+
+    "estimates": {
+      "revenue_ntm_est": {
+        "mnemonic": "IQ_REVENUE_EST",
+        "properties": {"periodType": "IQ_NTM", "currencyId": "USD", "asOfDate": "{as_of}"},
+        "unit": "USD millions (ASSUMED)",
+        "to_canonical": 1000000,
+        "units_verified": false,
+        "plausible": [0, 2000000000000],
+        "status": "unverifiable",
+        "notes": "Revenue estimate NTM row (unverifiable): IQ_REVENUE_EST + periodType=IQ_NTM; _CIQ suffix variants unverified."
+      },
+      "revenue_ntm_est_3m_ago": {
+        "mnemonic": "IQ_REVENUE_EST",
+        "properties": {"periodType": "IQ_NTM", "currencyId": "USD", "asOfDate": "{as_of_3m}"},
+        "unit": "USD millions (ASSUMED)",
+        "to_canonical": 1000000,
+        "units_verified": false,
+        "plausible": [0, 2000000000000],
+        "status": "unverifiable",
+        "notes": "Estimate revisions row (unverifiable): IQ_REVENUE_EST with asOfDate = as_of - 91 days."
+      },
+      "eps_ntm_est": {
+        "mnemonic": "IQ_EPS_EST",
+        "properties": {"periodType": "IQ_NTM", "currencyId": "USD", "asOfDate": "{as_of}"},
+        "unit": "USD per share",
+        "to_canonical": 1,
+        "plausible": [-10000, 100000],
+        "status": "unverifiable",
+        "notes": "Estimate revisions row (unverifiable): IQ_EPS_EST; periodType=IQ_NTM by analogy with IQ_REVENUE_EST."
+      },
+      "eps_ntm_est_3m_ago": {
+        "mnemonic": "IQ_EPS_EST",
+        "properties": {"periodType": "IQ_NTM", "currencyId": "USD", "asOfDate": "{as_of_3m}"},
+        "unit": "USD per share",
+        "to_canonical": 1,
+        "plausible": [-10000, 100000],
+        "status": "unverifiable",
+        "notes": "Estimate revisions row (unverifiable): IQ_EPS_EST with asOfDate = as_of - 91 days (Kensho has no as-of date)."
+      },
+      "eps_ttm": {"available": false, "status": "unverifiable", "notes": "No trailing-EPS mnemonic in VENDOR_REFERENCE: NaN."},
+      "num_analysts": {"available": false, "status": "unverifiable", "notes": "No analyst-count mnemonic in VENDOR_REFERENCE: NaN."},
+      "target_price_mean": {
+        "mnemonic": "IQ_PRICE_TARGET",
+        "properties": {"currencyId": "USD", "asOfDate": "{as_of}"},
+        "unit": "USD per share",
+        "to_canonical": 1,
+        "plausible": [0, 10000000],
+        "status": "confirmed",
+        "notes": "Next earnings / surprise / target row (confirmed; GDS parity untested)."
+      },
+      "last_eps_surprise": {
+        "mnemonic": "IQ_EST_EPS_SURPRISE_PERCENT",
+        "properties": {"asOfDate": "{as_of}"},
+        "unit": "percent (ASSUMED from the mnemonic name)",
+        "to_canonical": 0.01,
+        "units_verified": false,
+        "plausible": [-100, 100],
+        "status": "confirmed",
+        "notes": "Next earnings / surprise / target row (confirmed; GDS parity untested). Canonical is a fraction."
+      },
+      "last_earnings_date": {"available": false, "status": "unverifiable", "notes": "No last-earnings-date mnemonic in VENDOR_REFERENCE: NaN."},
+      "next_earnings_date": {
+        "mnemonic": "IQ_NEXT_EARNINGS_DATE",
+        "properties": {"asOfDate": "{as_of}"},
+        "kind": "date",
+        "status": "confirmed",
+        "notes": "Next earnings / surprise / target row (confirmed; GDS parity untested)."
+      }
+    },
+
+    "short_interest": {
+      "short_interest_shares": {"available": false, "status": "unverifiable", "notes": "Short interest row: none verified (IQ_SHORT_INTEREST_PERCENT is % of shares outstanding, community-sourced). 'Do not ship. Source it from Bloomberg or LSEG.'"},
+      "short_interest_shares_1m_ago": {"available": false, "status": "unverifiable", "notes": "As short_interest_shares."},
+      "float_shares": {"available": false, "status": "unverifiable", "notes": "No float mnemonic in VENDOR_REFERENCE."},
+      "settlement_date": {"available": false, "status": "unverifiable", "notes": "As short_interest_shares."}
+    },
+
+    "options": {
+      "iv_30d_atm": {"available": false, "status": "confirmed", "notes": "Implied vol: not available from S&P (confirmed). Use Bloomberg or LSEG."},
+      "iv_30d_atm_1y_high": {"available": false, "status": "confirmed", "notes": "Implied vol: not available from S&P (confirmed)."},
+      "iv_30d_atm_1y_low": {"available": false, "status": "confirmed", "notes": "Implied vol: not available from S&P (confirmed)."},
+      "put_volume": {"available": false, "status": "confirmed", "notes": "Put/call: not available from S&P (confirmed)."},
+      "call_volume": {"available": false, "status": "confirmed", "notes": "Put/call: not available from S&P (confirmed)."},
+      "put_open_interest": {"available": false, "status": "confirmed", "notes": "Put/call: not available from S&P (confirmed)."},
+      "call_open_interest": {"available": false, "status": "confirmed", "notes": "Put/call: not available from S&P (confirmed)."}
+    }
+  },
+
+  "history": {
+    "function": "GDSHE",
+    "properties": {"startDate": "{start}", "endDate": "{end}"},
+    "status": "confirmed",
+    "notes": "GDSHE per identifier x mnemonic with startDate/endDate (3.1 example). One request per ticker per field.",
+    "fields": {
+      "close": {
+        "mnemonic": "IQ_CLOSEPRICE_ADJ",
+        "unit": "USD per share",
+        "to_canonical": 1,
+        "plausible": [0.0001, 5000000],
+        "status": "confirmed",
+        "notes": "Last price row (confirmed). SMA row (corrected): compute moving averages from IQ_CLOSEPRICE_ADJ, never from raw prices. Plausibility is checked on each series' median."
+      },
+      "volume": {
+        "mnemonic": "IQ_VOLUME",
+        "unit": "millions of shares (ASSUMED)",
+        "to_canonical": 1000000,
+        "units_verified": false,
+        "plausible": [0, 20000000000],
+        "status": "confirmed",
+        "notes": "Daily volume row (confirmed); 'Avg volume 20d: compute from IQ_VOLUME'. Scale and split adjustment UNVERIFIED (x1e6 assumes CapIQ's millions default)."
+      },
+      "open": {
+        "mnemonic": "IQ_OPENPRICE_ADJ",
+        "unit": "USD per share",
+        "to_canonical": 1,
+        "plausible": [0.0001, 5000000],
+        "status": "unverifiable",
+        "notes": "Not in VENDOR_REFERENCE (named by analogy with IQ_CLOSEPRICE_ADJ). Preflighted; NaN when it fails."
+      },
+      "high": {
+        "mnemonic": "IQ_HIGHPRICE_ADJ",
+        "unit": "USD per share",
+        "to_canonical": 1,
+        "plausible": [0.0001, 5000000],
+        "status": "unverifiable",
+        "notes": "Not in VENDOR_REFERENCE (named by analogy with IQ_CLOSEPRICE_ADJ). Preflighted; NaN when it fails (the technical layer then uses the close)."
+      },
+      "low": {
+        "mnemonic": "IQ_LOWPRICE_ADJ",
+        "unit": "USD per share",
+        "to_canonical": 1,
+        "plausible": [0.0001, 5000000],
+        "status": "unverifiable",
+        "notes": "Not in VENDOR_REFERENCE (named by analogy with IQ_CLOSEPRICE_ADJ). Preflighted; NaN when it fails (the technical layer then uses the close)."
+      }
+    }
+  },
+
+  "benchmark": {
+    "identifier": "^SPX",
+    "mnemonic": "IQ_CLOSEPRICE",
+    "status": "unverifiable",
+    "notes": "Relative strength row (unverifiable): compute vs ^SPX + IQ_CLOSEPRICE; ^SPX is untested (the ^ form was seen only as ^ftse). A price index, not total return.",
+    "fallback_identifier": "SPY:",
+    "fallback_mnemonic": "IQ_CLOSEPRICE_ADJ",
+    "fallback_status": "unverifiable",
+    "fallback_notes": "Used when ^SPX returns nothing: the SPY ETF's adjusted close (identifier form TICKER: confirmed; SPY coverage untested)."
+  },
+
+  "features": {
+    "market_cap_usd_bn": {
+      "mnemonic": "IQ_MARKETCAP",
+      "properties": {"currencyId": "USD", "asOfDate": "{as_of}"},
+      "unit": "USD millions (ASSUMED)",
+      "to_catalog": 0.001,
+      "units_verified": false,
+      "plausible": [0.001, 10000],
+      "status": "confirmed",
+      "notes": "Market cap row: units UNVERIFIED. USD mn x 0.001 = USD bn."
+    },
+    "enterprise_value_usd_bn": {
+      "mnemonic": "IQ_TEV",
+      "properties": {"currencyId": "USD", "asOfDate": "{as_of}"},
+      "unit": "USD millions (ASSUMED)",
+      "to_catalog": 0.001,
+      "units_verified": false,
+      "plausible": [-1000, 20000],
+      "status": "confirmed",
+      "notes": "Enterprise value row (confirmed). CapIQ TEV includes items (minorities, preferred) the catalog's market cap + debt - cash does not: a reconciliation value, not a substitute."
+    },
+    "price": {
+      "mnemonic": "IQ_CLOSEPRICE",
+      "properties": {"asOfDate": "{as_of}"},
+      "unit": "USD per share",
+      "to_catalog": 1,
+      "plausible": [0.0001, 5000000],
+      "status": "confirmed",
+      "notes": "Last price row (confirmed). Unadjusted close; equals the adjusted close on the latest day."
+    },
+    "ev_to_ebitda": {
+      "mnemonic": "IQ_TEV_EBITDA",
+      "properties": {"asOfDate": "{as_of}"},
+      "unit": "x",
+      "to_catalog": 1,
+      "status": "confirmed",
+      "notes": "EV/EBITDA row (confirmed; GDS parity [M]). Vendor EV definition differs from the catalog's."
+    },
+    "ev_to_sales": {
+      "mnemonic": "IQ_TEV_TOTAL_REV",
+      "properties": {"asOfDate": "{as_of}"},
+      "unit": "x",
+      "to_catalog": 1,
+      "status": "confirmed",
+      "notes": "EV/Sales row (confirmed). Vendor EV definition differs from the catalog's."
+    },
+    "revenue_growth_yoy_pct": {
+      "mnemonic": "IQ_TOTAL_REV_1YR_ANN_GROWTH",
+      "properties": {"periodType": "IQ_LTM", "asOfDate": "{as_of}"},
+      "unit": "percent (ASSUMED)",
+      "to_catalog": 1,
+      "units_verified": false,
+      "plausible": [-100, 10000],
+      "status": "confirmed",
+      "notes": "Revenue growth YoY row (confirmed): trailing (LTM vs prior LTM), periodType IQ_LTM as in the 3.1 example."
+    },
+    "gross_margin_pct": {
+      "mnemonic": "IQ_GROSS_MARGIN",
+      "properties": {"periodType": "IQ_LTM", "asOfDate": "{as_of}"},
+      "unit": "percent (ASSUMED)",
+      "to_catalog": 1,
+      "units_verified": false,
+      "plausible": [-5000, 100],
+      "status": "confirmed",
+      "notes": "Gross margin row: IQ_GROSS_MARGIN (IQ_LTM) confirmed."
+    },
+    "operating_margin_pct": {
+      "mnemonic": "IQ_EBIT_MARGIN",
+      "properties": {"periodType": "IQ_LTM", "asOfDate": "{as_of}"},
+      "unit": "percent (ASSUMED)",
+      "to_catalog": 1,
+      "units_verified": false,
+      "plausible": [-5000, 100],
+      "status": "confirmed",
+      "notes": "Operating margin row (confirmed). EBIT margin; the catalog uses operating income / revenue."
+    },
+    "net_debt_usd_bn": {
+      "mnemonic": "IQ_NET_DEBT",
+      "properties": {"currencyId": "USD", "asOfDate": "{as_of}"},
+      "unit": "USD millions (ASSUMED)",
+      "to_catalog": 0.001,
+      "units_verified": false,
+      "plausible": [-2000, 5000],
+      "status": "confirmed",
+      "notes": "Net debt row (confirmed; Kensho net_debt dataItemId 4364)."
+    },
+    "net_debt_to_ebitda": {
+      "mnemonic": "IQ_NET_DEBT_EBITDA",
+      "properties": {"asOfDate": "{as_of}"},
+      "unit": "x",
+      "to_catalog": 1,
+      "status": "confirmed",
+      "notes": "Net debt/EBITDA row (confirmed; GDS parity untested)."
+    },
+    "fcf_yield_pct": {
+      "derive": "reciprocal",
+      "inputs": [
+        {
+          "mnemonic": "IQ_MARKET_CAP_LFCF",
+          "properties": {"asOfDate": "{as_of}"},
+          "unit": "x (market cap / levered FCF)",
+          "to_canonical": 1,
+          "status": "unverifiable",
+          "notes": "FCF yield row (unverifiable): 1/IQ_MARKET_CAP_LFCF."
+        }
+      ],
+      "to_catalog": 100,
+      "unit": "%",
+      "status": "unverifiable",
+      "notes": "FCF yield row (unverifiable): 100 / IQ_MARKET_CAP_LFCF. Levered FCF, not the catalog's CFO - capex. Z-score / reconciliation only until admitted."
+    },
+    "high_52w": {
+      "mnemonic": "IQ_YEARHIGH",
+      "properties": {"asOfDate": "{as_of}"},
+      "unit": "USD per share",
+      "to_catalog": 1,
+      "plausible": [0.0001, 5000000],
+      "status": "unverifiable",
+      "notes": "52w high row (unverifiable; IQ_YEARHIGH_DATE alongside): GDS parity untested; may be unadjusted. The catalog computes the adjusted 252-session high locally."
+    },
+    "gics_sector": {
+      "mnemonic": "IQ_INDUSTRY_SECTOR",
+      "kind": "label",
+      "status": "unverifiable",
+      "notes": "GICS / industry row (unverifiable). CapIQ classification; may differ from GICS."
+    },
+    "sma_50": {"compute": "local", "status": "corrected", "notes": "SMA 50/200 row (corrected): compute from IQ_CLOSEPRICE_ADJ, never from raw prices."},
+    "sma_200": {"compute": "local", "status": "corrected", "notes": "SMA 50/200 row (corrected): compute from IQ_CLOSEPRICE_ADJ."},
+    "rsi_14": {"compute": "local", "status": "confirmed", "notes": "RSI 14 row (confirmed): compute (Wilder); no field."},
+    "macd_line": {"compute": "local", "status": "confirmed", "notes": "MACD row (confirmed): compute; no field."},
+    "avg_dollar_volume_20d_usd_mn": {"compute": "local", "status": "confirmed", "notes": "Avg volume 20d row (confirmed): compute from IQ_VOLUME; no mnemonic."},
+    "rel_volume_5d": {"compute": "local", "status": "confirmed", "notes": "Computed from IQ_VOLUME history (Avg volume row)."},
+    "drawdown_from_52w_high_pct": {"compute": "local", "status": "unverifiable", "notes": "52w high row is unverifiable: computed locally from adjusted history (the reference SQL uses MAX(adjusted high))."},
+    "return_3m_pct": {"compute": "local", "status": "unverifiable", "notes": "Total return row (unverifiable): compute from IQ_CLOSEPRICE_ADJ; return semantics of PERIODTYPE '-3M' are undocumented."},
+    "rel_strength_3m_pp": {"compute": "local", "status": "unverifiable", "notes": "Relative strength row (unverifiable): compute vs ^SPX + IQ_CLOSEPRICE."},
+    "iv_30d_pct": {"available": false, "status": "confirmed", "notes": "Implied vol: not available from S&P (confirmed)."},
+    "iv_rank_1y": {"available": false, "status": "confirmed", "notes": "Implied vol: not available from S&P (confirmed)."},
+    "iv_to_realized_vol_ratio": {"available": false, "status": "confirmed", "notes": "Implied vol: not available from S&P (confirmed)."},
+    "put_call_volume_ratio": {"available": false, "status": "confirmed", "notes": "Put/call: not available from S&P (confirmed)."},
+    "put_call_oi_ratio": {"available": false, "status": "confirmed", "notes": "Put/call: not available from S&P (confirmed)."},
+    "short_interest_pct_float": {"available": false, "status": "unverifiable", "notes": "Short interest % float: none verified. Do not ship; source it from Bloomberg or LSEG."},
+    "days_to_cover": {"available": false, "status": "unverifiable", "notes": "Days to cover: compute; needs shares short, which S&P does not supply."},
+    "short_interest_change_1m_pct": {"available": false, "status": "unverifiable", "notes": "Needs shares short, which S&P does not supply."}
+  },
+
+  "documents": {
+    "transcripts": {
+      "channel": "kensho",
+      "latest_earnings_method": "get_latest_earnings_from_identifiers",
+      "transcript_method": "get_transcript_from_key_dev_id",
+      "licence_class": "L1",
+      "gate": "G2",
+      "status": "corrected",
+      "notes": "Transcripts row (corrected): Kensho get_latest_earnings_from_identifiers -> get_transcript_from_key_dev_id; de-duplicate versions per keyDevId. ADR step 7 object route: Client(...).ticker(sym).company.latest_earnings (.name, .key_dev_id) then .transcript.raw ('Speaker: text'; requires TranscriptsPermission). Licence class L1 pending gate G2: served only when the boundary permits TRANSCRIPT text with a note citing G2."
+    },
+    "news": {
+      "available": false,
+      "status": "unverifiable",
+      "notes": "News row (unverifiable): IQ_NEWS (CIQRANGE); Kensho get_key_devs_from_identifier. Key developments are curated events, not a newswire. Not served."
+    },
+    "filings": {
+      "available": false,
+      "status": "unverifiable",
+      "notes": "SEC filings row (unverifiable): CIQ document service; documents/search path unverifiable. Use SEC EDGAR directly (L0, aitrading.data.sec_edgar)."
+    },
+    "research": {
+      "available": false,
+      "status": "confirmed",
+      "notes": "Broker research: not available via API (confirmed)."
+    }
+  }
+}
