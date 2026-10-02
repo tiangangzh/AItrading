@@ -1,19 +1,21 @@
-# Run it on your PC (small edition)
+# Run it on your PC
 
-The full pipeline is built for institutional data (Bloomberg / LSEG / S&P Capital IQ). The small
-edition runs the **same pipeline on your own computer**, with three levels you can climb:
+AItrading is a normal Python program: clone it from GitHub, install it, and run it from a terminal
+on Windows, macOS or Linux. On a PC it uses **real market data from free sources** by default, and
+**Claude** for the reasoning when you give it your Anthropic API key. If you have institutional
+entitlements, the same program runs on Bloomberg / LSEG / S&P Capital IQ (see `docs/ARCHITECTURE.md`).
 
-| Level | Data | Reasoning | Needs |
-|---|---|---|---|
-| 1. Demo | Built-in synthetic US market (500 fictional stocks with planted dislocations and value traps, earnings-call transcripts, news) | Offline rule-based translator + explainer | Python only |
-| 2. Free real data | Real US stocks: prices, short interest, consensus estimates and options snapshot from Yahoo Finance (via `yfinance`); fundamentals, 8-K earnings press releases and 10-Q/10-K MD&A from SEC EDGAR | Offline rule-based, or Claude (level 3) | Internet + an `SEC_USER_AGENT` string |
-| 3. Claude | Either of the above | Claude (`claude-opus-5-5`) translates your observation into a screen and explains each dislocation, with every quote and number machine-checked | Your own `ANTHROPIC_API_KEY` |
+| Piece | On your PC (default) | Institutional |
+|---|---|---|
+| Market data | Yahoo Finance via `yfinance` (prices, short interest, consensus estimates, options) + SEC EDGAR (fundamentals, 8-K earnings releases, 10-Q/10-K MD&A) | Bloomberg (BQL/BQuant), LSEG Data Library, S&P Capital IQ |
+| Reasoning | Claude (`claude-opus-5-5`) with your `ANTHROPIC_API_KEY`; built-in rule-based fallback without one | same |
+| Universe | ~150 liquid US stocks bundled (mid-cap tilted), or your own ticker list | full US equity universe |
 
-Requirements: Windows 10/11, macOS or Linux; Python 3.10 or newer; ~4 GB RAM; ~200 MB disk.
+Requirements: Windows 10/11, macOS or Linux; Python 3.10+; Git; ~4 GB RAM; internet access.
 
 ---
 
-## 1. Install (once)
+## 1. Get the code and install (once)
 
 ### Windows (PowerShell)
 
@@ -35,119 +37,95 @@ source .venv/bin/activate
 pip install -e ".[free]"
 ```
 
-Or use the one-shot launchers, which create the virtual environment, install and run the demo:
-`scripts\run_demo.ps1 -Free` (Windows) / `./scripts/run_demo.sh --free` (macOS/Linux).
+Or run `scripts\install.ps1` (Windows) / `./scripts/install.sh` (macOS/Linux), which do the same.
 
----
+## 2. Set your keys (each new terminal, or add them to your user environment variables)
 
-## 2. Level 1 - the demo (no keys, no internet after install)
-
-```bash
-aitrading demo
-```
-
-This runs the representative task end to end on the synthetic market: translate the observation
-into a screen, scan ~500 stocks, rank the survivors, read their earnings calls, explain each
-dislocation, verify every quote and number, and write the report to `./aitrading_output/`
-(Markdown + HTML; the HTML opens in your browser - add `--no-open` to skip that).
-
-The synthetic market knows the right answers (which names are genuine transitory shocks and which
-are value traps), so the demo also prints how well the explainer told them apart.
-
-Try your own observation on the synthetic market:
-
-```bash
-aitrading run --offline "Large caps above their 200-day with RSI under 35 and FCF yield above 5%"
-```
-
----
-
-## 3. Level 2 - free real data
-
-The SEC asks every automated client to identify itself. Set this once per terminal session
-(use your own name and email):
+The SEC asks every automated client to identify itself with a name and email. The Anthropic key is
+what lets Claude do the reasoning (create one at <https://console.anthropic.com/>).
 
 ```powershell
 # Windows PowerShell
-$env:SEC_USER_AGENT = "Jane Doe jane@example.com"
+$env:SEC_USER_AGENT    = "Jane Doe jane@example.com"
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
 ```
 
 ```bash
 # macOS / Linux
 export SEC_USER_AGENT="Jane Doe jane@example.com"
+export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-Then run against the bundled starter watchlist (~150 liquid US stocks across all sectors, tilted to
-mid-caps), or your own tickers:
+To make them permanent on Windows: *Start -> "Edit environment variables for your account"*.
+On macOS/Linux add the two `export` lines to `~/.zshrc` or `~/.bashrc`.
+
+## 3. Run
 
 ```bash
-aitrading run --provider free --offline "Mid-caps in uptrends that pulled back 15-40% from highs on heavy volume, RSI under 40, FCF yield above 4%, revenue growth above 8%, short interest above 6% of float"
-
-aitrading run --provider free --tickers CROX,DECK,ELF,ONON,SKX --offline "..."
-aitrading run --provider free --universe-file my_watchlist.txt --offline "..."
+aitrading run "Find US mid-caps (\$2-20B) that were in established uptrends (50-day above 200-day, positive 12-1 momentum) but have pulled back 15-40% from their 52-week highs on heavy volume, now oversold (RSI under 40), still generating strong free cash flow (FCF yield above 4%) with revenue growth above 8%, and where short interest is elevated (above 6% of float). Rank by FCF yield, growth and the size of the drawdown, then read the latest earnings releases and explain the dislocation."
 ```
+
+What happens:
+
+1. Claude translates the observation into a typed screen (inspect it with `aitrading spec "..."`).
+2. The program downloads prices, fundamentals, short interest, estimates and options for the
+   universe, computes ~80 technical / fundamental / positioning features, applies the screen and
+   ranks the survivors. (Claude never computes these numbers.)
+3. For the top names it reads the latest SEC earnings press releases and 10-Q/10-K MD&A, and Claude
+   explains why each dislocation exists - or says it looks like a value trap.
+4. Every quote is checked verbatim against the source filing and every number against the feature
+   table; the report marks each one ✓ / ✗.
+5. The report is written to `./aitrading_output/` (Markdown + HTML) and opened in your browser.
 
 The first run downloads and caches data in `~/.aitrading/cache` (a few minutes for ~150 tickers);
 reruns are fast.
 
-What the free edition does **not** have, compared with the institutional build:
-
-* **Earnings-call transcripts** are not freely licensed. The narrative engine reads the 8-K earnings
-  press release and the 10-Q/10-K MD&A instead - good for numbers and management's framing,
-  weaker on Q&A tone.
-* **Point-in-time history for snapshots.** Short interest, consensus estimates and options from
-  Yahoo are *current* snapshots, so they are only used when `--as-of` is today (or within a few
-  days). For historical `--as-of` dates those features are left blank and the report says so.
-  Prices and SEC fundamentals *are* point-in-time (filings are used only after their filing date).
-* **Universe size.** It screens the tickers you give it, not the whole market. Pass a larger file
-  if you want a wider net; expect download time to grow with it.
-* Yahoo data via `yfinance` is unofficial and for personal research use; respect Yahoo's terms.
-
----
-
-## 4. Level 3 - reasoning with Claude
-
-Create an API key at <https://console.anthropic.com/> and set it in your terminal:
-
-```powershell
-$env:ANTHROPIC_API_KEY = "sk-ant-..."      # Windows PowerShell
-```
+### Your own tickers
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."      # macOS / Linux
+aitrading run --tickers CROX,DECK,ELF,ONON,SKX "..."
+aitrading run --universe-file my_watchlist.txt "..."     # one ticker per line, or a CSV with a 'ticker' column
 ```
 
-Drop `--offline` and Claude takes over the two reasoning steps:
+### Without an Anthropic key
 
-```bash
-aitrading run --provider free "Your observation in plain English"
-aitrading run "Your observation"            # same, on the synthetic market
-```
-
-* Claude translates the observation into a typed screen (you can inspect it with
-  `aitrading spec "..."`) and explains each top candidate. It never computes the numbers that select
-  stocks; those come from the deterministic engine.
-* Every quote must be verbatim from a source document and every number must match the feature
-  table; the report marks each one ✓ / ✗.
-* Cost: roughly one call for the screen plus one per explained candidate (`--explain 5` by default).
-  Use `--explain 2` while experimenting, `--effort medium` for cheaper, faster explanations.
+The program still runs end to end with a built-in rule-based translator and explainer (it tells you
+when it does this). Add `--offline` to force that mode even when a key is set.
 
 ---
 
 ## Useful commands
 
 ```bash
+aitrading run --help                   # all options: --tickers, --top, --explain, --effort, --as-of, --out, --format
+aitrading spec "..."                   # show the screen an observation translates to
+aitrading screen "..."                 # screen + rank only, no explanations (fast, cheap)
 aitrading catalog                      # every screenable feature with units and definitions
-aitrading spec --offline "..."         # show the screen an observation translates to
-aitrading screen --offline "..."       # screen + rank only, no explanations
-aitrading run --help                   # all options (as-of date, top N, output folder, JSON output)
+aitrading demo                         # offline self-test on a built-in simulated market (no internet, no keys)
 ```
+
+Cost control with Claude: roughly one call for the screen plus one per explained candidate.
+Use `--explain 2` while experimenting and `--effort medium` for cheaper, faster explanations.
+
+## Limits of the free data (vs. the institutional build)
+
+* **Earnings-call transcripts** are not freely licensed. The narrative engine reads the 8-K earnings
+  press release and the 10-Q/10-K MD&A instead - good for numbers and management's framing, weaker
+  on Q&A tone. With Bloomberg / LSEG / Capital IQ entitlements the transcripts are used.
+* **Point-in-time history for snapshots.** Short interest, consensus estimates and options from
+  Yahoo are *current* snapshots, so they are used only when `--as-of` is today (the default) or
+  within a few days. For historical `--as-of` dates those features are left blank and the report
+  says so. Prices and SEC fundamentals *are* point-in-time (a filing is used only after its filing
+  date).
+* **Universe size.** It screens the tickers you give it (default: the bundled ~150), not the whole
+  market. Pass a bigger list for a wider net; download time grows with it.
+* Yahoo data via `yfinance` is unofficial and for personal research use; respect Yahoo's terms.
 
 ## Troubleshooting
 
-* `SEC_USER_AGENT is not set` - see step 3.
-* `No Anthropic credentials found` - set `ANTHROPIC_API_KEY` or add `--offline`.
-* A ticker shows blank fundamentals - it may file with the SEC under a different ticker/class, be
-  a foreign private issuer (files 20-F/6-K, not 10-Q/8-K), or use uncommon XBRL tags. The report
-  lists data-coverage warnings.
-* Corporate proxies: `pip` and the data clients honour `HTTPS_PROXY`.
+* `SEC_USER_AGENT is not set` - see step 2.
+* `No Anthropic credentials found - running offline` - set `ANTHROPIC_API_KEY` (step 2).
+* A ticker has blank fundamentals - it may file under a different entity/class, be a foreign
+  private issuer (20-F/6-K instead of 10-Q/8-K), or use uncommon XBRL tags. The report lists
+  data-coverage warnings.
+* Behind a corporate proxy: `pip`, `yfinance` and the SEC client honour `HTTPS_PROXY`.
