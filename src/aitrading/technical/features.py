@@ -19,6 +19,7 @@ Conventions
 * Returns are simple close-to-close returns (beta uses daily simple returns); volatility uses log
   returns (sample stdev, annualised with 252).
 * Bool features are 1.0 / 0.0, NaN when the inputs over the whole look-back are not available.
+* days_since_52w_high counts bars since the most recent bar whose high equals high_52w (0 = today).
 * return_6m_percentile = (rank - 1) / (N - 1) x 100 over the tickers with a valid return_6m_pct
   (ties share the average rank; 50 when N == 1): 0 = weakest, 100 = strongest.
 
@@ -202,12 +203,11 @@ def _last(frame: pd.DataFrame) -> np.ndarray:
 def _cross_flag(a: pd.DataFrame, b: pd.DataFrame, lookback: int) -> np.ndarray:
     """1.0 / 0.0 if ``a`` crossed above ``b`` within ``lookback`` bars; NaN unless both series are
     available on all lookback + 1 bars (every possible crossing was observable)."""
-    av, bv = a.to_numpy(dtype=float), b.to_numpy(dtype=float)
-    wa, wb = _tail(av, lookback + 1), _tail(bv, lookback + 1)
-    if wa is None:
-        return np.full(av.shape[1], np.nan)
-    observable = np.isfinite(wa).all(axis=0) & np.isfinite(wb).all(axis=0)
-    crossed = _last(ind.crossed_above_within(a, b, lookback).astype(float))
+    if len(a) < lookback + 1:
+        return np.full(a.shape[1], np.nan)
+    wa, wb = a.iloc[-(lookback + 1) :], b.iloc[-(lookback + 1) :]
+    observable = (wa.notna().all(axis=0) & wb.notna().all(axis=0)).to_numpy()
+    crossed = _last(ind.crossed_above_within(wa, wb, lookback).astype(float))
     return np.where(observable, crossed, np.nan)
 
 
@@ -241,7 +241,6 @@ def compute_technical_features(prices: PricePanel, benchmark: pd.Series | None, 
     cols = pd.RangeIndex(n)
     frame = lambda a: pd.DataFrame(a, columns=cols)  # noqa: E731
     C, H, L, V, B = bars.close, bars.high, bars.low, bars.volume, bars.bench
-    Cdf = frame(C)
     price = _row(C, 0)
     f: dict[str, np.ndarray] = {"price": price}
 
@@ -270,11 +269,8 @@ def compute_technical_features(prices: PricePanel, benchmark: pd.Series | None, 
         f["return_12m_ex_1m_pct"] = _pct(_row(C, W_1M), _row(C, W_12M))
 
         # oscillators
-        f["rsi_14"] = _last(ind.rsi_wilder(Cdf, 14))
-        line, sig, hist = ind.macd(Cdf, 12, 26, 9)
-        f["macd_line"], f["macd_signal"], f["macd_histogram"] = _last(line), _last(sig), _last(hist)
+        f.update(_recursive_features(C, H, L))
         f["macd_histogram_pct_price"] = _div(f["macd_histogram"], price) * 100.0
-        f["macd_bullish_cross_10d"] = _cross_flag(line, sig, 10)
 
         # range / drawdown
         wh, wl = _tail(H, W_12M), _tail(L, W_12M)
@@ -291,7 +287,7 @@ def compute_technical_features(prices: PricePanel, benchmark: pd.Series | None, 
         # volatility
         f["volatility_20d_pct"] = _last(ind.realized_vol(frame(_tail_or_all(C, 21)), 20)) * 100.0
         f["volatility_60d_pct"] = _last(ind.realized_vol(frame(_tail_or_all(C, 61)), 60)) * 100.0
-        f["atr_14_pct"] = _div(_last(ind.atr_wilder(frame(H), frame(L), Cdf, 14)), price) * 100.0
+        f["atr_14_pct"] = _div(f.pop("atr_14"), price) * 100.0
         tail = _tail_or_all(C, W_12M + 1), _tail_or_all(B, W_12M + 1)
         rets = ind.total_return(frame(tail[0]), 1), ind.total_return(frame(tail[1]), 1)
         f["beta_1y"] = _last(ind.rolling_beta(rets[0], rets[1], W_12M))
@@ -312,6 +308,24 @@ def compute_technical_features(prices: PricePanel, benchmark: pd.Series | None, 
         cross_sectional_percentile(out["return_6m_pct"]),
     )
     return out[TECHNICAL_FEATURES].astype("float64")
+
+
+_BLOCK = 512  # columns per block for full-history recursions (keeps temporaries cache/heap friendly)
+
+
+def _recursive_features(C: np.ndarray, H: np.ndarray, L: np.ndarray) -> dict[str, np.ndarray]:
+    """RSI, MACD (+ bullish cross) and ATR need each ticker's full bar history; run in column blocks."""
+    keys = ("rsi_14", "macd_line", "macd_signal", "macd_histogram", "macd_bullish_cross_10d", "atr_14")
+    out = {k: np.full(C.shape[1], np.nan) for k in keys}
+    for lo in range(0, C.shape[1], _BLOCK):
+        sl = slice(lo, lo + _BLOCK)
+        c, h, low = (pd.DataFrame(a[:, sl]) for a in (C, H, L))
+        out["rsi_14"][sl] = _last(ind.rsi_wilder(c, 14))
+        line, sig, hist = ind.macd(c, 12, 26, 9)
+        out["macd_line"][sl], out["macd_signal"][sl], out["macd_histogram"][sl] = _last(line), _last(sig), _last(hist)
+        out["macd_bullish_cross_10d"][sl] = _cross_flag(line, sig, 10)
+        out["atr_14"][sl] = _last(ind.atr_wilder(h, low, c, 14))
+    return out
 
 
 def _tail_or_all(a: np.ndarray, n: int) -> np.ndarray:

@@ -82,15 +82,15 @@ def _rolling(a: np.ndarray, n: int, stat: _Stat) -> np.ndarray:
         padded[n:] = np.where(finite, a, np.nan)
         r = getattr(pd.Series(padded.T.ravel()).rolling(n, min_periods=n), stat)()
         return r.to_numpy().reshape(k, t + n).T[n:].copy()
+    all_finite = bool(finite.all())
     first = np.argmax(finite, axis=0)
     centre = np.where(finite.any(axis=0), a[first, np.arange(k)], 0.0)
-    x = np.where(finite, a - centre, 0.0)
+    x = a - centre
+    if not all_finite:
+        x[~finite] = 0.0
     cum = np.zeros((t + 1, k))
     np.cumsum(x, axis=0, out=cum[1:])
     s1 = _window_diff(cum, n)
-    bad = np.zeros((t + 1, k), dtype=np.int64)
-    np.cumsum(~finite, axis=0, out=bad[1:])
-    incomplete = _window_diff(bad, n) > 0
     if stat == "sum":
         res = s1 + n * centre
     elif stat == "mean":
@@ -103,7 +103,10 @@ def _rolling(a: np.ndarray, n: int, stat: _Stat) -> np.ndarray:
         res = np.sqrt(np.maximum(var, 0.0))
     else:  # pragma: no cover - guarded by _Stat
         raise ValueError(f"unknown rolling statistic {stat!r}")
-    res[incomplete] = np.nan
+    if not all_finite:
+        bad = np.zeros((t + 1, k), dtype=np.int32)
+        np.cumsum(~finite, axis=0, out=bad[1:])
+        res[_window_diff(bad, n) > 0] = np.nan
     out[n - 1 :] = res
     return out
 
@@ -116,23 +119,24 @@ def _ewm(a: np.ndarray, alpha: float, min_periods: int = 1) -> np.ndarray:
     ok = np.isfinite(a)
     row_ok = ok.all(axis=1)
     state = np.full(k, np.nan)
+    seen = np.zeros(k, dtype=np.int64)
     keep = 1.0 - alpha
-    ready = False  # every column seeded: complete rows take the cheap in-place update
+    ready = False  # every column seeded and warmed up: complete rows take the cheap update
     for i in range(t):
         x = a[i]
         if ready and row_ok[i]:
             state *= keep
             state += alpha * x
-        else:
-            new = keep * state + alpha * x
-            fresh = ok[i] & np.isnan(state)
-            new[fresh] = x[fresh]
-            state = np.where(ok[i], new, state)
-            ready = not np.isnan(state).any()
-        out[i] = state
-    out[~ok] = np.nan
-    if min_periods > 1:
-        out[np.cumsum(ok, axis=0) < min_periods] = np.nan
+            out[i] = state
+            continue
+        new = keep * state + alpha * x
+        fresh = ok[i] & np.isnan(state)
+        new[fresh] = x[fresh]
+        state = np.where(ok[i], new, state)
+        seen += ok[i]
+        warm = seen >= min_periods
+        out[i] = np.where(ok[i] & warm, state, np.nan)
+        ready = bool(warm.all()) and not np.isnan(state).any()
     return out
 
 
