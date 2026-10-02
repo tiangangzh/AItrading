@@ -19,6 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# Free real-data mode for running on a personal PC (Yahoo via yfinance + SEC EDGAR via httpx).
+free = ["yfinance>=0.2.54"]
 # Vendor SDKs are licensed and/or only available inside the vendor environment.
 # They are imported lazily by the adapters; install the one you are entitled to.
 bloomberg = ["blpapi"]          # Desktop/Server API; BQL's `bql` package ships inside BQuant only
@@ -29,6 +31,9 @@ aitrading = "aitrading.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+aitrading = ["data/universes/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
