@@ -168,7 +168,7 @@ items = {
   'Upside': d.best_target_price() / d.px_last() - 1,
 }
 df = bql.combined_df(bq.execute(bql.Request(screen, items, with_params={'fill': 'prev', 'mode': 'cached'})))
-df.columns = [c if c in items else c.upper() for c in df.columns]           # normalise case defensively
+# Normalise header case before lookups: some BQL headers come back upper-case (e.g. MAXLINE/MINLINE).
 
 # --- short interest for ALL survivors (Desktop API, same workstation; all mnemonics UNVERIFIED -> FLDS first) ---
 s = open_session()
@@ -260,7 +260,9 @@ ASKB "show the BQL" is a source of **candidate** items, for example a short-inte
 | LSEG MCP `https://api.analytics.lseg.com/lfa/mcp` (OAuth2 authorization code + PKCE, `login.ciam.refinitiv.com`) | Analyst drill-down only | confirmed. No screening tool. Not ZDR-eligible via the Anthropic connector. |
 
 ```python
-import os, time, lseg.data as ld
+import os, time, pandas as pd, lseg.data as ld
+AS_OF = pd.Timestamp(spec['as_of'])
+D = lambda days: (AS_OF - pd.Timedelta(days=days)).strftime('%Y-%m-%d')
 os.environ.setdefault('LD_LIB_CONFIG_PATH', './config')
 ld.get_config().set_param('http.request-timeout', 300)   # default 20 s; v1.1+ ~300 s server timeout, no datapoint cap
 ld.open_session('platform.ldp')
@@ -394,6 +396,7 @@ Limits: Workspace allows 5 req/s, 10k requests/day, 50 MB/min and 5 GB/day [M]. 
 
 ```python
 import requests
+U, P = os.environ['CIQ_USER'], os.environ['CIQ_PASSWORD']   # from the S&P API welcome letter
 BASE = 'https://api-ciq.marketintelligence.spglobal.com/gdsapi/rest'
 tok = requests.post(f'{BASE}/authenticate/api/v1/token', data={'username': U, 'password': P},
                     headers={'Content-Type': 'application/x-www-form-urlencoded'}).json()['access_token']
@@ -413,7 +416,9 @@ if len(r) == 1 and set(r[0]) == {'ErrMsg'}:
 
 ```python
 # Kensho (zone E; licence class L1 pending gate G2)
+import os
 from kfinance.client.kfinance import Client
+# PeriodType enum (annual | quarterly | ltm | ytd) ships with kfinance; import it from the installed package.
 kf = Client(client_id=os.environ['KENSHO_CLIENT_ID'], private_key=os.environ['KENSHO_PRIVATE_KEY'])  # key pair in prod
 t = kf.ticker('SPGI')
 mcap, tev = t.market_cap(), t.tev()
