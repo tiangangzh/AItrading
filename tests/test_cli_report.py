@@ -800,7 +800,7 @@ def fake_anthropic(monkeypatch):
 @pytest.mark.parametrize("command", ["spec", "run", "screen"])
 def test_cli_without_credentials_suggests_offline(capsys, tmp_path, no_credentials, fake_anthropic, monkeypatch, shared_provider, command):
     monkeypatch.setattr(fake_anthropic, "mode", "no_credentials")
-    argv = [command, OBS] + (["--out", str(tmp_path)] if command != "spec" else [])
+    argv = [command, "--claude", OBS] + (["--out", str(tmp_path)] if command != "spec" else [])
     code, out, err = run_cli(capsys, *argv)
     assert code == 1 and out == ""
     assert "--offline" in err and "ANTHROPIC_API_KEY" in err and "are not set" in err and "Traceback" not in err
@@ -809,7 +809,7 @@ def test_cli_without_credentials_suggests_offline(capsys, tmp_path, no_credentia
 
 def test_cli_client_construction_failure_suggests_offline(capsys, no_credentials, fake_anthropic, monkeypatch):
     monkeypatch.setattr(fake_anthropic, "mode", "construct")
-    code, out, err = run_cli(capsys, "spec", OBS)
+    code, out, err = run_cli(capsys, "spec", "--claude", OBS)
     assert code == 1 and "could not create the Anthropic client" in err and "--offline" in err
 
 
@@ -863,7 +863,7 @@ def test_cli_live_path_uses_the_llm(capsys, tmp_path, monkeypatch, shared_provid
         return llm
 
     monkeypatch.setattr(cli, "make_llm", fake_make_llm)
-    code, out, err = run_cli(capsys, "run", OBS, "--out", str(tmp_path), "--model", "claude-test", "--effort", "medium", "--explain", "3")
+    code, out, err = run_cli(capsys, "run", "--claude", OBS, "--out", str(tmp_path), "--model", "claude-test", "--effort", "medium", "--explain", "3")
     assert code == 0 and seen == {"model": "claude-test", "effort": "medium"}
     (run_dir,) = list(tmp_path.iterdir())
     result = PipelineResult.model_validate_json((run_dir / "result.json").read_text(encoding="utf-8"))
@@ -880,7 +880,7 @@ def test_cli_live_path_uses_the_llm(capsys, tmp_path, monkeypatch, shared_provid
 def test_cli_live_translation_failure_exits_1(capsys, monkeypatch, tmp_path):
     bad = canonical_spec(conditions=[Condition(feature="moon_phase", op=">", value=1)])
     monkeypatch.setattr(cli, "make_llm", lambda model=None, effort="high": ScriptedLLM({"nl_screen": lambda *a: bad}))
-    code, out, err = run_cli(capsys, "run", OBS, "--out", str(tmp_path))
+    code, out, err = run_cli(capsys, "run", "--claude", OBS, "--out", str(tmp_path))
     assert code == 1 and out == "" and "could not produce a valid screen after 3 attempt(s):" in err
     assert "  - unknown feature 'moon_phase'" in err
     assert list(tmp_path.iterdir()) == []
@@ -888,7 +888,7 @@ def test_cli_live_translation_failure_exits_1(capsys, monkeypatch, tmp_path):
 
 def test_cli_spec_live_with_scripted_llm(capsys, monkeypatch):
     monkeypatch.setattr(cli, "make_llm", lambda model=None, effort="high": _scripted_llm())
-    code, out, err = run_cli(capsys, "spec", OBS)
+    code, out, err = run_cli(capsys, "spec", "--claude", OBS)
     assert code == 0 and [c.describe() for c in ScreenSpec.model_validate_json(out).conditions] == CANONICAL_CONDITIONS
     assert "translator: scripted; attempts: 1" in err
 
@@ -933,3 +933,42 @@ def test_example_live_without_credentials(capsys, tmp_path, no_credentials, fake
     err = capsys.readouterr().err
     assert "ANTHROPIC_API_KEY" in err and "without --live" in err
     assert not (tmp_path / "r.md").exists()
+
+
+def test_cli_auto_engine_falls_back_offline_without_credentials(capsys, no_credentials, shared_provider):
+    code, out, err = run_cli(capsys, "spec", OBS)
+    assert code == 0 and "running offline" in err and "ANTHROPIC_API_KEY" in err
+    assert "translator: heuristic" in err
+
+
+def test_cli_run_writes_html_report(capsys, tmp_path, shared_provider):
+    code, out, err = run_cli(capsys, "run", "--offline", OBS, "--out", str(tmp_path), "--explain", "1", "--no-open")
+    assert code == 0
+    (run_dir,) = list(tmp_path.iterdir())
+    html = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert html.lstrip().lower().startswith("<!doctype html") and "<script>alert" not in html
+
+
+def test_cli_universe_file_and_default_as_of(capsys, tmp_path, monkeypatch, shared_provider):
+    seen = {}
+    real = cli.make_provider
+
+    def spy(name, **kw):
+        seen.update(kw)
+        return shared_provider
+
+    monkeypatch.setattr(cli, "make_provider", spy)
+    path = tmp_path / "u.txt"
+    path.write_text("# watchlist\nAAA\nbbb  # comment\n", encoding="utf-8")
+    code, out, err = run_cli(capsys, "screen", "--offline", OBS, "--universe-file", str(path), "--no-save", "--format", "json")
+    assert code == 0 and seen["tickers"] == ["AAA", "BBB"]
+    assert PipelineResult.model_validate_json(out).as_of == cli.DEFAULT_AS_OF
+    assert cli.default_as_of("free", today=date(2026, 10, 3)) == date(2026, 10, 2)  # Saturday -> Friday
+    monkeypatch.setattr(cli, "make_provider", real)
+
+
+def test_cli_demo_scores_against_ground_truth(capsys, tmp_path, shared_provider):
+    code, out, err = run_cli(capsys, "demo", "--out", str(tmp_path), "--no-open")
+    assert code == 0 and "matched the planted ground truth" in out
+    (run_dir,) = list(tmp_path.iterdir())
+    assert (run_dir / "report.html").exists() and (run_dir / "report.md").exists()

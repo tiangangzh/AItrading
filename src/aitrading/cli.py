@@ -1,20 +1,30 @@
-"""Command-line interface: ``aitrading run | screen | spec | catalog``.
+"""Command-line interface: ``aitrading run | screen | spec | catalog | demo``.
 
 Commands
 --------
 * ``run``     observation -> ScreenSpec -> screen -> ranked candidates -> grounded explanations.
   Prints the Markdown report (``--format md``, default) or the ``PipelineResult`` JSON to stdout and
-  the run directory to stderr. The run directory (``--out``, default ``runs``) holds the pipeline's
-  ``result.json`` / ``spec.json`` / ``features.csv`` / ``documents.json`` plus ``report.md``.
+  the run directory to stderr. The run directory (``--out``, default ``aitrading_output``) holds the
+  pipeline's ``result.json`` / ``spec.json`` / ``features.csv`` / ``documents.json`` plus
+  ``report.md`` and ``report.html`` (opened in the browser when run from a terminal).
 * ``screen``  the same without explanations (translate, screen, rank).
 * ``spec``    translate only; prints the ``ScreenSpec`` JSON.
 * ``catalog`` prints the feature catalog (``--category`` filters by category or source).
+* ``demo``    offline self-test on the built-in synthetic market (no internet, no keys).
+
+Data
+----
+``--provider`` defaults to ``free`` (real US data from Yahoo Finance + SEC EDGAR; override the
+default with ``AITRADING_PROVIDER``). ``synthetic`` is the built-in simulated market; ``bloomberg`` /
+``lseg`` / ``capiq`` need the corresponding entitlements. ``--as-of`` defaults to the latest
+business day (the synthetic market's last day for ``--provider synthetic``).
 
 Engines
 -------
-``--offline`` uses the deterministic heuristic translator and explainer (no API key). Otherwise
-Claude (``AnthropicLLM``; ``--model``, ``--effort``) translates and explains. When the Claude call
-fails for lack of credentials the CLI says so and suggests ``--offline``.
+By default Claude (``AnthropicLLM``; ``--model``, ``--effort``) translates and explains when Anthropic
+credentials are configured; otherwise the CLI says so and uses the deterministic offline translator
+and explainer. ``--offline`` forces the offline engine; ``--claude`` requires Claude and fails with
+guidance when it cannot be used.
 
 Providers are created by :func:`make_provider`, which imports the vendor adapter lazily and
 raises :class:`ProviderUnavailableError` with an installation hint when it is missing.
@@ -48,6 +58,10 @@ __all__ = [
     "is_auth_error",
     "PROVIDERS",
     "DEFAULT_AS_OF",
+    "DEFAULT_PROVIDER",
+    "DEMO_OBSERVATION",
+    "resolve_engine",
+    "default_as_of",
     "EFFORTS",
     "CLIError",
     "UsageError",
@@ -56,8 +70,16 @@ __all__ = [
 ]
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_INTERRUPTED = 0, 1, 2, 130
-DEFAULT_AS_OF = date(2026, 9, 30)
-DEFAULT_OUT = "runs"
+DEFAULT_AS_OF = date(2026, 9, 30)  # last day of the synthetic market
+DEFAULT_OUT = "aitrading_output"
+DEFAULT_PROVIDER = "free"
+DEMO_OBSERVATION = (
+    "Find US mid-caps ($2-20B) that were in established uptrends (50-day above 200-day, positive 12-1 momentum) "
+    "but have pulled back 15-40% from their 52-week highs over the past few months on heavy volume, now oversold "
+    "(RSI under 40), still generating strong free cash flow (FCF yield above 4%) with revenue growth above 8%, and "
+    "where short interest is elevated (above 6% of float). Rank by FCF yield, growth and the size of the drawdown, "
+    "then read the latest earnings calls and explain the dislocation."
+)
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
@@ -206,9 +228,22 @@ def make_llm(model: str | None = None, effort: str = "high") -> Any:
         raise CredentialsError(credentials_help(f"could not create the Anthropic client ({type(exc).__name__}: {exc})")) from exc
 
 
+def resolve_engine(args: argparse.Namespace) -> str:
+    """'offline' or 'claude'. Auto mode picks Claude only when credentials are configured."""
+    if getattr(args, "offline", False):
+        return "offline"
+    if getattr(args, "claude", False) or credentials_configured():
+        return "claude"
+    _note(
+        "No Anthropic credentials found (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN) - running offline with the "
+        "rule-based translator and explainer. Set ANTHROPIC_API_KEY to let Claude do the reasoning."
+    )
+    return "offline"
+
+
 def _components(args: argparse.Namespace, *, explain: bool) -> tuple[Any, Any]:
     """(translator, explainer) for the chosen engine; the explainer is None when not explaining."""
-    if args.offline:
+    if resolve_engine(args) == "offline":
         from aitrading.agent.offline import HeuristicExplainer
         from aitrading.screen.nl import HeuristicScreenTranslator
 
@@ -261,22 +296,35 @@ def build_parser() -> argparse.ArgumentParser:
     obs.add_argument("-f", "--observation-file", metavar="PATH", help="read the observation from a UTF-8 text file ('-' = stdin)")
 
     engine = argparse.ArgumentParser(add_help=False)
-    engine.add_argument("--offline", action="store_true", help="heuristic translator + explainer; no API key needed")
+    mode = engine.add_mutually_exclusive_group()
+    mode.add_argument("--offline", action="store_true", help="force the rule-based translator + explainer (no API key needed)")
+    mode.add_argument("--claude", action="store_true", help="require Claude (fail instead of falling back to offline)")
     engine.add_argument("--model", default=None, help="Claude model id (default: $AITRADING_MODEL or claude-opus-5-5)")
     engine.add_argument("--effort", choices=EFFORTS, default="high", help="Claude effort level (default: high)")
 
+    default_provider = (os.environ.get("AITRADING_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
+    if default_provider not in PROVIDERS:
+        default_provider = DEFAULT_PROVIDER
     data = argparse.ArgumentParser(add_help=False)
-    data.add_argument("--provider", choices=list(PROVIDERS), default="synthetic", help="data provider (default: synthetic)")
-    data.add_argument("--as-of", type=_iso_date, default=DEFAULT_AS_OF, metavar="YYYY-MM-DD",
-                      help=f"point-in-time date (default: {DEFAULT_AS_OF.isoformat()})")
-    data.add_argument("--tickers", default=None, metavar="LIST",
+    data.add_argument("--provider", choices=list(PROVIDERS), default=default_provider,
+                      help=f"data provider (default: {default_provider}; 'free' = Yahoo + SEC EDGAR, 'synthetic' = simulated market)")
+    data.add_argument("--as-of", type=_iso_date, default=None, metavar="YYYY-MM-DD",
+                      help="point-in-time date (default: latest business day; the synthetic market's last day for --provider synthetic)")
+    tick = data.add_mutually_exclusive_group()
+    tick.add_argument("--tickers", default=None, metavar="LIST",
                       help="explicit universe for providers that take one: comma-separated, or @PATH (one per line)")
+    tick.add_argument("--universe-file", default=None, metavar="PATH",
+                      help="explicit universe from a file (one ticker per line, '#' comments)")
 
     output = argparse.ArgumentParser(add_help=False)
     output.add_argument("--top", type=_top_n, default=None, metavar="N", help="number of ranked candidates (1-100; default: the spec's top_n)")
     output.add_argument("--out", default=DEFAULT_OUT, metavar="DIR", help=f"directory for run artifacts (default: {DEFAULT_OUT})")
     output.add_argument("--no-save", action="store_true", help="do not write run artifacts")
     output.add_argument("--format", choices=("md", "json"), default="md", help="stdout format (default: md)")
+    browser = output.add_mutually_exclusive_group()
+    browser.add_argument("--open", dest="open_browser", action="store_true", default=None,
+                         help="open the HTML report in the browser (default when run from a terminal)")
+    browser.add_argument("--no-open", dest="open_browser", action="store_false", help="do not open the HTML report")
 
     parser = argparse.ArgumentParser(
         prog="aitrading",
@@ -304,6 +352,11 @@ def build_parser() -> argparse.ArgumentParser:
     catalog.add_argument("--category", default=None, help="only this category (e.g. trend, valuation) or source (technical, ...)")
     catalog.add_argument("--format", choices=("md", "json"), default="md", help="output format (default: md)")
     catalog.set_defaults(func=_cmd_catalog)
+
+    demo = sub.add_parser("demo", parents=[base, output], help="offline self-test on the built-in synthetic market",
+                          description="Run the representative task on the built-in synthetic market with the offline engine "
+                                      "(no internet, no keys) and score the explanations against the market's planted ground truth.")
+    demo.set_defaults(func=_cmd_demo, out=str(Path(DEFAULT_OUT) / "demo"), explain=10, top=None)
     return parser
 
 
@@ -389,14 +442,60 @@ def _describe(exc: BaseException) -> str:
 # --------------------------------------------------------------------------------------------
 
 
+def default_as_of(provider_name: str, provider: Any = None, today: date | None = None) -> date:
+    """Latest business day on or before today; the synthetic market's last day for 'synthetic'."""
+    if provider_name == "synthetic":
+        end = getattr(provider, "end", None)
+        return end if isinstance(end, date) else DEFAULT_AS_OF
+    d = today or date.today()
+    while d.weekday() >= 5:
+        d = date.fromordinal(d.toordinal() - 1)
+    return d
+
+
+def _provider_from_args(args: argparse.Namespace) -> Any:
+    spec = getattr(args, "tickers", None)
+    if getattr(args, "universe_file", None):
+        spec = "@" + args.universe_file
+    tickers = _read_tickers(spec)
+    provider = make_provider(args.provider, **({"tickers": tickers} if tickers else {}))
+    diagnostics = getattr(provider, "diagnostics", None)
+    if callable(diagnostics):
+        for line in diagnostics() or []:
+            _note(f"setup: {line}")
+    return provider
+
+
+def _should_open(args: argparse.Namespace) -> bool:
+    if getattr(args, "open_browser", None) is not None:
+        return bool(args.open_browser)
+    if os.environ.get("AITRADING_NO_BROWSER"):
+        return False
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _write_html(run_dir: Path, html: str, args: argparse.Namespace) -> Path:
+    path = run_dir / "report.html"
+    path.write_text(html, encoding="utf-8")
+    if _should_open(args):
+        from aitrading.report.dashboard import open_in_browser
+
+        open_in_browser(path)
+    return path
+
+
 def _pipeline(args: argparse.Namespace, *, explain: bool) -> int:
     from aitrading.pipeline import ResearchPipeline
+    from aitrading.report.html import render_pipeline_html
     from aitrading.report.markdown import render_markdown
 
     observation = _read_observation(args)
-    tickers = _read_tickers(args.tickers)
-    provider = make_provider(args.provider, **({"tickers": tickers} if tickers else {}))
+    provider = _provider_from_args(args)
     translator, explainer = _components(args, explain=explain)
+    as_of = args.as_of or default_as_of(args.provider, provider)
     out_dir = None if args.no_save else Path(args.out)
     pipe = ResearchPipeline(
         provider,
@@ -405,11 +504,12 @@ def _pipeline(args: argparse.Namespace, *, explain: bool) -> int:
         out_dir=out_dir,
         explain_top_k=args.explain if explain else 0,
     )
-    result = pipe.run(observation, args.as_of, top_n=args.top)
+    result = pipe.run(observation, as_of, top_n=args.top)
     report = render_markdown(result)
     run_dir = out_dir / result.run_id if out_dir is not None else None
     if run_dir is not None:
         (run_dir / "report.md").write_text(report, encoding="utf-8")
+        _write_html(run_dir, render_pipeline_html(result), args)
     _emit(report if args.format == "md" else result.model_dump_json(indent=2) + "\n")
     explained = sum(i.thesis is not None for i in result.ideas)
     failed = sum(bool(i.error) for i in result.ideas)
@@ -439,6 +539,50 @@ def _cmd_spec(args: argparse.Namespace) -> int:
     _emit(spec.model_dump_json(indent=2) + "\n")
     attempts = getattr(out, "attempts", 1)
     _note(f"translator: {getattr(out, 'translator', type(translator).__name__)}; attempts: {attempts}")
+    return EXIT_OK
+
+
+def _cmd_demo(args: argparse.Namespace) -> int:
+    """Representative task on the synthetic market, offline, scored against the planted ground truth."""
+    from aitrading.agent.offline import HeuristicExplainer
+    from aitrading.pipeline import ResearchPipeline
+    from aitrading.report.html import render_pipeline_html
+    from aitrading.report.markdown import render_markdown
+    from aitrading.screen.nl import HeuristicScreenTranslator
+
+    provider = make_provider("synthetic")
+    out_dir = None if args.no_save else Path(args.out)
+    pipe = ResearchPipeline(provider, HeuristicScreenTranslator(), HeuristicExplainer(), out_dir=out_dir, explain_top_k=args.explain)
+    result = pipe.run(DEMO_OBSERVATION, default_as_of("synthetic", provider), top_n=args.top or 10)
+    report = render_markdown(result)
+    run_dir = out_dir / result.run_id if out_dir is not None else None
+    if run_dir is not None:
+        (run_dir / "report.md").write_text(report, encoding="utf-8")
+        _write_html(run_dir, render_pipeline_html(result), args)
+    if args.format == "json":
+        _emit(result.model_dump_json(indent=2) + "\n")
+
+    truth = provider.archetypes() if hasattr(provider, "archetypes") else {}
+    expected = {
+        "transitory_shock": "transitory_fundamental_shock",
+        "value_trap": "structural_decline_value_trap",
+        "guidance_reset": "guidance_reset_overreaction",
+        "sector_contagion": "sector_or_macro_contagion",
+    }
+    scored = [(i.candidate.ticker, truth.get(i.candidate.ticker), i.thesis) for i in result.ideas if i.thesis is not None]
+    correct = sum(expected.get(t) == th.dislocation_type for _, t, th in scored)
+    lines = [
+        "AItrading demo (synthetic market, offline engine)",
+        f"  {result.survivors} of {result.universe_size} names passed the screen; {len(scored)} explained.",
+        f"  Dislocation type matched the planted ground truth for {correct}/{len(scored)} explained names.",
+        "  (The synthetic market is a self-test of the pipeline, not evidence of real-world skill.)",
+    ]
+    for ticker, t, th in scored:
+        mark = "ok " if expected.get(t) == th.dislocation_type else "MISS"
+        lines.append(f"  [{mark}] {ticker:6s} planted={t or '?':17s} explained={th.dislocation_type}")
+    if run_dir is not None:
+        lines.append(f"  Report: {run_dir / 'report.html'}")
+    print("\n".join(lines), file=sys.stderr if args.format == "json" else sys.stdout)
     return EXIT_OK
 
 
@@ -505,7 +649,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _exit_code(exc.code)
     if not getattr(args, "command", None):
         parser.print_usage(sys.stderr)
-        _note("aitrading: error: a command is required (run, screen, spec or catalog)")
+        _note("aitrading: error: a command is required (run, screen, spec, catalog or demo)")
         return EXIT_USAGE
     prog = f"aitrading {args.command}"
     try:
