@@ -1,4 +1,6 @@
-"""Command-line interface: ``aitrading run | screen | spec | catalog | demo``.
+"""Command-line interface: ``aitrading run | screen | spec | catalog | demo`` plus the idea-lab
+commands registered by :mod:`aitrading.cli_lab` (``backtest | library | strategy | discover | ideas |
+dashboard``).
 
 Commands
 --------
@@ -357,6 +359,10 @@ def build_parser() -> argparse.ArgumentParser:
                           description="Run the representative task on the built-in synthetic market with the offline engine "
                                       "(no internet, no keys) and score the explanations against the market's planted ground truth.")
     demo.set_defaults(func=_cmd_demo, out=str(Path(DEFAULT_OUT) / "demo"), explain=10, top=None)
+
+    from aitrading import cli_lab  # idea lab, simulated trading, discovery, dashboard
+
+    cli_lab.register(sub, base=base, engine=engine, data=data)
     return parser
 
 
@@ -649,7 +655,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _exit_code(exc.code)
     if not getattr(args, "command", None):
         parser.print_usage(sys.stderr)
-        _note("aitrading: error: a command is required (run, screen, spec, catalog or demo)")
+        _note("aitrading: error: a command is required (see aitrading --help)")
         return EXIT_USAGE
     prog = f"aitrading {args.command}"
     try:
