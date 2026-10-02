@@ -45,6 +45,7 @@ def inputs():
                 fields.CFO_TTM: 1.0e9, fields.CAPEX_TTM: 0.2e9, fields.FCF_TTM: 0.8e9,
                 fields.TOTAL_DEBT: 3e9, fields.CASH: 1e9, fields.INTEREST_EXPENSE_TTM: 0.05e9,
                 fields.TOTAL_EQUITY: 4e9, fields.SHARES_OUTSTANDING: 2e8,
+                fields.TOTAL_ASSETS: 12e9, fields.TOTAL_ASSETS_PRIOR_YEAR: 10e9,
             },
             "BBB": {  # shrinking loss-maker, FCF from CFO - capex
                 fields.PERIOD_END: date(2026, 6, 30), fields.REPORT_DATE: "2026-09-10",
@@ -56,6 +57,7 @@ def inputs():
                 fields.CFO_TTM: 0.1e9, fields.CAPEX_TTM: 0.3e9, fields.FCF_TTM: NAN,
                 fields.TOTAL_DEBT: 1e9, fields.CASH: 0.5e9, fields.INTEREST_EXPENSE_TTM: 0.08e9,
                 fields.TOTAL_EQUITY: 1e9, fields.SHARES_OUTSTANDING: 2e8,
+                fields.TOTAL_ASSETS: 5e9, fields.TOTAL_ASSETS_PRIOR_YEAR: 5.5e9,
             },
             "CCC": {  # net cash, debt-free, zero / negative denominators
                 fields.PERIOD_END: date(2026, 6, 30), fields.REPORT_DATE: pd.NaT,
@@ -67,9 +69,10 @@ def inputs():
                 fields.CFO_TTM: 0.2e9, fields.CAPEX_TTM: 0.05e9, fields.FCF_TTM: 0.15e9,
                 fields.TOTAL_DEBT: 0.0, fields.CASH: 2.5e9, fields.INTEREST_EXPENSE_TTM: NAN,
                 fields.TOTAL_EQUITY: -0.5e9, fields.SHARES_OUTSTANDING: 2e8,
+                fields.TOTAL_ASSETS: 4e9, fields.TOTAL_ASSETS_PRIOR_YEAR: NAN,
             },
         },
-        fields.FUNDAMENTAL_COLUMNS,
+        fields.FUNDAMENTAL_COLUMNS + fields.FUNDAMENTAL_OPTIONAL_COLUMNS,
     )
     est = frame(
         {
@@ -151,6 +154,11 @@ def test_every_feature_hand_computed_profitable_grower(inputs):
         "last_eps_surprise_pct": 5.0,
         "days_since_last_earnings": 57.0,  # 2026-08-04 -> 2026-09-30
         "days_to_next_earnings": 34.0,  # 2026-09-30 -> 2026-11-03
+        "book_to_market": 0.4,  # equity 4 / market cap 10
+        "operating_profitability_pct": 23.75,  # (1 - 0.05) / 4
+        "asset_growth_yoy_pct": 20.0,  # 12 / 10 - 1
+        "gross_profitability_pct": 2 / 12 * 100,  # gross profit / total assets
+        "earnings_yield_ttm_pct": 8.0,  # 0.8 / 10
     }
     assert set(expected) == set(FUNDAMENTAL_FEATURES)
     check(a, expected)
@@ -189,7 +197,13 @@ def test_every_feature_hand_computed_loss_maker(inputs):
         "last_eps_surprise_pct": -20.0,
         "days_since_last_earnings": 20.0,  # falls back to report_date 2026-09-10
         "days_to_next_earnings": NAN,
+        "book_to_market": 0.25,  # 1 / 4
+        "operating_profitability_pct": -18.0,  # (-0.1 - 0.08) / 1
+        "asset_growth_yoy_pct": 5 / 5.5 * 100 - 100,  # shrinking balance sheet
+        "gross_profitability_pct": 12.0,  # 0.6 / 5
+        "earnings_yield_ttm_pct": -5.0,  # loss: -0.2 / 4
     }
+    assert set(expected) == set(FUNDAMENTAL_FEATURES)
     check(b, expected)
 
 
@@ -226,7 +240,13 @@ def test_every_feature_hand_computed_denominator_guards(inputs):
         "last_eps_surprise_pct": NAN,
         "days_since_last_earnings": NAN,  # date after as_of: not yet public
         "days_to_next_earnings": NAN,  # stale date before as_of
+        "book_to_market": NAN,  # negative equity
+        "operating_profitability_pct": NAN,  # negative equity
+        "asset_growth_yoy_pct": NAN,  # prior-year total assets missing
+        "gross_profitability_pct": 12.5,  # 0.5 / 4
+        "earnings_yield_ttm_pct": 5.0,  # 0.1 / 2
     }
+    assert set(expected) == set(FUNDAMENTAL_FEATURES)
     check(c, expected)
 
 
@@ -395,3 +415,67 @@ def test_canonical_demo_thresholds_reachable(inputs):
     """AAA would pass the demo's fundamental conditions (FCF yield > 4%, revenue growth > 8%)."""
     a = compute(inputs).loc["AAA"]
     assert a["fcf_yield_pct"] > 4 and a["revenue_growth_yoy_pct"] > 8
+
+
+# ---------------------------------------------------------------------------------------------
+# Factor characteristics
+# ---------------------------------------------------------------------------------------------
+
+FACTOR_CHARACTERISTICS = ["book_to_market", "operating_profitability_pct", "asset_growth_yoy_pct",
+                          "gross_profitability_pct", "earnings_yield_ttm_pct"]
+
+
+def test_factor_characteristics_are_catalogued_last_in_their_own_category():
+    from aitrading.screen.catalog import default_catalog
+
+    cat = default_catalog()
+    assert FUNDAMENTAL_FEATURES[-5:] == FACTOR_CHARACTERISTICS
+    assert {cat[f].category for f in FACTOR_CHARACTERISTICS} == {"factor_characteristics"}
+    assert {f: cat[f].higher_is_better for f in FACTOR_CHARACTERISTICS} == {
+        "book_to_market": True, "operating_profitability_pct": True, "asset_growth_yoy_pct": False,
+        "gross_profitability_pct": True, "earnings_yield_ttm_pct": True,
+    }
+    assert [cat[f].unit for f in FACTOR_CHARACTERISTICS] == ["x", "%", "%", "%", "%"]
+
+
+def test_optional_total_assets_columns_absent_give_nan(inputs):
+    """Vendor adapters need not supply the optional total-assets columns: the asset features are NaN."""
+    uni, fa, est, price = inputs
+    out = compute_fundamental_features(uni, fa[fields.FUNDAMENTAL_COLUMNS], est, price, AS_OF)
+    assert out[["asset_growth_yoy_pct", "gross_profitability_pct"]].isna().all().all()
+    # the characteristics that only need the required columns are unaffected
+    assert out.loc["AAA", "book_to_market"] == pytest.approx(0.4)
+    assert out.loc["AAA", "operating_profitability_pct"] == pytest.approx(23.75)
+    assert out.loc["AAA", "earnings_yield_ttm_pct"] == pytest.approx(8.0)
+
+
+def test_total_assets_guards(inputs):
+    uni, fa, est, price = inputs
+    fa = fa.copy()
+    fa.loc["AAA", fields.TOTAL_ASSETS] = 0.0  # data error: no asset ratio, no growth
+    fa.loc["BBB", fields.TOTAL_ASSETS_PRIOR_YEAR] = -1e9  # non-positive base
+    fa.loc["CCC", fields.TOTAL_ASSETS] = np.inf
+    out = compute_fundamental_features(uni, fa, est, price, AS_OF)
+    assert math.isnan(out.loc["AAA", "gross_profitability_pct"]) and math.isnan(out.loc["AAA", "asset_growth_yoy_pct"])
+    assert math.isnan(out.loc["BBB", "asset_growth_yoy_pct"])
+    assert out.loc["BBB", "gross_profitability_pct"] == pytest.approx(12.0)  # current assets still fine
+    assert math.isnan(out.loc["CCC", "gross_profitability_pct"])
+
+
+def test_operating_profitability_treats_missing_interest_as_zero(inputs):
+    uni, fa, est, price = inputs
+    fa = fa.copy()
+    fa.loc["AAA", fields.INTEREST_EXPENSE_TTM] = NAN  # has debt, interest not tagged
+    out = compute_fundamental_features(uni, fa, est, price, AS_OF)
+    assert out.loc["AAA", "operating_profitability_pct"] == pytest.approx(25.0)  # 1 / 4
+    assert math.isnan(out.loc["AAA", "interest_coverage"])  # coverage stays conservative
+
+
+def test_market_cap_guards_factor_characteristics(inputs):
+    uni, fa, est, price = inputs
+    uni = uni.copy()
+    uni.loc["AAA", fields.MARKET_CAP] = 0.0
+    uni.loc["BBB", fields.MARKET_CAP] = -1e9
+    out = compute_fundamental_features(uni, fa, est, price, AS_OF)
+    assert out.loc[["AAA", "BBB"], ["book_to_market", "earnings_yield_ttm_pct"]].isna().all().all()
+    assert out.loc["AAA", "gross_profitability_pct"] == pytest.approx(2 / 12 * 100)  # no market cap needed

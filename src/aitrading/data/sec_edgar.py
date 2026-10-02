@@ -257,6 +257,7 @@ DA_CONCEPTS = ["DepreciationDepletionAndAmortization", "DepreciationAndAmortizat
 INTEREST_CONCEPTS = ["InterestExpense", "InterestExpenseNonoperating", "InterestExpenseDebt"]
 CASH_CONCEPTS = ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"]
 EQUITY_CONCEPTS = ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]
+ASSETS_CONCEPTS = ["Assets"]  # total assets (balance-sheet instant)
 LTD_TOTAL = "LongTermDebt"  # includes current maturities
 LTD_PARTS = [("LongTermDebtNoncurrent", "LongTermDebtCurrent"),
              ("LongTermDebtAndCapitalLeaseObligations", "LongTermDebtAndCapitalLeaseObligationsCurrent")]
@@ -279,8 +280,11 @@ DEI_SHARES = "EntityCommonStockSharesOutstanding"
 USGAAP_CONCEPTS = sorted({
     *REVENUE_CONCEPTS, *GROSS_PROFIT_CONCEPTS, *COST_OF_REVENUE_CONCEPTS, *OPERATING_INCOME_CONCEPTS,
     *NET_INCOME_CONCEPTS, *CFO_CONCEPTS, *CAPEX_CONCEPTS, *DA_CONCEPTS, *INTEREST_CONCEPTS, *CASH_CONCEPTS,
-    *EQUITY_CONCEPTS, *DEBT_CONCEPTS, DILUTED_SHARES,
+    *EQUITY_CONCEPTS, *ASSETS_CONCEPTS, *DEBT_CONCEPTS, DILUTED_SHARES,
 })
+# Bump when USGAAP_CONCEPTS changes: cached reduced companyfacts are keyed on it, so a cache written
+# by an older version (missing the new concepts) is not reused.
+COMPANYFACTS_CACHE_VERSION = 2
 DEI_CONCEPTS = [DEI_SHARES]
 FOREIGN_FORMS = ("20-F", "40-F", "6-K")  # foreign private issuers: cover page counts ordinary shares, not ADSs
 
@@ -557,8 +561,9 @@ def _first_current_instant(cf: dict, concepts: list[str], as_of: date) -> tuple[
 
 
 def balance_sheet_date(cf: dict, as_of: date) -> date | None:
-    """Date of the latest balance sheet public on ``as_of``: latest equity / cash instant, else latest debt instant."""
-    for group in (EQUITY_CONCEPTS + CASH_CONCEPTS, DEBT_CONCEPTS):
+    """Date of the latest balance sheet public on ``as_of``: latest equity / cash instant, else latest debt
+    instant, else latest total-assets instant."""
+    for group in (EQUITY_CONCEPTS + CASH_CONCEPTS, DEBT_CONCEPTS, ASSETS_CONCEPTS):
         ends = [x[0] for x in (latest_instant(facts_for(cf, c), as_of) for c in group) if x is not None]
         if ends:
             return max(ends)
@@ -620,6 +625,24 @@ def total_debt(cf: dict, as_of: date) -> float:
     return total if found else math.nan
 
 
+def total_assets(cf: dict, as_of: date) -> tuple[float, float]:
+    """(total assets on the latest balance sheet public on ``as_of``, total assets one year before it).
+
+    us-gaap ``Assets`` (a balance-sheet instant), point-in-time like every other instant: only facts
+    filed on/before ``as_of`` count, the latest filed version of a date wins (restated comparatives
+    included), and the value must be dated on the :func:`balance_sheet_date` (within 7 days) - a
+    stale value is never carried forward. The year-ago value is the instant closest to that date
+    minus 365 days (within 10 days, so 52/53-week fiscal years match). Missing -> NaN.
+    """
+    bs = balance_sheet_date(cf, as_of)
+    if bs is None:
+        return math.nan, math.nan
+    facts = [f for c in ASSETS_CONCEPTS for f in facts_for(cf, c)]
+    now = instant_at(facts, as_of, bs)
+    prior = instant_at(facts, as_of, bs - timedelta(days=365), tol_days=10)
+    return (now if now is not None else math.nan), (prior if prior is not None else math.nan)
+
+
 @dataclass(frozen=True)
 class SharesInfo:
     """Share count used for market cap, with the facts needed to put it on the right basis."""
@@ -671,14 +694,15 @@ def _ts(d: date | None) -> pd.Timestamp:
 
 
 def _nan_row() -> dict[str, Any]:
-    row: dict[str, Any] = {c: math.nan for c in F.FUNDAMENTAL_COLUMNS}
+    row: dict[str, Any] = {c: math.nan for c in F.FUNDAMENTAL_COLUMNS + F.FUNDAMENTAL_OPTIONAL_COLUMNS}
     row[F.PERIOD_END] = pd.NaT
     row[F.REPORT_DATE] = pd.NaT
     return row
 
 
 def fundamentals_from_companyfacts(cf: dict, as_of: date) -> dict[str, Any]:
-    """One ``fields.FUNDAMENTAL_COLUMNS`` row, point-in-time as of ``as_of`` (missing -> NaN/NaT)."""
+    """One ``fields.FUNDAMENTAL_COLUMNS`` + ``fields.FUNDAMENTAL_OPTIONAL_COLUMNS`` row, point-in-time as of
+    ``as_of`` (missing -> NaN/NaT)."""
     row = _nan_row()
     rev = merged_quarters(cf, REVENUE_CONCEPTS, as_of)
     ni = merged_quarters(cf, NET_INCOME_CONCEPTS, as_of)
@@ -724,6 +748,7 @@ def fundamentals_from_companyfacts(cf: dict, as_of: date) -> dict[str, Any]:
     row[F.CASH] = cash[1] if cash else math.nan
     eq = _first_current_instant(cf, EQUITY_CONCEPTS, as_of)
     row[F.TOTAL_EQUITY] = eq[1] if eq else math.nan
+    row[F.TOTAL_ASSETS], row[F.TOTAL_ASSETS_PRIOR_YEAR] = total_assets(cf, as_of)
     row[F.SHARES_OUTSTANDING] = shares_outstanding(cf, as_of)
     for k, v in row.items():
         if k not in (F.PERIOD_END, F.REPORT_DATE) and v is not None:
@@ -1167,10 +1192,12 @@ class SecEdgarClient:
             while len(self._memo) > self._memo_size:
                 self._memo.popitem(last=False)
 
-    def get_json(self, url: str, ttl_s: float | None, *, reducer: Callable[[dict], dict] | None = None) -> Any:
+    def get_json(self, url: str, ttl_s: float | None, *, reducer: Callable[[dict], dict] | None = None,
+                 cache_tag: str = "") -> Any:
         """GET a JSON resource through memory memo -> disk cache -> network (with ``reducer`` applied
-        before caching, so only the parts this client reads are stored)."""
-        key = f"sec:json:{url}"
+        before caching, so only the parts this client reads are stored). ``cache_tag`` versions the
+        cache key (change it when the reducer keeps different parts)."""
+        key = f"sec:json:{url}" + (f"#{cache_tag}" if cache_tag else "")
         hit = self._memo_get(key)
         if hit is not None:
             return hit
@@ -1233,7 +1260,8 @@ class SecEdgarClient:
 
     # ------------------------------------------------------------------ datasets
     def company_facts(self, cik: int) -> dict:
-        return self.get_json(COMPANYFACTS_URL.format(cik=int(cik)), TTL_COMPANYFACTS, reducer=reduce_companyfacts)
+        return self.get_json(COMPANYFACTS_URL.format(cik=int(cik)), TTL_COMPANYFACTS, reducer=reduce_companyfacts,
+                             cache_tag=f"v{COMPANYFACTS_CACHE_VERSION}")
 
     def submissions(self, cik: int) -> dict:
         return self.get_json(SUBMISSIONS_URL.format(cik=int(cik)), TTL_SUBMISSIONS, reducer=_reduce_submissions)

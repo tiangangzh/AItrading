@@ -533,7 +533,8 @@ def test_cli_help_and_version(capsys):
 
 def test_cli_catalog_markdown(capsys):
     code, out, _ = run_cli(capsys, "catalog")
-    assert code == 0 and out.startswith("# Feature catalog (80 features)")
+    assert code == 0 and out.startswith(f"# Feature catalog ({len(default_catalog())} features)")
+    assert len(default_catalog()) == 85  # 80 + the 5 factor characteristics
     for f in default_catalog():
         assert f"| `{f.name}` | {f.source} | {f.dtype} |" in out
     assert "| `fcf_yield_pct` | fundamental | number | % | higher is better |" in out

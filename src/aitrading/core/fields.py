@@ -68,6 +68,14 @@ FUNDAMENTAL_COLUMNS = [
     TOTAL_EQUITY, SHARES_OUTSTANDING,
 ]
 
+# Optional fundamentals: a provider MAY append these after ``FUNDAMENTAL_COLUMNS`` (the synthetic
+# and free providers do); vendor adapters are not required to. Consumers must not assume they are
+# present: read them with ``.get`` / ``reindex`` and treat an absent column as all-NaN.
+TOTAL_ASSETS = "total_assets"  # USD, balance-sheet instant at PERIOD_END (the latest reported quarter)
+TOTAL_ASSETS_PRIOR_YEAR = "total_assets_prior_year"  # USD, balance-sheet instant four quarters earlier
+
+FUNDAMENTAL_OPTIONAL_COLUMNS = [TOTAL_ASSETS, TOTAL_ASSETS_PRIOR_YEAR]
+
 # --- Consensus estimates snapshot (provider.get_estimates) -------------------------------------
 REVENUE_NTM_EST = "revenue_ntm_est"  # next-twelve-months consensus revenue
 REVENUE_NTM_EST_3M_AGO = "revenue_ntm_est_3m_ago"

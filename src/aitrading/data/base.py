@@ -108,7 +108,8 @@ class MarketDataProvider(Protocol):
         ...
 
     def get_fundamentals(self, tickers: list[str], as_of: date) -> pd.DataFrame:
-        """Indexed by ticker, columns ``fields.FUNDAMENTAL_COLUMNS`` (point-in-time on report date)."""
+        """Indexed by ticker, columns ``fields.FUNDAMENTAL_COLUMNS`` (point-in-time on report date), optionally
+        followed by any of ``fields.FUNDAMENTAL_OPTIONAL_COLUMNS`` (consumers treat absent ones as NaN)."""
         ...
 
     def get_estimates(self, tickers: list[str], as_of: date) -> pd.DataFrame:

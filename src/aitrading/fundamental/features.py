@@ -27,6 +27,23 @@ Conventions
   is NaN when the date is missing or already before as_of.
 * Tickers absent from an input get NaN for every feature that depends on it (never a KeyError);
   missing input columns behave like all-NaN columns. Duplicate input rows: the last one wins.
+
+Factor characteristics (the academic factor sort variables)
+-----------------------------------------------------------
+* book_to_market = total equity / market cap (x); NaN when equity <= 0 (Fama-French exclude
+  negative book equity from the B/M sort). Equity is the latest public balance sheet and market cap
+  the current one (the monthly-formation variant of HML's B/M, not the June / December timing).
+* operating_profitability_pct = (operating income TTM - interest expense TTM) / total equity x 100,
+  NaN when equity <= 0. Fama-French (2015) define OP as (revenue - COGS - SG&A - interest expense)
+  / book equity; operating income is revenue - COGS - SG&A - other operating items (incl. D&A and
+  R&D), so this is the closest catalog approximation. A missing interest expense counts as 0
+  (filers with no debt usually do not tag it), so coverage is not lost for debt-free companies.
+* asset_growth_yoy_pct = (total assets / total assets four quarters earlier - 1) x 100 (the CMA
+  investment variable; lower = conservative). gross_profitability_pct = gross profit TTM / total
+  assets x 100 (Novy-Marx 2013). Both read the optional ``fields.TOTAL_ASSETS`` /
+  ``fields.TOTAL_ASSETS_PRIOR_YEAR`` columns (``fields.FUNDAMENTAL_OPTIONAL_COLUMNS``) and are
+  NaN when a provider does not supply them; total assets must be > 0.
+* earnings_yield_ttm_pct = net income TTM / market cap x 100 (negative for loss-makers).
 """
 
 from __future__ import annotations
@@ -132,8 +149,8 @@ def compute_fundamental_features(
     net_debt = debt - cash
     ev = mcap + net_debt
 
-    interest = _nonneg(_num(fa, fields.INTEREST_EXPENSE_TTM))
-    interest = interest.where(interest.notna() | (debt != 0), 0.0)
+    interest_raw = _nonneg(_num(fa, fields.INTEREST_EXPENSE_TTM))
+    interest = interest_raw.where(interest_raw.notna() | (debt != 0), 0.0)
     coverage = _ratio(op_inc, interest).clip(upper=COVERAGE_CAP)
     coverage = coverage.mask((interest == 0) & (op_inc > 0), COVERAGE_CAP)
 
@@ -150,6 +167,11 @@ def compute_fundamental_features(
 
     def margin(num: pd.Series, rev: pd.Series = revenue) -> pd.Series:
         return _ratio(num, rev) * 100.0
+
+    # factor characteristics (optional total-assets columns: absent -> NaN via _num)
+    assets = _num(fa, fields.TOTAL_ASSETS)
+    assets_py = _num(fa, fields.TOTAL_ASSETS_PRIOR_YEAR)
+    op_profit = op_inc - interest_raw.fillna(0.0)
 
     ts = _as_of(as_of)
     last_er = _dates(est, fields.LAST_EARNINGS_DATE).fillna(_dates(fa, fields.REPORT_DATE))
@@ -189,6 +211,11 @@ def compute_fundamental_features(
             "last_eps_surprise_pct": _num(est, fields.LAST_EPS_SURPRISE) * 100.0,
             "days_since_last_earnings": since_last.where(since_last >= 0),
             "days_to_next_earnings": to_next.where(to_next >= 0),
+            "book_to_market": _ratio(equity, mcap).where(equity > 0),
+            "operating_profitability_pct": _ratio(op_profit, equity) * 100.0,
+            "asset_growth_yoy_pct": _growth_pct(assets.where(assets > 0), assets_py),
+            "gross_profitability_pct": _ratio(gross, assets) * 100.0,
+            "earnings_yield_ttm_pct": _ratio(net_inc, mcap) * 100.0,
         },
         index=index,
     )

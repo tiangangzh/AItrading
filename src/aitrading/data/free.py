@@ -6,7 +6,8 @@ Sources
   ``Close``, its split- and dividend-adjusted ``Adj Close`` and the split events). The price panel is
   split- and dividend-adjusted exactly like yfinance's ``auto_adjust`` (OHLC x Adj Close / Close).
 * **Fundamentals** - SEC EDGAR XBRL ``companyfacts``, point-in-time on the *filing* date
-  (see :mod:`aitrading.data.sec_edgar`).
+  (see :mod:`aitrading.data.sec_edgar`); the frame also carries the optional total-assets columns
+  (``fields.FUNDAMENTAL_OPTIONAL_COLUMNS``, us-gaap ``Assets`` now and a year earlier).
 * **Documents** - SEC EDGAR: 8-K item 2.02 earnings press releases (``DocumentKind.NEWS``) and
   10-Q / 10-K MD&A (``DocumentKind.FILING``). Earnings-call transcripts are not available from any
   official free source, so they are not offered (no ``Capability.TRANSCRIPTS``); the press release
@@ -530,6 +531,10 @@ def estimates_from_yahoo(info: dict, earnings_estimate: Any, revenue_estimate: A
     row[F.LAST_EARNINGS_DATE] = last
     row[F.NEXT_EARNINGS_DATE] = nxt
     return row
+
+
+# SEC fundamentals carry the optional total-assets columns (us-gaap ``Assets``) after the required ones.
+_FUNDAMENTAL_OUT_COLUMNS = F.FUNDAMENTAL_COLUMNS + F.FUNDAMENTAL_OPTIONAL_COLUMNS
 
 
 def _frame(rows: dict[str, dict], columns: list[str], tickers: list[str], date_cols: Iterable[str] = ()) -> pd.DataFrame:
@@ -1086,11 +1091,11 @@ class FreeDataProvider:
             self.sec.check_user_agent()
         except ProviderUnavailable as e:
             self._warn(str(e))
-            return _frame({}, F.FUNDAMENTAL_COLUMNS, tickers, date_cols)
+            return _frame({}, _FUNDAMENTAL_OUT_COLUMNS, tickers, date_cols)
         res = self._parallel(lambda t: self.sec.fundamentals(t, as_of), list(dict.fromkeys(tickers)))
         rows = {t: v for t, (v, e) in res.items() if e is None and v is not None}
         self._summarise_errors("SEC fundamentals", {t: e for t, (_, e) in res.items() if e is not None})
-        return _frame(rows, F.FUNDAMENTAL_COLUMNS, tickers, date_cols)
+        return _frame(rows, _FUNDAMENTAL_OUT_COLUMNS, tickers, date_cols)
 
     def _sec_last_earnings(self, tickers: list[str], as_of: date) -> dict[str, date]:
         try:

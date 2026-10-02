@@ -244,16 +244,76 @@ def _value_fcf() -> StrategySpec:
     )
 
 
+def _value_book_to_market() -> StrategySpec:
+    return _cross_sectional(
+        "value_book_to_market",
+        "Value (book-to-market, HML-style)",
+        [_sig("book_to_market")],
+        assumptions=[
+            "Signal = book equity (total stockholders' equity on the latest public balance sheet) / current market cap; "
+            "negative book equity is excluded (NaN), as in Fama-French.",
+            "Quintile long-short (high minus low B/M), equal weighted and re-formed monthly on the latest public book "
+            "equity - not the official 2x3 value-weighted HML with June formation and December market cap (build that "
+            "with the ff3 template).",
+        ],
+    )
+
+
+def _profitability() -> StrategySpec:
+    return _cross_sectional(
+        "profitability",
+        "Profitability (operating profitability, RMW-style)",
+        [_sig("operating_profitability_pct")],
+        assumptions=[
+            "Signal = (TTM operating income - TTM interest expense) / book equity, approximating Fama-French (2015) "
+            "operating profitability (revenue - COGS - SG&A - interest) / book equity; NaN for negative equity.",
+            "Quintile long-short (robust minus weak), equal weighted, re-formed monthly on point-in-time filings.",
+        ],
+    )
+
+
+def _investment() -> StrategySpec:
+    return _cross_sectional(
+        "investment",
+        "Investment (asset growth, CMA-style)",
+        [_sig("asset_growth_yoy_pct", "lower_is_better")],
+        assumptions=[
+            "Signal = year-over-year growth of total assets (latest balance sheet vs four quarters earlier); low "
+            "growth (conservative) is long, high growth (aggressive) is short - the CMA sort variable.",
+            "Quintile long-short, equal weighted, re-formed monthly on point-in-time filings (Fama-French use annual "
+            "growth to the fiscal year end, formed in June).",
+        ],
+    )
+
+
+def _gross_profitability() -> StrategySpec:
+    return _cross_sectional(
+        "gross_profitability",
+        "Gross profitability (Novy-Marx)",
+        [_sig("gross_profitability_pct")],
+        assumptions=[
+            "Signal = TTM gross profit / total assets (Novy-Marx 2013 gross profits-to-assets).",
+            "Quintile long-short, equal weighted, re-formed monthly. Novy-Marx forms value-weighted portfolios and "
+            "excludes financial firms; here every sector is kept (say 'ex-financials' or 'value weighted' to match).",
+        ],
+    )
+
+
+def _value_signal() -> list[SignalComponent]:
+    return [
+        _sig("book_to_market"),
+        _sig("fcf_yield_pct"),
+        _sig("earnings_yield_ntm_pct"),
+        _sig("ev_to_ebitda", "lower_is_better"),
+    ]
+
+
 def _value_composite() -> StrategySpec:
     return _cross_sectional(
         "value_composite",
-        "Value composite (FCF yield, earnings yield, EV/EBITDA)",
-        [
-            _sig("fcf_yield_pct"),
-            _sig("earnings_yield_ntm_pct"),
-            _sig("ev_to_ebitda", "lower_is_better"),
-        ],
-        assumptions=["Equal-weighted average of cross-sectional ranks of the three valuation ratios."],
+        "Value composite (book-to-market, FCF yield, earnings yield, EV/EBITDA)",
+        _value_signal(),
+        assumptions=["Equal-weighted average of cross-sectional ranks of the four valuation ratios."],
     )
 
 
@@ -273,18 +333,17 @@ def _quality() -> StrategySpec:
         _quality_signal(),
         assumptions=[
             "Quality composite = equal-weighted ranks of ROE, gross margin, FCF conversion and (low) net debt / EBITDA.",
-            "Gross margin stands in for Novy-Marx's gross profits / assets (not in the catalog).",
+            "Novy-Marx's gross profits / assets and Fama-French operating profitability are separate templates "
+            "(gross_profitability, profitability).",
         ],
     )
 
 
 def _qarp() -> StrategySpec:
-    value = [
-        _sig("fcf_yield_pct", weight=1.0),
-        _sig("earnings_yield_ntm_pct", weight=1.0),
-        _sig("ev_to_ebitda", "lower_is_better", weight=1.0),
-    ]
-    quality = [SignalComponent(feature=s.feature, direction=s.direction, weight=0.75) for s in _quality_signal()]
+    value = _value_signal()
+    quality = _quality_signal()
+    w_value = sum(c.weight for c in quality) / sum(c.weight for c in value)  # 50 / 50 total weight
+    value = [c.model_copy(update={"weight": c.weight * w_value}) for c in value]
     return _cross_sectional(
         "qarp",
         "Quality at a reasonable price (QARP)",
@@ -292,7 +351,7 @@ def _qarp() -> StrategySpec:
         style="long_only",
         assumptions=[
             "Composite = 50% quality (ROE, gross margin, FCF conversion, low net debt / EBITDA) + 50% value "
-            "(FCF yield, NTM earnings yield, low EV/EBITDA); weights 0.75 x 4 and 1.0 x 3.",
+            "(book-to-market, FCF yield, NTM earnings yield, low EV/EBITDA); equal weights within each half.",
             "Long-only top quintile (QARP is a stock-selection approach); use long_short to test it as a factor.",
         ],
     )
@@ -510,12 +569,29 @@ TEMPLATES: dict[str, IdeaTemplate] = {
             build=_value_fcf,
         ),
         IdeaTemplate(
+            key="value_book_to_market",
+            title="Value (book-to-market, HML-style)",
+            aliases=["book to market", "book-to-market", "hml", "high minus low", "price to book", "low price to book",
+                     "b/m value", "fama french value"],
+            description=(
+                "Long the highest book-to-market quintile, short the lowest, rebalanced monthly - the HML sort variable "
+                "as an equal-weighted quintile spread (the ff3 template builds the official-style 2x3 HML factor). Book "
+                "equity comes from filings, point-in-time by filing date."
+            ),
+            references=[
+                "Rosenberg, Reid & Lanstein (1985), Persuasive evidence of market inefficiency, JPM 11.",
+                "Fama & French (1992), The cross-section of expected stock returns, JF 47.",
+                "Fama & French (1993), Common risk factors in the returns on stocks and bonds, JFE 33.",
+            ],
+            build=_value_book_to_market,
+        ),
+        IdeaTemplate(
             key="value_composite",
-            title="Value composite (FCF yield, earnings yield, EV/EBITDA)",
+            title="Value composite (book-to-market, FCF yield, earnings yield, EV/EBITDA)",
             aliases=["value composite", "composite value", "multi-factor value", "blended value", "ev/ebitda value"],
             description=(
-                "Rank stocks on an equal blend of FCF yield, NTM earnings yield and (low) EV/EBITDA; quintile long-short. "
-                + INSTITUTIONAL_DATA_NOTE.format(what="the NTM consensus earnings yield")
+                "Rank stocks on an equal blend of book-to-market, FCF yield, NTM earnings yield and (low) EV/EBITDA; "
+                "quintile long-short. " + INSTITUTIONAL_DATA_NOTE.format(what="the NTM consensus earnings yield")
             ),
             references=[
                 "Asness, Moskowitz & Pedersen (2013), Value and momentum everywhere, JF 68.",
@@ -527,7 +603,7 @@ TEMPLATES: dict[str, IdeaTemplate] = {
         IdeaTemplate(
             key="quality",
             title="Quality (profitability, cash conversion, low leverage)",
-            aliases=["quality", "quality factor", "quality minus junk", "qmj", "profitability", "high quality stocks"],
+            aliases=["quality", "quality factor", "quality minus junk", "qmj", "high quality stocks"],
             description=(
                 "Rank stocks on ROE, gross margin, FCF conversion and low leverage; quintile long-short. Uses filings-based "
                 "fundamentals that are point-in-time by filing date."
@@ -537,6 +613,50 @@ TEMPLATES: dict[str, IdeaTemplate] = {
                 "Novy-Marx (2013), The other side of value: the gross profitability premium, JFE 108.",
             ],
             build=_quality,
+        ),
+        IdeaTemplate(
+            key="profitability",
+            title="Profitability (operating profitability, RMW-style)",
+            aliases=["profitability", "operating profitability", "robust minus weak", "profitability factor",
+                     "profitable firms", "high profitability"],
+            description=(
+                "Long the most profitable quintile (operating profits net of interest over book equity, the Fama-French "
+                "RMW sort variable), short the least profitable, rebalanced monthly. Uses filings-based fundamentals that "
+                "are point-in-time by filing date."
+            ),
+            references=[
+                "Fama & French (2015), A five-factor asset pricing model, JFE 116.",
+                "Fama & French (2006), Profitability, investment and average returns, JFE 82.",
+            ],
+            build=_profitability,
+        ),
+        IdeaTemplate(
+            key="gross_profitability",
+            title="Gross profitability (Novy-Marx)",
+            aliases=["gross profitability", "novy-marx", "novy marx", "gross profits to assets", "gross profitability premium",
+                     "gross profits-to-assets"],
+            description=(
+                "Long the highest gross-profits-to-assets quintile, short the lowest, rebalanced monthly (Novy-Marx 2013). "
+                "Uses filings-based fundamentals that are point-in-time by filing date."
+            ),
+            references=["Novy-Marx (2013), The other side of value: the gross profitability premium, JFE 108."],
+            build=_gross_profitability,
+        ),
+        IdeaTemplate(
+            key="investment",
+            title="Investment (asset growth, CMA-style)",
+            aliases=["investment", "asset growth", "low asset growth", "conservative minus aggressive", "investment factor",
+                     "asset growth anomaly"],
+            description=(
+                "Long the lowest total-asset-growth quintile (conservative investors), short the highest (aggressive), "
+                "rebalanced monthly - the Fama-French CMA sort variable. Total assets come from filings (us-gaap "
+                "Assets), point-in-time by filing date."
+            ),
+            references=[
+                "Cooper, Gulen & Schill (2008), Asset growth and the cross-section of stock returns, JF 63.",
+                "Fama & French (2015), A five-factor asset pricing model, JFE 116.",
+            ],
+            build=_investment,
         ),
         IdeaTemplate(
             key="qarp",

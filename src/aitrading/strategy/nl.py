@@ -340,7 +340,7 @@ _RULES: list[tuple] = [
     ("ff5", [r"\b5[\s-]*factor", r"\bff5\b", r"\brmw\b", r"\bcma\b"]),
     ("carhart4", [r"carhart", r"\b4[\s-]*factor", r"\bff4\b", r"fama[\s-]*french.{0,30}(?:\+|plus|and|with)\s*momentum",
                   r"\bff3\b.{0,10}(?:\+|plus|and|with)\s*momentum"]),
-    ("ff3", [r"\b3[\s-]*factor", r"\bff3\b", r"fama[\s-]*french", r"\bsmb\b", r"\bhml\b"]),
+    ("ff3", [r"\b3[\s-]*factor", r"\bff3\b", r"fama[\s-]*french", r"\bsmb\b(?:.{0,12}\bhml\b)?"]),
     ("capm", [r"\bcapm\b", r"capital asset pricing", r"\b1[\s-]*factor[\s-]*model", r"single[\s-]*factor", r"market[\s-]*model",
               r"market[\s-]*factor"]),
     ("qarp", [r"\bqarp\b", r"quality.{0,40}(?:\bvalue\b|reasonable[\s-]*price|cheap|valuation)",
@@ -356,11 +356,19 @@ _RULES: list[tuple] = [
                              r"\bcontrarian\b"]),
     ("momentum_12_1", [r"momentum", r"\b12[\s-]*1\b", r"jegadeesh", r"\bwinners\b", r"relative[\s-]*strength",
                        r"trend[\s-]*following"]),
-    ("quality", [r"quality", r"\bqmj\b", r"profitab", r"high[\s-]*roe", r"gross[\s-]*margin"]),
+    ("quality", [r"quality", r"\bqmj\b", r"high[\s-]*roe", r"gross[\s-]*margin"]),
+    ("gross_profitability", [r"gross[\s-]*profitab", r"novy[\s-]*marx",
+                             r"gross[\s-]*profits?[\s-]*(?:to|/|over|scaled[\s-]*by)[\s-]*(?:total[\s-]*)?assets"]),
+    ("profitability", [r"operating[\s-]*profitab", r"robust[\s-]*minus[\s-]*weak", r"profitab"]),
+    ("investment", [r"asset[\s-]*growth", r"conservative[\s-]*minus[\s-]*aggressive",
+                    r"\binvestment[\s-]*(?:factor|anomaly|effect|premium)\b", r"\blow[\s-]*investment\b",
+                    r"balance[\s-]*sheet[\s-]*(?:growth|expansion)", r"aggressive(?:ly)?[\s-]*invest"]),
     ("value_composite", [r"value[\s-]*composite", r"composite[\s-]*value", r"multi[\s-]*(?:factor|metric)[\s-]*value",
                          r"ev[\s/-]*(?:to[\s-]*)?ebitda", r"earnings[\s-]*yield", r"blend\w*.{0,20}valu"]),
+    ("value_book_to_market", [r"book[\s-]*to[\s-]*(?:market|price)", r"\bb\s*/\s*m\b", r"price[\s-]*to[\s-]*book",
+                              r"\bp\s*/\s*b\b", r"\bhml\b", r"high[\s-]*minus[\s-]*low", r"book[\s-]*(?:value|equity)"]),
     ("value_fcf", [r"\bvalue\b", r"fcf[\s-]*yield", r"free[\s-]*cash[\s-]*flow[\s-]*yield", r"\bcheap", r"undervalued",
-                   r"book[\s-]*to[\s-]*market", r"price[\s-]*to[\s-]*book", r"\bp\s*/?\s*e\b", r"price[\s-]*to[\s-]*earnings"]),
+                   r"\bp\s*/?\s*e\b", r"price[\s-]*to[\s-]*earnings"]),
     ("size", [r"\bsize\b", r"small[\s-]*caps?\b.{0,30}(?:outperform|premium|beat|\bvs\b|versus|minus|effect)",
               r"small[\s-]*minus[\s-]*big", r"small[\s-]*(?:cap|firm)[\s-]*(?:premium|effect|factor|anomaly)"]),
 ]
@@ -383,19 +391,25 @@ _XS_MOMENTUM_STRONG = (
     r"\b12[\s-]*1\b|jegadeesh|cross[\s-]*sectional[\s-]*momentum|momentum\s+(?:stocks|names|portfolios?|factor|deciles?|quintiles?)"
 )
 _LOW_VOL_STRONG = r"low[\s-]*vol|min(?:imum)?[\s-]*vol|min(?:imum)?[\s-]*variance|volatility[\s-]*anomaly|least[\s-]*volatile"
+_OP_PROFIT_STRONG = r"operating[\s-]*profitab|robust[\s-]*minus[\s-]*weak|profitability[\s-]*(?:factor|premium|anomaly)"
+_GROSS_PROFIT_STRONG = r"gross[\s-]*profitab|novy[\s-]*marx|gross[\s-]*profits?\b"
+_FCF_STRONG = r"fcf|free[\s-]*cash[\s-]*flow"
 
 _SUBSUMES: dict[str, dict[str, str | None]] = {
     "dislocation_screen": dict.fromkeys(["momentum_12_1", "rsi_reversal", "short_interest", "value_fcf", "golden_cross_spy",
                                          "trend_200dma_spy", "short_term_reversal", "quality", "size"]),
     "golden_cross_spy": {"trend_200dma_spy": None, "momentum_12_1": _XS_MOMENTUM_STRONG},
     "trend_200dma_spy": {"momentum_12_1": _XS_MOMENTUM_STRONG, "golden_cross_spy": None},
-    "ff5": {"ff3": None, "capm": None, "quality": None, "size": None, "value_fcf": None,
-            "carhart4": r"carhart|\b4[\s-]*factors?|\bff4\b"},
-    "carhart4": dict.fromkeys(["ff3", "capm", "momentum_12_1", "size", "value_fcf"]),
-    "ff3": dict.fromkeys(["capm", "size", "value_fcf"]),
+    "ff5": {"ff3": None, "capm": None, "quality": None, "size": None, "value_fcf": None, "value_book_to_market": None,
+            "profitability": None, "investment": None, "carhart4": r"carhart|\b4[\s-]*factors?|\bff4\b"},
+    "carhart4": dict.fromkeys(["ff3", "capm", "momentum_12_1", "size", "value_fcf", "value_book_to_market"]),
+    "ff3": dict.fromkeys(["capm", "size", "value_fcf", "value_book_to_market"]),
     "capm": {},
-    "qarp": dict.fromkeys(["quality", "value_fcf", "value_composite"]),
-    "value_composite": {"value_fcf": None},
+    "qarp": dict.fromkeys(["quality", "value_fcf", "value_composite", "value_book_to_market"]),
+    "value_composite": {"value_fcf": None, "value_book_to_market": None},
+    "value_book_to_market": {"value_fcf": _FCF_STRONG},
+    "quality": {"profitability": _OP_PROFIT_STRONG, "gross_profitability": _GROSS_PROFIT_STRONG},
+    "gross_profitability": {"profitability": _OP_PROFIT_STRONG},
     "low_beta": {"low_volatility": _LOW_VOL_STRONG, "capm": None},
     "estimate_revisions": {"momentum_12_1": _MOMENTUM_STRONG},
     "short_interest": {"short_term_reversal": _ST_REVERSAL_STRONG},
@@ -455,7 +469,6 @@ _UNSUPPORTED = [
     (r"sentiment|\bnews\b|twitter|reddit|social[\s-]*media|\btone\b", "news / sentiment signals (not in the feature catalog)"),
     (r"\binsiders?\b", "insider-trading data (not in the feature catalog)"),
     (r"dividend", "dividend-based signals (not in the feature catalog)"),
-    (r"book[\s-]*to[\s-]*market|price[\s-]*to[\s-]*book|\bp\s*/\s*b\b", "book-to-market ranking (book value is not a catalog feature)"),
 ]
 
 # Transaction-cost amounts: (pattern with the number in group 1, multiplier to bps).
@@ -815,8 +828,14 @@ class HeuristicStrategyTranslator:
             self._swap_feature(spec, "volatility_60d_pct", "volatility_20d_pct")
             p.notes.append("'20-day' -> volatility signal volatility_20d_pct.")
         if spec.name == "value_fcf" and re.search(r"\bp\s*/?\s*e\b|price[\s-]*to[\s-]*earnings|earnings[\s-]*yield", t):
-            self._swap_feature(spec, "fcf_yield_pct", "earnings_yield_ntm_pct")
-            p.notes.append("P/E value -> signal earnings_yield_ntm_pct (consensus NTM earnings yield; no point-in-time history in the free edition).")
+            if re.search(r"forward|\bntm\b|next[\s-]*(?:12|twelve)|consensus|estimate", t):
+                self._swap_feature(spec, "fcf_yield_pct", "earnings_yield_ntm_pct")
+                p.notes.append("Forward P/E value -> signal earnings_yield_ntm_pct (consensus NTM earnings yield; no point-in-time "
+                               "history in the free edition).")
+            else:
+                self._swap_feature(spec, "fcf_yield_pct", "earnings_yield_ttm_pct")
+                p.notes.append("P/E value -> signal earnings_yield_ttm_pct (trailing reported earnings / market cap, point-in-time "
+                               "from filings; say 'forward P/E' for the consensus NTM earnings yield).")
         if re.search(r"sector[\s-]*neutral|industry[\s-]*neutral|within[\s-]*sectors?", t):
             spec.signal = [s.model_copy(update={"sector_neutral": True}) for s in spec.signal]
             p.notes.append("'sector neutral' -> every signal component is ranked within its GICS sector.")
@@ -1132,8 +1151,6 @@ class HeuristicStrategyTranslator:
     def _unsupported(self, spec: StrategySpec, t: str, p: _Parse) -> None:
         for pat, what in _UNSUPPORTED:
             if re.search(pat, t):
-                if what.startswith("book-to-market") and spec.kind == "factor_model":
-                    continue  # HML is built from book equity inside the factor-model builder
                 p.unsupported.append(what)
 
     @staticmethod

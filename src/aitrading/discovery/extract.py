@@ -1399,7 +1399,8 @@ _FAMILIES: tuple[_Family, ...] = (
         testability="testable_now",
         missing=(),
         holding="1 year",
-        templates=("value", "value_hml", "hml", "book_to_market", "value_composite", "value_fcf", "ff3", "fama_french_3"),
+        templates=("value", "value_book_to_market", "value_hml", "hml", "book_to_market", "value_composite", "value_fcf", "ff3",
+                   "fama_french_3"),
         template_words=("value", "hml", "book-to-market", "book to market", "cheap"),
     ),
     _Family(

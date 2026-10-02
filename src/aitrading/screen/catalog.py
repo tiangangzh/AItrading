@@ -7,6 +7,9 @@ cannot express goes into ``ScreenSpec.unsupported_requests`` rather than being s
 Window conventions (trading sessions): 1m = 21, 3m = 63, 6m = 126, 12m / 52w = 252.
 "Price" is the latest split- and dividend-adjusted close on or before the as-of date.
 A feature whose inputs are insufficient (short history, non-positive denominator) is NaN.
+The ``factor_characteristics`` features are the sort variables of the academic factors (HML, RMW,
+CMA, Novy-Marx gross profitability, trailing E/P); the asset-based ones need the optional
+``total_assets`` fundamentals (``fields.FUNDAMENTAL_OPTIONAL_COLUMNS``) and are NaN without them.
 """
 
 from __future__ import annotations
@@ -134,6 +137,12 @@ _FEATURES: list[FeatureDef] = [
     # ---------------- events ----------------
     _f("days_since_last_earnings", "fundamental", "events", "number", "days", "Calendar days since the last earnings report."),
     _f("days_to_next_earnings", "fundamental", "events", "number", "days", "Calendar days until the next expected earnings report (NaN if unknown)."),
+    # ---------------- factor characteristics (academic factor sort variables) ----------------
+    _f("book_to_market", "fundamental", "factor_characteristics", "number", "x", "Book equity (total stockholders' equity, latest balance sheet) / market cap: the Fama-French HML sort variable on the current market cap (NaN if equity <= 0).", True),
+    _f("operating_profitability_pct", "fundamental", "factor_characteristics", "number", "%", "(TTM operating income - TTM interest expense) / total equity x 100: approximates Fama-French (2015) operating profitability, the RMW sort variable (NaN if equity <= 0).", True),
+    _f("asset_growth_yoy_pct", "fundamental", "factor_characteristics", "number", "%", "(total assets / total assets four quarters earlier - 1) x 100: the CMA investment variable; low = conservative, high = aggressive.", False),
+    _f("gross_profitability_pct", "fundamental", "factor_characteristics", "number", "%", "TTM gross profit / total assets x 100 (Novy-Marx 2013 gross profits-to-assets).", True),
+    _f("earnings_yield_ttm_pct", "fundamental", "factor_characteristics", "number", "%", "TTM net income / market cap x 100 (trailing E/P from reported earnings; negative for loss-makers).", True),
 ]
 
 

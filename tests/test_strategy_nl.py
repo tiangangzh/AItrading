@@ -38,6 +38,7 @@ REQUIRED_KEYS = [
     "capm", "ff3", "carhart4", "ff5", "momentum_12_1", "short_term_reversal", "low_volatility", "low_beta", "value_fcf",
     "value_composite", "quality", "qarp", "size", "estimate_revisions", "short_interest", "rsi_reversal",
     "trend_200dma_spy", "golden_cross_spy", "dislocation_screen",
+    "value_book_to_market", "profitability", "investment", "gross_profitability",
 ]
 
 
@@ -99,7 +100,8 @@ def test_cross_sectional_template_definitions():
     assert any("Frazzini" in r and "2014" in r for r in TEMPLATES["low_beta"].references)
     assert _sig("value_fcf") == [("fcf_yield_pct", "higher_is_better")]
     assert _sig("value_composite") == [
-        ("fcf_yield_pct", "higher_is_better"), ("earnings_yield_ntm_pct", "higher_is_better"), ("ev_to_ebitda", "lower_is_better")
+        ("book_to_market", "higher_is_better"), ("fcf_yield_pct", "higher_is_better"),
+        ("earnings_yield_ntm_pct", "higher_is_better"), ("ev_to_ebitda", "lower_is_better"),
     ]
     assert _sig("quality") == [
         ("roe_pct", "higher_is_better"), ("gross_margin_pct", "higher_is_better"), ("fcf_conversion_pct", "higher_is_better"),
@@ -116,6 +118,26 @@ def test_cross_sectional_template_definitions():
     assert _sig("short_interest") == [("short_interest_pct_float", "lower_is_better")]
     assert _sig("rsi_reversal") == [("rsi_14", "lower_is_better")]
     assert TEMPLATES["rsi_reversal"].spec().rebalance == "weekly"
+
+
+def test_factor_characteristic_templates():
+    assert _sig("value_book_to_market") == [("book_to_market", "higher_is_better")]
+    assert _sig("profitability") == [("operating_profitability_pct", "higher_is_better")]
+    assert _sig("investment") == [("asset_growth_yoy_pct", "lower_is_better")]  # conservative minus aggressive
+    assert _sig("gross_profitability") == [("gross_profitability_pct", "higher_is_better")]
+    for key in ("value_book_to_market", "profitability", "investment", "gross_profitability"):
+        s = TEMPLATES[key].spec()
+        assert s.kind == "cross_sectional" and s.rebalance == "monthly"
+        assert (s.portfolio.style, s.portfolio.selection, s.portfolio.n_quantiles, s.portfolio.weighting) == (
+            "long_short", "quantile", 5, "equal")
+        assert s.attribution_model == "ff3"
+        assert not TEMPLATES[key].needs_institutional_data  # filings-based, point-in-time in the free edition
+    refs = lambda k: " ".join(TEMPLATES[k].references)  # noqa: E731
+    assert "Fama & French (1992)" in refs("value_book_to_market")
+    assert "Fama & French (2015)" in refs("profitability") and "Cooper, Gulen & Schill (2008)" in refs("investment")
+    assert "Novy-Marx (2013)" in refs("gross_profitability")
+    assert "HML" in TEMPLATES["value_book_to_market"].title and "RMW" in TEMPLATES["profitability"].title
+    assert "CMA" in TEMPLATES["investment"].title and "Novy-Marx" in TEMPLATES["gross_profitability"].title
 
 
 def test_time_series_templates():
@@ -153,7 +175,8 @@ def test_weak_free_data_is_flagged(key):
 
 
 def test_price_only_templates_not_flagged():
-    for key in ["momentum_12_1", "low_volatility", "trend_200dma_spy", "ff3"]:
+    for key in ["momentum_12_1", "low_volatility", "trend_200dma_spy", "ff3", "value_book_to_market", "profitability",
+                "investment", "gross_profitability"]:
         assert not TEMPLATES[key].needs_institutional_data
 
 
@@ -220,6 +243,19 @@ PHRASINGS = [
     ("SPY when the 50-day is above the 200-day", "golden_cross_spy"),
     ("dislocation screen", "dislocation_screen"),
     ("value weighted momentum", "momentum_12_1"),
+    ("book to market", "value_book_to_market"),
+    ("HML", "value_book_to_market"),
+    ("HML value factor, decile spread", "value_book_to_market"),
+    ("buy low price-to-book stocks", "value_book_to_market"),
+    ("profitability", "profitability"),
+    ("operating profitability long short", "profitability"),
+    ("robust minus weak", "profitability"),
+    ("asset growth", "investment"),
+    ("low asset growth stocks beat high asset growth", "investment"),
+    ("conservative minus aggressive investment factor", "investment"),
+    ("Novy-Marx", "gross_profitability"),
+    ("Novy-Marx gross profitability premium", "gross_profitability"),
+    ("gross profits to assets", "gross_profitability"),
 ]
 
 
@@ -495,6 +531,45 @@ def test_descriptive_matches_are_absorbed_visibly(h, idea, key, absorbed):
     else:
         assert len(notes) == 1 and notes[0].startswith(absorbed)
     assert tr.spec.unsupported_requests == []
+
+
+@pytest.mark.parametrize("idea", ["SMB and HML", "Fama-French 3 factor model with SMB and HML"])
+def test_hml_inside_the_three_factor_model_is_not_a_second_idea(h, idea):
+    s = h.translate(idea).spec
+    assert s.name == "ff3" and s.kind == "factor_model"
+    assert not any("is read as part of" in a for a in s.assumptions) and s.unsupported_requests == []
+
+
+def test_book_to_market_is_a_catalog_signal_not_unsupported(h):
+    for idea in ["book to market", "low price to book", "B/M deciles", "Fama-French 5 factor model"]:
+        assert not any("book" in u for u in h.translate(idea).spec.unsupported_requests), idea
+    s = h.translate("cheap stocks on book to market").spec
+    assert [c.feature for c in s.signal] == ["book_to_market"]
+    s = h.translate("book to market and FCF yield").spec  # two value ideas -> composite
+    assert s.name == "value_book_to_market_plus_value_fcf" and [c.feature for c in s.signal] == ["book_to_market", "fcf_yield_pct"]
+
+
+def test_profitability_flavours(h):
+    s = h.translate("Novy-Marx gross profitability").spec
+    assert [c.feature for c in s.signal] == ["gross_profitability_pct"]
+    assert not any("is read as part of" in a for a in s.assumptions)  # 'profitability' belongs to the same phrase
+    s = h.translate("quality minus junk").spec
+    assert s.name == "quality"
+    s = h.translate("gross profitability combined with operating profitability").spec
+    assert s.name == "gross_profitability_plus_profitability"
+    assert [c.feature for c in s.signal] == ["gross_profitability_pct", "operating_profitability_pct"]
+    s = h.translate("5 factor model with RMW and CMA").spec
+    assert s.name == "ff5" and s.unsupported_requests == []
+
+
+@pytest.mark.parametrize(
+    "idea,feature",
+    [("low P/E stocks", "earnings_yield_ttm_pct"), ("value on price to earnings", "earnings_yield_ttm_pct"),
+     ("low forward P/E", "earnings_yield_ntm_pct")],
+)
+def test_pe_value_uses_trailing_earnings_unless_forward(h, idea, feature):
+    s = h.translate(idea).spec
+    assert s.name == "value_fcf" and [c.feature for c in s.signal] == [feature]
 
 
 def test_factor_model_family_needs_no_absorption_note(h):

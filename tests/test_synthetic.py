@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from datetime import date, timedelta
@@ -169,7 +170,7 @@ def test_tiny_and_short_configurations_work():
     t = p.tickers
     panel = p.get_price_history(t, p.start, p.end)
     assert len(panel.close) == len(pd.bdate_range(p.start, p.end))
-    assert p.get_fundamentals(t, p.end).shape == (1, len(F.FUNDAMENTAL_COLUMNS))
+    assert p.get_fundamentals(t, p.end).shape == (1, len(F.FUNDAMENTAL_COLUMNS + F.FUNDAMENTAL_OPTIONAL_COLUMNS))
     assert p.get_estimates(t, p.end).shape == (1, len(F.ESTIMATE_COLUMNS))
     assert p.get_short_interest(t, p.end).shape == (1, len(F.SHORT_INTEREST_COLUMNS))
     assert p.get_options_summary(t, p.end).shape == (1, len(F.OPTIONS_COLUMNS))
@@ -304,7 +305,7 @@ def test_benchmark(prov, raw):
 
 def test_fundamental_columns_units_and_identity(raw):
     fu = raw["fund"]
-    assert list(fu.columns) == F.FUNDAMENTAL_COLUMNS
+    assert list(fu.columns) == F.FUNDAMENTAL_COLUMNS + F.FUNDAMENTAL_OPTIONAL_COLUMNS  # optional columns appended
     assert str(fu[F.REPORT_DATE].dtype).startswith("datetime64") and str(fu[F.PERIOD_END].dtype).startswith("datetime64")
     ok = fu[F.REVENUE_TTM].notna()
     assert ok.sum() >= 480  # everything except ETFs / preferreds
@@ -318,6 +319,42 @@ def test_fundamental_columns_units_and_identity(raw):
     assert lag.between(25, 45).all()
     etfs = raw["uni"].index[raw["uni"][F.SECURITY_TYPE].isin(["etf", "preferred"])]
     assert fu.loc[etfs].isna().all().all()
+
+
+def test_total_assets_consistent_with_balance_sheet(prov, raw):
+    fu = raw["fund"]
+    ok = fu[F.REVENUE_TTM].notna()
+    ta, ta_py = fu.loc[ok, F.TOTAL_ASSETS], fu.loc[ok, F.TOTAL_ASSETS_PRIOR_YEAR]
+    assert ta.notna().all() and (ta > 1e6).all()  # absolute USD
+    # assets = equity + debt + other liabilities (> 0), never below cash
+    assert (ta > fu.loc[ok, F.TOTAL_EQUITY] + fu.loc[ok, F.TOTAL_DEBT]).all()
+    assert (ta > fu.loc[ok, F.CASH]).all()
+    assert ta_py.notna().mean() > 0.95 and (ta_py.dropna() > 0).all()
+    growth = (ta / ta_py - 1).dropna()
+    assert -0.6 < growth.median() < 0.6 and growth.between(-0.9, 3.0).all()
+    # banks / insurers carry far more assets per dollar of revenue than industrials
+    sector = raw["uni"][F.GICS_SECTOR].reindex(ta.index)
+    turn = fu.loc[ok, F.REVENUE_TTM] / ta
+    assert turn[sector == "Financials"].median() < 0.5 * turn[sector == "Industrials"].median()
+    etfs = raw["uni"].index[raw["uni"][F.SECURITY_TYPE].isin(["etf", "preferred"])]
+    assert fu.loc[etfs, F.FUNDAMENTAL_OPTIONAL_COLUMNS].isna().all().all()
+
+
+def test_total_assets_prior_year_is_the_point_in_time_value_four_quarters_back(prov):
+    for t in prov.tickers[:12]:
+        snap = prov.get_fundamentals([t], END).iloc[0]
+        if pd.isna(snap[F.REPORT_DATE]):
+            continue
+        cur, row = snap[F.REPORT_DATE], None
+        for _ in range(4):  # walk back four reported quarters through point-in-time snapshots
+            row = prov.get_fundamentals([t], (cur - pd.Timedelta(days=1)).date()).iloc[0]
+            cur = row[F.REPORT_DATE]
+            if pd.isna(cur):  # recent IPO: pre-listing quarters became public together
+                break
+        if pd.isna(cur):
+            continue
+        assert row[F.PERIOD_END] < snap[F.PERIOD_END] - pd.Timedelta(days=330)
+        assert row[F.TOTAL_ASSETS] == pytest.approx(snap[F.TOTAL_ASSETS_PRIOR_YEAR], rel=1e-12)
 
 
 def test_fundamentals_point_in_time_and_ttm(prov):
@@ -732,3 +769,95 @@ def test_filings_and_research(prov):
     assert research and all(d.kind == DocumentKind.RESEARCH for d in research)
     kept, withheld = prov.boundary.filter_documents(research)
     assert not kept and withheld  # broker research is withheld from the LLM by the default boundary
+
+
+# ---------------------------------------------------------------------------------------------
+# Long histories (factor research over 15 years)
+# ---------------------------------------------------------------------------------------------
+
+LONG_START = date(2012, 1, 2)
+
+
+@pytest.fixture(scope="module")
+def long_prov() -> SyntheticProvider:
+    t0 = time.perf_counter()
+    p = SyntheticProvider(n_tickers=400, seed=7, start=LONG_START, end=END)
+    p.build_seconds = time.perf_counter() - t0  # type: ignore[attr-defined]
+    return p
+
+
+def _valuations(p: SyntheticProvider, d: date) -> pd.DataFrame:
+    u = p.get_universe(None, d)
+    u = u[u[F.SECURITY_TYPE].isin(["common_stock", "adr", "reit"])]
+    fu = p.get_fundamentals(list(u.index), d)
+    cap = u[F.MARKET_CAP]
+    return pd.DataFrame({
+        "fcf_yield": fu[F.FCF_TTM] / cap,
+        "log_ps": np.log(cap / fu[F.REVENUE_TTM]),
+        "growth": fu[F.REVENUE_TTM] / fu[F.REVENUE_TTM_PRIOR_YEAR] - 1,
+        "asset_growth": fu[F.TOTAL_ASSETS] / fu[F.TOTAL_ASSETS_PRIOR_YEAR] - 1,
+    })
+
+
+def _spread(x: pd.Series) -> float:
+    return float(x.quantile(0.9) - x.quantile(0.1))
+
+
+def test_long_history_builds_fast_and_covers_the_window(long_prov):
+    assert long_prov.build_seconds < 15.0
+    t = long_prov.tickers
+    panel = long_prov.get_price_history(t, LONG_START, END)
+    assert len(panel.close) == len(pd.bdate_range(LONG_START, END)) and panel.close.iloc[0].notna().any()
+    c = panel.close.to_numpy()
+    assert (c[np.isfinite(c)] > 0).all()  # no price rounds down to 0 however far back the window goes
+    early = long_prov.get_fundamentals(t, date(2012, 3, 1))  # quarters from 2009 are available
+    assert early[F.REVENUE_TTM].notna().mean() > 0.9 and early[F.TOTAL_ASSETS].notna().mean() > 0.9
+
+
+def test_long_history_valuations_stay_realistic(long_prov):
+    """Multiples must not random-walk away over 15 years: relative valuations stay as dispersed as at the
+    start of the last three years (where fundamentals evolve freely), medians stay plausible."""
+    ref = _spread(_valuations(long_prov, date(2023, 6, 30)).log_ps)
+    for d in (date(2014, 6, 30), date(2018, 6, 29), date(2021, 12, 31)):
+        v = _valuations(long_prov, d)
+        assert _spread(v.log_ps) < ref + 0.75, d
+        assert 0.03 < v.fcf_yield.median() < 0.25 and v.fcf_yield.quantile(0.9) < 1.0, d
+        assert 0.0 < v.growth.median() < 0.25 and v.growth.quantile(0.95) < 1.2, d
+        assert abs(v.asset_growth.median() - v.growth.median()) < 0.05, d
+
+
+def test_long_history_market_earns_the_market_factor(long_prov):
+    """End-anchored cap weights would otherwise make the cap-weighted market trail its constituents."""
+    b = long_prov.get_benchmark_history(LONG_START, date(2022, 12, 30))
+    years = (b.index[-1] - b.index[0]).days / 365.25
+    bench = (b.iloc[-1] / b.iloc[0]) ** (1 / years) - 1
+    mret = long_prov._mret[: len(b)]  # the simulated market factor (log returns), same sessions
+    market = math.exp(mret[1:].sum() / years) - 1
+    assert abs(bench - market) < 0.01
+
+
+def test_long_history_keeps_the_planted_end_of_sample_stories(long_prov):
+    t = long_prov.tickers
+    counts = pd.Series(long_prov.archetypes()).value_counts()
+    assert counts["transitory_shock"] == 12 and counts["value_trap"] == 12 and counts["momentum_leader"] == 20
+    raw = dict(panel=long_prov.get_price_history(t, date(2025, 1, 1), END), uni=long_prov.get_universe(None, END),
+               fund=long_prov.get_fundamentals(t, END), si=long_prov.get_short_interest(t, END),
+               arch=pd.Series(long_prov.archetypes()))
+    df = canonical_features(raw)
+    surv = df[canonical_mask(df)]
+    assert 6 <= len(surv) <= 24
+    assert surv.arch.isin(DISLOCATION_ARCHES).sum() >= 6
+
+
+def test_long_history_factor_characteristics_have_coverage(long_prov):
+    from aitrading.screen.features import FeatureEngine
+
+    d = date(2015, 6, 30)
+    uni = long_prov.get_universe(None, d)
+    uni = uni[uni[F.SECURITY_TYPE] == "common_stock"]
+    feats = ["book_to_market", "operating_profitability_pct", "asset_growth_yoy_pct", "gross_profitability_pct",
+             "earnings_yield_ttm_pct"]
+    ff = FeatureEngine(long_prov).build(uni, d, set(feats))
+    assert all(ff.coverage[f] > 0.9 for f in feats), ff.coverage
+    f = ff.frame
+    assert 0.1 < f.book_to_market.median() < 3 and 5 < f.gross_profitability_pct.median() < 60

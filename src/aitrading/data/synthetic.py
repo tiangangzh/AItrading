@@ -12,7 +12,15 @@ not random noise:
   lognormal volume with event spikes, and consistent OHLC (low <= open, close <= high).
 * Fundamentals / estimates: quarterly history (calendar or retail-style fiscal quarters) with
   report dates 25-45 days after period end. Snapshots are point-in-time on the report date;
-  TTM = last four reported quarters; ``fcf_ttm == cfo_ttm - capex_ttm`` exactly.
+  TTM = last four reported quarters; ``fcf_ttm == cfo_ttm - capex_ttm`` exactly. The balance
+  sheet is consistent: total assets (optional columns ``total_assets`` / ``total_assets_prior_year``)
+  = equity + debt + other liabilities, always above cash.
+* Long windows (e.g. 2012-2026 for factor research; ~1-4 s to build 300-500 names): before the
+  last ~3 years, each stock's drift is redrawn every 3 years (no 15-year persistence), returns are
+  calibrated so the cap-weighted universe earns the simulated market factor, and fundamentals
+  follow market-relative prices with a lag, so relative valuations stay realistic over decades
+  instead of random-walking. The last ~3 years (the planted stories, and the whole of a
+  default-length window) are unaffected.
 * Short interest: semi-monthly settlement dates (15th and month end). Options: 30d ATM IV tied
   to realised volatility plus event premia, put/call volume and open interest.
 * Documents: earnings-call transcripts, news, SEC-filing excerpts and research notes generated
@@ -92,6 +100,17 @@ _ARCH_FRACTIONS = {
 }
 _MIN_SESSIONS_FOR_PLANTING = 300
 _MAX_PLANT_ROUNDS = 30
+# Long-window valuation anchor (see SyntheticProvider._valuation_anchor): the latest 12 reported
+# quarters keep their designed numbers; earlier fundamentals follow prices with a 4-quarter
+# half-life - fully for each name's gap relative to the market, half for the market-wide gap.
+_ANCHOR_FREE_QUARTERS = 12
+_ANCHOR_HALF_LIFE_Q = 4.0
+_ANCHOR_MARKET_SHARE = 0.5
+_MIN_PRICE = 1e-4  # adjusted prices are stored with 4 decimals; never round a price down to 0
+# Long windows: before the last 756 sessions (phased in over 252) each stock's persistent drift is
+# replaced by drifts redrawn every 756 sessions (same distribution), see _regime_drifts.
+_FREE_SESSIONS = 756
+_DRIFT_REGIME_SESSIONS = 756
 
 # ---------------------------------------------------------------------------------------------
 # Reference data: sectors, industries, economics
@@ -1101,10 +1120,12 @@ class SyntheticProvider:
 
         if self._stories:
             self._plant_prices(factor, R, LV, ev, base_lv, ovn, hu, hd)
+        self._long_window_returns(R)
 
         lc, lo, lh, ll = _ohlc_log(R, ev, ovn, hu, hd)
         shift = np.log(self._price_end)[None, :] - lc[-1:, :]
-        px = {k: np.round(np.exp(v + shift), 4) for k, v in (("open", lo), ("high", lh), ("low", ll), ("close", lc))}
+        px = {k: np.maximum(np.round(np.exp(v + shift), 4), _MIN_PRICE)
+              for k, v in (("open", lo), ("high", lh), ("low", ll), ("close", lc))}
         vol = np.maximum(np.round(np.exp(LV)), 100.0)
         pre = np.arange(N)[:, None] < self._listing[None, :]
         for k in px:
@@ -1118,6 +1139,56 @@ class SyntheticProvider:
         self._px["volume"] = pd.DataFrame(vol, index=idx, columns=cols_ix)
         self._close = px["close"]
         self._logret = np.vstack([np.full((1, n), np.nan), np.diff(np.log(px["close"]), axis=0)])
+
+    def _long_window_returns(self, R: np.ndarray) -> None:
+        """Long windows only: realistic multi-year return structure before the last three years.
+
+        1. Every stock carries a persistent drift (``N(3%, 11%)`` a year). Over the default ~3-year
+           window that is part of the design (cross-sectional trends, momentum), but kept for 15
+           years it drives names apart by +-1.6 in log terms. Before the last ``_FREE_SESSIONS``
+           sessions each stock's drift is therefore redrawn every ``_DRIFT_REGIME_SESSIONS`` sessions
+           from the same distribution (same short-horizon dispersion, no 15-year persistence).
+        2. The cross-section is anchored at the end of the window, so earlier market caps depend on
+           later returns and the cap-weighted market trails its constituents (by roughly the
+           cross-sectional return variance). A uniform daily shift of every stock's return - which
+           leaves those cap weights unchanged - is calibrated so that over this period the
+           cap-weighted universe (the ``SYNTH-US`` construction) earns exactly the simulated market
+           factor; individual stocks keep their betas, factor exposures and idiosyncratic paths.
+
+        Both are phased in over a year before the last ``_FREE_SESSIONS`` sessions; the recent
+        sessions (where the planted stories live, and all of a default-length window) are untouched.
+        """
+        N = self._N
+        t0 = N - _FREE_SESSIONS
+        if t0 <= 1:
+            return
+        stocks = np.flatnonzero(~np.isin(self._stype, ["etf", "preferred"]))
+        if stocks.size == 0:
+            return
+        t = np.arange(N)
+        v = np.clip((t0 - t) / 252.0, 0.0, 1.0)  # phase-in weight (0 from t0 on)
+        v[0] = 0.0
+        rng = self._rng("drift-regimes")
+        n_reg = (t0 - 1) // _DRIFT_REGIME_SESSIONS + 1
+        draws = rng.normal(0.03, 0.11, (n_reg, self.n_tickers))  # same law as the reference drift
+        reg = np.clip((t0 - 1 - t) // _DRIFT_REGIME_SESSIONS, 0, n_reg - 1)  # regime 0 ends at t0
+        R[:, stocks] += (draws[reg][:, stocks] - self._drift[stocks][None, :]) * (v / 252)[:, None]
+
+        # cap weights at t-1 ~ end cap x exp(log price(t-1) - log price(end)); unlisted names excluded
+        Rs = R[:, stocks]
+        lc = np.cumsum(Rs, axis=0)
+        logw = (self._lcap[stocks] * math.log(10.0))[None, :] + lc - lc[-1:]
+        listed = t[:, None] >= self._listing[stocks][None, :]
+        zone = np.flatnonzero(v > 0)
+        live = listed[zone - 1] & listed[zone]
+        zone, live = zone[live.any(axis=1)], live[live.any(axis=1)]
+        if zone.size == 0:
+            return
+        a = np.where(live, logw[zone - 1], -np.inf)
+        wts = np.exp(a - a.max(axis=1, keepdims=True))
+        idx_r = np.log((wts * np.exp(Rs[zone])).sum(axis=1) / wts.sum(axis=1))
+        delta = float((v[zone] * (self._mret[zone] - idx_r)).sum() / v[zone].sum())
+        R[:, stocks] += (delta * v)[:, None]
 
     def _plant_prices(self, factor, R, LV, ev, base_lv, ovn, hu, hd) -> None:
         """Rejection-sample the idiosyncratic path of every planted name until its technical
@@ -1404,6 +1475,10 @@ class SyntheticProvider:
             out[:, 3:] = x[:, 3:] + x[:, 2:-1] + x[:, 1:-2] + x[:, :-3]
             return out
 
+        adj = self._valuation_anchor(np.log(np.maximum(ttm_rel(rev), 1e-12)))
+        if adj is not None:  # long windows only (see _valuation_anchor); the recent quarters keep their numbers
+            rev = rev * np.exp(adj)
+
         gp = gm_q * rev
         oi = om_q * rev
         da_v = da_q * rev
@@ -1416,6 +1491,15 @@ class SyntheticProvider:
         ni = pretax - 0.21 * np.maximum(pretax, 0.0)
         cfo = ni + da_v + sbc[:, None] * rev + wc_sd[:, None] * wc_z * rev
         equity = eq_r[:, None] * rev_ttm
+        # Total assets = equity + debt + other liabilities (payables, deferred revenue, deposits for
+        # banks / insurers), floored at cash + a minimum operating-asset base of 0.6x TTM revenue
+        # (negative-equity names carry large liabilities, not a tiny balance sheet). Separate RNG
+        # stream: adding it leaves every other simulated number unchanged.
+        r_as = self._rng("assets")
+        fin = np.array([s == "Financials" for s in self._sector])
+        ol_r = np.where(fin, r_as.uniform(3.0, 8.0, n), r_as.uniform(0.15, 0.60, n))
+        other_liab = ol_r[:, None] * rev_ttm * (1 + r_as.normal(0, 0.04, (n, K)))
+        assets = np.maximum(equity + debt + other_liab, cash + 0.6 * rev_ttm)
 
         shares_a = np.maximum(np.round(10**self._lcap / self._price_end), 1000.0)
         cap_end = shares_a * self._price_end
@@ -1430,6 +1514,7 @@ class SyntheticProvider:
         self._q = {
             "rev": rev * sc, "gp": gp * sc, "oi": oi * sc, "da": da_v * sc, "ni": ni * sc, "cfo": cfo * sc,
             "capex": capex_v * sc, "debt": debt * sc, "cash": cash * sc, "interest": interest * sc, "equity": equity * sc,
+            "assets": assets * sc,
         }
         self._q["ebitda"] = self._q["oi"] + self._q["da"]
         self._q["shares"] = np.round(shares_a[:, None] * (1 + chg[:, None]) ** (np.arange(K)[None, :] - ka_all[:, None]))
@@ -1445,6 +1530,68 @@ class SyntheticProvider:
         self._kk_t = kk
         shares_t = np.take_along_axis(self._q["shares"].T, np.clip(kk, 0, None), axis=0)
         self._cap_t = self._close * shares_t
+
+    def _valuation_anchor(self, log_rev_ttm: np.ndarray) -> np.ndarray | None:
+        """Log-level revenue adjustment (n, K) that keeps valuations sane over long windows (None: no-op).
+
+        Prices are simulated independently of the revenue path, so over many years price / sales
+        random-walks without bound (a 15-year window would show FCF yields of thousands of %).
+        Up to the start of the free zone (the latest ``_ANCHOR_FREE_QUARTERS`` reported quarters),
+        fundamentals follow prices: each name's log price / TTM-sales gap relative to its value at the
+        start of the free zone is absorbed into revenue with a causal EMA (half-life
+        ``_ANCHOR_HALF_LIFE_Q`` quarters) - fully for the part relative to the cross-sectional median
+        gap, and ``_ANCHOR_MARKET_SHARE`` of the market-wide median gap (the rest stays in prices, so
+        aggregate multiples can still re-rate, but not without bound). Relative multiples
+        therefore mean-revert through fundamentals catching up with prices: revenue growth follows
+        past returns, returns stay unpredictable from valuations. From the free zone on the
+        adjustment is held constant, and since the end-of-window scaling normalises any constant
+        factor, the free zone (the planted stories, and every quarter of a default-length window,
+        where this is a no-op) keeps its designed numbers and revenue growth stays continuous.
+        Every income / cash-flow / balance-sheet line scales with revenue, so the whole statement
+        moves together. Quarters before the price window keep their relative path.
+        """
+        n, K = log_rev_ttm.shape
+        kf = self._k_end - _ANCHOR_FREE_QUARTERS
+        if not (kf >= 1).any():
+            return None
+        # mean log close over each fiscal quarter's sessions (pe[k-1], pe[k]] inside the window
+        rows = np.arange(n)[:, None]
+        hi = np.searchsorted(self._dd, self._pe.ravel(), side="right").reshape(n, K)
+        lo = np.concatenate([np.zeros((n, 1), dtype=hi.dtype), hi[:, :-1]], axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            logc = np.log(self._close)
+        ok = np.isfinite(logc)
+        cs = np.vstack([np.zeros((1, n)), np.cumsum(np.where(ok, logc, 0.0), axis=0)])
+        cn = np.vstack([np.zeros((1, n)), np.cumsum(ok, axis=0)])
+        cnt = cn[hi, rows] - cn[lo, rows]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            p = np.where(cnt >= 20, (cs[hi, rows] - cs[lo, rows]) / np.maximum(cnt, 1), np.nan)
+        y = p - log_rev_ttm  # log price / sales (up to a per-name constant)
+        y_ref = y[np.arange(n), np.clip(kf, 0, K - 1)]
+        names = (kf >= 1) & np.isfinite(y_ref) & ~np.isin(self._stype, ["etf", "preferred"])
+        live = names[:, None] & (np.arange(K)[None, :] <= kf[:, None]) & np.isfinite(y)
+        if not live.sum(axis=1).max(initial=0) > 1:
+            return None
+        z = np.where(live, y - y_ref[:, None], np.nan)
+        common = np.zeros(K)  # cross-sectional median gap per quarter (left in prices)
+        cols = live.sum(axis=0) >= 5
+        if cols.any():
+            common[cols] = np.nanmedian(z[:, cols], axis=0)
+        z = z - (1.0 - _ANCHOR_MARKET_SHARE) * common[None, :]
+        alpha = 1.0 - 2.0 ** (-1.0 / _ANCHOR_HALF_LIFE_Q)
+        ema = np.full(n, np.nan)
+        out = np.zeros((n, K))
+        seen = np.zeros(n, dtype=bool)
+        for k in range(K):
+            use = live[:, k]
+            ema = np.where(use, np.where(np.isnan(ema), z[:, k], ema + alpha * (z[:, k] - ema)), ema)
+            seen |= use
+            out[:, k] = np.where(seen, ema, 0.0)  # after the last live quarter: held constant
+        first = np.where(live.any(axis=1), live.argmax(axis=1), 0)
+        before = np.arange(K)[None, :] < first[:, None]
+        out = np.where(before, out[np.arange(n), first][:, None], out)  # before the price window: relative path kept
+        out[~names] = 0.0
+        return out if out.any() else None
 
     def _kidx(self, as_of: date) -> np.ndarray:
         """Per-ticker index of the latest quarter public on or before ``as_of`` (-1: none)."""
@@ -1727,7 +1874,9 @@ class SyntheticProvider:
         return ser.loc[(idx >= pd.Timestamp(s)) & (idx <= pd.Timestamp(e))].copy()
 
     def get_fundamentals(self, tickers: list[str], as_of: date) -> pd.DataFrame:
-        """Point-in-time fundamentals snapshot (``fields.FUNDAMENTAL_COLUMNS``) keyed on report date."""
+        """Point-in-time fundamentals snapshot keyed on report date: ``fields.FUNDAMENTAL_COLUMNS`` followed by
+        the optional ``fields.FUNDAMENTAL_OPTIONAL_COLUMNS`` (total assets at the latest quarter end and
+        four quarters earlier)."""
         tick, rows = self._rows(tickers)
         kk_all = self._kidx(_as_date(as_of))
         kk = np.where(rows >= 0, kk_all[np.clip(rows, 0, None)], -1)
@@ -1754,8 +1903,10 @@ class SyntheticProvider:
             F.INTEREST_EXPENSE_TTM: self._ttm("interest", rows, kk),
             F.TOTAL_EQUITY: q("equity", rows, kk),
             F.SHARES_OUTSTANDING: q("shares", rows, kk),
+            F.TOTAL_ASSETS: q("assets", rows, kk),
+            F.TOTAL_ASSETS_PRIOR_YEAR: q("assets", rows, kk, 4),
         }
-        return pd.DataFrame(data, index=pd.Index(tick, name="ticker"))[F.FUNDAMENTAL_COLUMNS]
+        return pd.DataFrame(data, index=pd.Index(tick, name="ticker"))[F.FUNDAMENTAL_COLUMNS + F.FUNDAMENTAL_OPTIONAL_COLUMNS]
 
     def get_estimates(self, tickers: list[str], as_of: date) -> pd.DataFrame:
         """Consensus snapshot (``fields.ESTIMATE_COLUMNS``); "3m ago" values are the consensus 91 days earlier."""

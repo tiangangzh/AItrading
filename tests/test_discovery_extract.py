@@ -701,7 +701,7 @@ def test_heuristic_with_the_real_idea_library():
         picked[name] = key
     expected = {"momentum": "momentum_12_1", "reversal": "short_term_reversal", "low_vol": "low_volatility", "bab": "low_beta",
                 "short_interest": "short_interest", "revisions": "estimate_revisions", "trend": "trend_200dma_spy",
-                "profitability": "quality", "asset_growth": "ff5"}
+                "profitability": "quality", "asset_growth": "investment", "value": "value_book_to_market"}
     for name, key in expected.items():
         if key in templates:
             assert picked[name] == key, name

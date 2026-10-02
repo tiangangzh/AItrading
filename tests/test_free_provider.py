@@ -395,13 +395,14 @@ EXPECTED_2026_08_15 = {
     F.FCF_TTM: (175 - 53) * M,
     F.TOTAL_DEBT: (280 + 20) * M, F.CASH: 150 * M, F.INTEREST_EXPENSE_TTM: 8 * M, F.TOTAL_EQUITY: 500 * M,
     F.SHARES_OUTSTANDING: 49_500_000,
+    F.TOTAL_ASSETS: 1210 * M, F.TOTAL_ASSETS_PRIOR_YEAR: 1100 * M,  # us-gaap Assets 2026-06-30 / 2025-06-30
 }
 
 
 def test_fundamentals_point_in_time_full_row():
     cf = _fx_json("companyfacts_CIK0001234567.json")
     row = fundamentals_from_companyfacts(cf, date(2026, 8, 15))
-    assert list(row) == F.FUNDAMENTAL_COLUMNS
+    assert list(row) == F.FUNDAMENTAL_COLUMNS + F.FUNDAMENTAL_OPTIONAL_COLUMNS
     for k, v in EXPECTED_2026_08_15.items():
         assert row[k] == pytest.approx(v) if isinstance(v, (int, float)) else row[k] == v, k
     assert row[F.FCF_TTM] == row[F.CFO_TTM] - row[F.CAPEX_TTM]
@@ -417,21 +418,25 @@ def test_fundamentals_ignore_filings_after_as_of():
     assert row[F.CFO_TTM] == (40 + 45 + 50 + 35) * M and row[F.FCF_TTM] == (170 - 52) * M
     assert row[F.TOTAL_DEBT] == 290 * M  # the 2026-06-30 short-term borrowings are not public yet
     assert row[F.SHARES_OUTSTANDING] == 50_000_000
+    assert (row[F.TOTAL_ASSETS], row[F.TOTAL_ASSETS_PRIOR_YEAR]) == (1180 * M, 1080 * M)  # 2026-03-31 vs 2025-03-31
 
     row = fundamentals_from_companyfacts(cf, date(2026, 3, 1))  # just after the FY2025 10-K
     assert row[F.PERIOD_END] == pd.Timestamp("2025-12-31") and row[F.REPORT_DATE] == pd.Timestamp("2026-02-19")
     assert row[F.REVENUE_LAST_Q] == 155 * M  # Q4 = FY 560 - 9M 405
     assert row[F.REVENUE_TTM] == 560 * M  # original Q1'25 = 125 (restatement not yet filed)
     assert row[F.REVENUE_TTM_PRIOR_YEAR] == 460 * M
+    assert (row[F.TOTAL_ASSETS], row[F.TOTAL_ASSETS_PRIOR_YEAR]) == (1150 * M, 1050 * M)  # FY-end vs prior FY-end
 
 
 def test_fundamentals_missing_pieces_are_nan_not_errors():
     cf = _fx_json("companyfacts_CIK0001234567.json")
     row = fundamentals_from_companyfacts(cf, date(2024, 5, 10))  # one quarter of history
     assert row[F.REVENUE_LAST_Q] == 100 * M and math.isnan(row[F.REVENUE_TTM]) and math.isnan(row[F.FCF_TTM])
+    assert row[F.TOTAL_ASSETS] == 1010 * M and math.isnan(row[F.TOTAL_ASSETS_PRIOR_YEAR])  # no year-ago balance sheet
     empty = fundamentals_from_companyfacts({"facts": {}}, date(2026, 1, 1))
     assert empty[F.PERIOD_END] is pd.NaT
-    assert all(math.isnan(empty[c]) for c in F.FUNDAMENTAL_COLUMNS if c not in (F.PERIOD_END, F.REPORT_DATE))
+    assert all(math.isnan(empty[c]) for c in F.FUNDAMENTAL_COLUMNS + F.FUNDAMENTAL_OPTIONAL_COLUMNS
+               if c not in (F.PERIOD_END, F.REPORT_DATE))
     # EBITDA is NaN when D&A is not tagged
     no_da = json.loads(json.dumps(cf))
     del no_da["facts"]["us-gaap"]["DepreciationDepletionAndAmortization"]
@@ -466,7 +471,7 @@ def test_missing_sec_user_agent_raises_with_setup_guidance(tmp_path, monkeypatch
     monkeypatch.delenv("SEC_USER_AGENT")
     p = make_provider(tmp_path, sec=client)
     out = p.get_fundamentals(["ACME"], date(2026, 8, 15))
-    assert list(out.columns) == F.FUNDAMENTAL_COLUMNS and out.isna().all().all()
+    assert list(out.columns) == F.FUNDAMENTAL_COLUMNS + F.FUNDAMENTAL_OPTIONAL_COLUMNS and out.isna().all().all()
     assert any("$env:SEC_USER_AGENT" in w for w in p.warnings)
     assert any("SEC_USER_AGENT" in d for d in p.diagnostics())
 
@@ -482,7 +487,7 @@ def test_cache_hit_avoids_second_http_call(tmp_path):
     assert c2.company_facts(1234567)["entityName"] == "Acme Widgets Inc."
     assert router.calls[url] == 1
     # Only the concepts the client reads are stored on disk.
-    assert set(cf1["facts"]["us-gaap"]) >= {"RevenueFromContractWithCustomerExcludingAssessedTax", "LongTermDebt"}
+    assert set(cf1["facts"]["us-gaap"]) >= {"RevenueFromContractWithCustomerExcludingAssessedTax", "LongTermDebt", "Assets"}
     # Filing documents are cached forever as converted text.
     f_url = "https://www.sec.gov/Archives/edgar/data/1234567/000123456726000031/acme-ex991_q22026.htm"
     t1 = c1.document_text(f_url)
@@ -627,7 +632,9 @@ def test_documents_kinds_date_filter_and_order(tmp_path):
 def test_provider_fundamentals_frame(tmp_path):
     p = make_provider(tmp_path)
     df = p.get_fundamentals(["ACME", "BETA", "ZZZZ"], date(2026, 8, 15))
-    assert list(df.columns) == F.FUNDAMENTAL_COLUMNS and list(df.index) == ["ACME", "BETA", "ZZZZ"]
+    assert list(df.columns) == F.FUNDAMENTAL_COLUMNS + F.FUNDAMENTAL_OPTIONAL_COLUMNS
+    assert list(df.index) == ["ACME", "BETA", "ZZZZ"]
+    assert df.loc["ACME", F.TOTAL_ASSETS] == 1210 * M and df.loc["ACME", F.TOTAL_ASSETS_PRIOR_YEAR] == 1100 * M
     assert df.index.name == "ticker"
     assert df.loc["ACME", F.FCF_TTM] == df.loc["ACME", F.CFO_TTM] - df.loc["ACME", F.CAPEX_TTM] == 122 * M
     assert df.loc["ACME", F.REVENUE_TTM] == 615 * M
@@ -986,6 +993,30 @@ def test_balance_sheet_and_share_fallbacks():
     diluted = _cf({"WeightedAverageNumberOfDilutedSharesOutstanding": [
         _dur("2026-01-01", "2026-03-31", 410, "2026-05-01"), _dur("2025-01-01", "2025-12-31", 400, "2026-02-15")]})
     assert shares_outstanding(diluted, as_of) == 410  # no dei -> latest quarterly diluted count
+
+
+def test_total_assets_point_in_time_on_the_balance_sheet_date():
+    from aitrading.data.sec_edgar import total_assets
+
+    eq = [_inst("2026-03-28", 500, "2026-05-01"), _inst("2025-09-27", 480, "2025-11-01"), _inst("2025-03-29", 450, "2025-05-02")]
+    assets = [_inst("2026-03-28", 1300, "2026-05-01"), _inst("2025-09-27", 1250, "2025-11-01"),
+              _inst("2025-03-29", 1100, "2025-05-02"), _inst("2025-03-29", 1120, "2026-05-01", "restated")]
+    cf = _cf({"StockholdersEquity": eq, "Assets": assets})
+    # 52/53-week fiscal year: the year-ago quarter ended 364 days earlier; its restatement (filed with the
+    # latest 10-Q) is already public and wins
+    assert total_assets(cf, date(2026, 6, 1)) == (1300, 1120)
+    now, prior = total_assets(cf, date(2026, 4, 1))  # the 2026-03-28 balance sheet is not public yet
+    assert now == 1250 and math.isnan(prior)  # no balance sheet a year before 2025-09-27
+    now, prior = total_assets(cf, date(2025, 6, 1))
+    assert now == 1100 and math.isnan(prior)  # the original value: the restatement was filed in 2026
+    # a stale Assets value is never carried onto a newer balance sheet
+    stale = _cf({"StockholdersEquity": [_inst("2026-03-31", 500, "2026-05-01")],
+                 "Assets": [_inst("2025-12-31", 1200, "2026-02-15")]})
+    assert all(math.isnan(x) for x in total_assets(stale, date(2026, 6, 1)))
+    # no equity / cash / debt tags: the Assets instant itself dates the balance sheet
+    only_assets = _cf({"Assets": [_inst("2026-03-31", 900, "2026-05-01"), _inst("2025-03-31", 800, "2025-05-01")]})
+    assert total_assets(only_assets, date(2026, 6, 1)) == (900, 800)
+    assert all(math.isnan(x) for x in total_assets(_cf({}), date(2026, 6, 1)))
 
 
 def test_revenue_tag_switch_and_sixteen_week_quarter():
