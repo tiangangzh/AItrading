@@ -26,12 +26,34 @@ SURVIVORSHIP BIAS warning and the ``universe`` data-usage note says so (companie
 acquired before ``end`` are missing; this caps the interpreter's verdict at "promising").
 Names without a valid price on a rebalance date (not listed yet, halted) are not eligible then.
 
-Market cap at each date is point-in-time: from ``provider.get_universe(spec.universe, t)`` for
-providers whose universe snapshot is cheap and point-in-time (the synthetic provider, or any
-provider with ``point_in_time_market_cap = True``); otherwise it is estimated as the END market cap
-times the adjusted-price ratio P(t) / P(end) (share issuance / buybacks after t and dividends are
-not reflected; the data-usage note says so). It feeds ``market_cap_usd_bn``, value weights and
-every valuation ratio (book-to-market, FCF yield, ...).
+Price floor: ``UniverseSpec.min_price`` is a floor on the price a stock TRADED at. Providers serve
+split- and dividend-adjusted closes (the ``PricePanel`` contract), which later splits and dividends
+restate downwards, so on adjusted prices the floor is suspended at dates before the provider's latest
+data date (a warning and the ``universe`` data-usage note say so; the liquidity floor, which is
+split-invariant, still applies). It applies at every date when the prices are as traded (the
+synthetic market, or a provider declaring ``prices_as_traded = True``).
+
+Market cap (only computed when something uses it: ``MARKET_CAP_FEATURES`` - size and the valuation
+ratios book-to-market, FCF / earnings yield, EV ... - value weights, or a factor model; otherwise the
+universe's cap column is blank so the END snapshot can never stand in for a past date). Modes
+(:meth:`StrategyRunner._mcap_mode`):
+
+* ``snapshot`` - ``provider.get_universe(spec.universe, t)`` at every date (the cheap offline
+  synthetic provider, or a provider declaring ``point_in_time_market_cap = True``);
+* ``anchored`` (default) - the provider's universe snapshot (point-in-time by the provider contract;
+  e.g. the free provider prices SEC cover-page shares as of the date) at the last session of each
+  June and December ``a`` - about two calls a year - rolled forward to ``t`` with the adjusted-price
+  ratio P(t) / P(a), which only uses prices in (a, t]. Share changes between snapshots are not
+  reflected, dividends since ``a`` count as reinvested, a name listed after ``a`` has no cap until
+  the next snapshot. The June / December snapshots are exactly the Fama-French size / B/M dates;
+* ``end_scaled`` - a provider declaring ``point_in_time_market_cap = False``: END cap x P(t) / P(end),
+  which feeds the END share count and later dividends to every date. A ``MARKET CAPS NOT
+  POINT-IN-TIME`` warning and a ``market_cap`` data-usage entry with ``point_in_time=False`` make the
+  interpreter treat it as look-ahead. An anchored snapshot that fails falls back to this estimate for
+  the dates that depend on it, flagged the same way.
+
+A name is given a cap only if it traded within 10 days of the date (no stale caps for dead names).
+The ``market_cap`` data-usage entry records the mode.
 
 Per-date portfolio (one code path for the backtest and ``target_portfolio``)
 --------------------------------------------------------------------------
@@ -53,7 +75,11 @@ the spec's features + universe-filter inputs + ``price`` + ``market_cap_usd_bn``
   filters): long when every entry condition (and every ``spec.filters`` condition) holds; with
   exit conditions the position is kept until every exit condition holds, without them it is
   closed when the entry stops holding. Weight +1/n long, -1/n when flat and ``when_flat="short"``,
-  else 0. The state is replayed date by date (``target_portfolio`` replays from the window start).
+  else 0. Missing data never opens a position: an asset without a price at t (not listed yet,
+  halted) is flat with its state reset, and one without its entry inputs (e.g. during the warm-up
+  of a 200-day average) is neither long nor short (an open long under an exit rule keeps following
+  it); a warning lists the dates per asset. The state is replayed date by date
+  (``target_portfolio`` replays from the window start).
 * ``factor_model`` - see below.
 
 Execution and returns
@@ -62,9 +88,10 @@ Execution and returns
 at the close of t, traded ``execution_lag`` sessions later, weights drift, costs on traded notional.
 Long-short books (cross_sectional ``long_short``) are self-financing: collateral earns 0, Sharpe is
 on the raw spread and the factor regression uses ``excess=False``. Every other book (long-only,
-screen, time series) earns the daily risk-free rate on its idle cash (1 - sum of the executed
-weights, clipped to [0, 1], drift ignored), Sharpe is in excess of RF and the regression uses
-``excess=True``. Long-short runs also report the ``long`` leg (positive weights, simulated with the
+screen, time series) earns the daily risk-free rate on its cash (max(0, 1 - sum of the executed
+weights), drift ignored: a net-short time-series book keeps its capital plus the short-sale
+proceeds, e.g. 2 for a -1 short, at RF - a full rebate - so the short state's excess return is
+-(r - rf)), Sharpe is in excess of RF and the regression uses ``excess=True``. Long-short runs also report the ``long`` leg (positive weights, simulated with the
 same costs) and the ``short`` leg = the return of the shorted basket (absolute negative weights,
 before costs), so long - short is the spread before the short leg's trading costs.
 
@@ -78,6 +105,8 @@ signals against ``forward_returns_from_close`` with the same execution lag.
 
 Factor models (kind ``factor_model``)
 -------------------------------------
+The universe is the provider's (country / security types) without the price and liquidity floors
+or ``spec.filters``: every name with data enters the sorts, as in Fama-French.
 A :class:`~aitrading.factors.construct.CharacteristicsPanel` on calendar month-ends: returns from
 month-end closes, point-in-time market caps (above), book equity = ``total_equity`` of the latest
 public filing as of each June formation date (the point-in-time lag), ff5 operating profitability /
@@ -85,17 +114,32 @@ investment = ``operating_profitability_pct`` / ``asset_growth_yoy_pct`` / 100 fr
 at the June formation date, carhart4 momentum = P(m-1) / P(m-12) - 1 from month-end closes (the
 monthly-granularity ``return_12m_ex_1m_pct``), NYSE flags from the universe ``exchange``, RF = the
 official monthly RF. ``construct_factors(panel, model, formation="annual_june")`` builds the
-factors, ``compare_with_official`` gives ``factor_checks``. ``returns`` holds every factor plus
-``strategy`` = the equal-weighted average of the model's non-market long-short factors (SMB / HML /
-... ; the constructed Mkt-RF for capm) so reports and the interpreter have a headline series;
-statistics are per factor (raw, they are already excess / self-financing returns) and for
-``strategy`` / ``benchmark``. ``target_portfolio`` / ``latest_holdings`` give the factor-mimicking
-weights of that headline portfolio: the 2x3 value-weighted portfolios formed at the latest June
-(momentum: at as_of) with today's market-cap weights inside each portfolio.
+factors, ``compare_with_official`` gives ``factor_checks``. A name that stops trading has no later
+monthly price; a non-zero ``spec.delisting_return`` is booked on its first missing session (as in
+``simulate``). A last month the data does not cover to its end (the data ending more than 3 days
+before the calendar month-end) is left out of every series, the statistics and the attribution.
+``returns`` holds every factor (gross, like the official ones) plus ``strategy`` = the
+equal-weighted average of the model's non-market long-short factors (SMB / HML / ... ; the
+constructed Mkt-RF for capm) NET of ``spec.costs_bps`` one-way costs on the traded notional of the
+factor-mimicking portfolio: its weights at every month-end session, drifted through the month with
+the monthly returns, against the next month-end's weights (the cost of the trade at the end of month
+m is deducted from month m+1's return; the first trade builds the book from cash). Factors and
+``strategy`` are formed and traded at the month-end close (the Fama-French convention; the runner's
+``execution_lag`` is not applied - a warning says so). Statistics are per factor (raw, they are
+already excess / self-financing returns) and for ``strategy`` (with its turnover) / ``benchmark``.
+``target_portfolio`` / ``latest_holdings`` give the factor-mimicking weights of that headline
+portfolio: the 2x3 value-weighted portfolios of the latest June formation whose formation SESSION
+(the last trading session of June, as in ``construct_factors``) is on or before the date (momentum:
+at the date), with the market-cap weights of the date inside each portfolio; over the backtest these
+weights reproduce the constructed gross factor returns exactly.
 
-Run ids are deterministic: ``<spec name>-<sha256 of spec JSON + provider + window + execution lag>``
-plus ``-<label>`` when a label is given. ``runner.last_run`` keeps the internals of the latest
-backtest (:class:`RunDetails`: target weights and signals per date, the simulation).
+Run ids are deterministic: ``<spec name>-<hash>`` plus ``-<label>`` when a label is given; the hash
+covers the spec JSON, the provider name and configuration (:meth:`StrategyRunner.provider_fingerprint`:
+a provider ``fingerprint``, else its class, seed / n_tickers / start / end / benchmark and its ticker
+list), the universe (sorted tickers), the window and the execution lag - so the same idea on two
+differently configured providers never shares an id (or an idea-lab run folder). ``runner.last_run``
+keeps the internals of the latest backtest (:class:`RunDetails`: target weights and signals per date,
+the simulation; for factor models the monthly factor-mimicking weights and gross / cost / net series).
 """
 
 from __future__ import annotations
@@ -138,6 +182,8 @@ __all__ = [
     "StrategyRunner",
     "RunDetails",
     "composite_signal",
+    "snapshot_only_features",
+    "MARKET_CAP_FEATURES",
     "PRELOAD_LOOKBACK_DAYS",
     "REBALANCES_PER_YEAR",
 ]
@@ -146,6 +192,20 @@ __all__ = [
 PRELOAD_LOOKBACK_DAYS = LOOKBACK_CALENDAR_DAYS
 REBALANCES_PER_YEAR: dict[str, float] = {"daily": 252.0, "weekly": 52.0, "monthly": 12.0, "quarterly": 4.0, "annual": 1.0}
 _SNAPSHOT_DATASETS = ("estimates", "short_interest", "options")
+#: Features that read a snapshot dataset but stay point-in-time when the provider's snapshots are
+#: current-only: the last earnings date comes from dated filings (SEC 8-K release dates on the free
+#: provider) and falls back to the fundamentals' report date.
+_POINT_IN_TIME_DESPITE_SNAPSHOT = frozenset({"days_since_last_earnings"})
+#: Catalog features computed from the universe market cap: they need a point-in-time cap at each date.
+MARKET_CAP_FEATURES = frozenset({
+    "market_cap_usd_bn", "enterprise_value_usd_bn", "fcf_yield_pct", "ev_to_ebitda", "ev_to_sales",
+    "cash_pct_market_cap", "book_to_market", "earnings_yield_ttm_pct",
+})
+#: Calendar months whose last session is a market-cap snapshot date in ``anchored`` mode (the
+#: Fama-French formation months: June for size, December for book-to-market).
+MCAP_ANCHOR_MONTHS = (6, 12)
+#: A market cap is only estimated for a name that traded within this many calendar days of the date.
+_MCAP_STALE_DAYS = 10
 _MARKET = {"capm": "Mkt-RF"}
 _MAX_WARNINGS = 80
 
@@ -182,9 +242,62 @@ def _dedupe(items: list[str]) -> list[str]:
     return list(seen)
 
 
+_DATED = re.compile(r"^(\d{4}-\d{2}-\d{2}): (.*)$", re.S)
+
+
+def _compress_dated(warnings: list[str], keep: int = 2) -> list[str]:
+    """Collapse repeated per-date warnings ("2020-01-31: dropped 2 target name(s) ...") of the same kind
+    (the first four words after the date, numbers ignored): the first ``keep`` are kept, the rest
+    become one "... and N more" line, so they cannot crowd out the other warnings."""
+    groups: dict[str, list[str]] = {}
+    order: list[tuple[str, str]] = []
+    for w in warnings:
+        m = _DATED.match(w)
+        if not m:
+            order.append(("", w))
+            continue
+        kind = " ".join(re.sub(r"\d+", "#", m.group(2)).split()[:4])
+        if kind not in groups:
+            order.append((kind, ""))
+        groups.setdefault(kind, []).append(w)
+    out: list[str] = []
+    for kind, w in order:
+        if not kind:
+            out.append(w)
+            continue
+        items = groups[kind]
+        out.extend(items[:keep])
+        if len(items) > keep:
+            first_dates = [_DATED.match(x).group(1) for x in items[keep:]]  # type: ignore[union-attr]
+            out.append(f"... and {len(items) - keep} more warning(s) like '{kind}' ({first_dates[0]} to {first_dates[-1]})")
+    return out
+
+
 def _names(names: list[str], limit: int = 8) -> str:
     names = [str(n) for n in names]
     return ", ".join(names[:limit]) + (f", +{len(names) - limit} more" if len(names) > limit else "")
+
+
+def snapshot_only_features(features: set[str] | list[str]) -> dict[str, list[str]]:
+    """Feature -> the snapshot datasets (estimates / short interest / options) it needs, for the
+    features that have NO point-in-time history on a provider whose snapshots are current-only.
+
+    ``days_since_last_earnings`` is left out: it reads the estimates dataset, but its input (the last
+    earnings date) comes from dated filings and falls back to the fundamentals' report date.
+    """
+    out: dict[str, list[str]] = {}
+    for f in sorted(set(features)):
+        if f in _POINT_IN_TIME_DESPITE_SNAPSHOT:
+            continue
+        ds = [d for d in _SNAPSHOT_DATASETS if d in FEATURE_DATASETS.get(f, ())]
+        if ds:
+            out[f] = ds
+    return out
+
+
+def _sha(payload: Any) -> str:
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _rank_pct(x: pd.Series) -> pd.Series:
@@ -271,6 +384,7 @@ class RunDetails:
     simulation: SimulationResult | None = None
     daily_returns: pd.Series | None = None
     factor_returns: pd.DataFrame | None = None
+    universe: list[str] = field(default_factory=list)  # the tickers the run used (part of the run id)
 
 
 @dataclass
@@ -296,19 +410,62 @@ class _Context:
     wrapped: PreloadedProvider
     engine: FeatureEngine
     needed: set[str]
-    mcap_point_in_time: bool
+    mcap_mode: str  # "snapshot" | "anchored" | "end_scaled" (see StrategyRunner._mcap_mode)
     universe_spec: Any
+    mcap_needed: bool = True  # False: no feature / weighting uses market cap, so none is computed
+    prices_as_traded: bool = True  # False: adjusted prices (price floors suspended at past dates)
+    price_floor_from: date | None = None  # dates on or after it apply the price floor on adjusted prices
     warnings: list[str] = field(default_factory=list)
     benchmark: pd.Series | None = None
     benchmark_label: str = ""
     data_start: date | None = None
+    eligible_counts: list[int] = field(default_factory=list)
+    floor_suspended: list[pd.Timestamp] = field(default_factory=list)
+    ts_unavailable: dict[str, list[pd.Timestamp]] = field(default_factory=dict)
+    mcap_fallback: list[str] = field(default_factory=list)  # snapshot dates estimated from the END cap
     _mcap_cache: dict = field(default_factory=dict)
+    _mcap_snapshots: dict = field(default_factory=dict)
+    _mcap_anchors: pd.DatetimeIndex | None = None
     _close_ffill: pd.DataFrame | None = None
+    _last_valid_pos: np.ndarray | None = None
     _mcap_scale: pd.Series | None = None
+    _sessions: pd.DatetimeIndex | None = None
+    _formations: dict = field(default_factory=dict)
 
     @property
     def close(self) -> pd.DataFrame:
         return self.prices.close
+
+    @property
+    def sessions(self) -> pd.DatetimeIndex:
+        """Dates with at least one valid close (the trading sessions in the loaded data)."""
+        if self._sessions is None:
+            self._sessions = self.close.index[self.close.notna().any(axis=1).to_numpy()]
+        return self._sessions
+
+    def close_ffill(self) -> pd.DataFrame:
+        """Closes of the universe forward-filled (row lookups only ever read rows up to the date)."""
+        if self._close_ffill is None:
+            self._close_ffill = self.close.reindex(columns=self.universe.index).ffill()
+        return self._close_ffill
+
+    def fresh(self, t: pd.Timestamp) -> pd.Series:
+        """True for names with a valid close within ``_MCAP_STALE_DAYS`` calendar days on or before ``t``."""
+        cols = self.universe.index
+        idx = self.close.index
+        if self._last_valid_pos is None:
+            valid = self.close.reindex(columns=cols).notna().to_numpy()
+            pos = np.where(valid, np.arange(len(idx))[:, None], -1)
+            self._last_valid_pos = np.maximum.accumulate(pos, axis=0) if len(idx) else pos
+        ts = pd.Timestamp(t)
+        p = int(idx.searchsorted(ts, side="right")) - 1
+        if p < 0:
+            return pd.Series(False, index=cols)
+        lp = self._last_valid_pos[p]
+        ok = lp >= 0
+        age = np.full(len(lp), np.inf)
+        age[ok] = (ts.to_datetime64() - idx.to_numpy()[lp[ok]]) / np.timedelta64(1, "D")
+        return pd.Series(ok & (age <= _MCAP_STALE_DAYS), index=cols)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -466,11 +623,36 @@ class StrategyRunner:
                 needed.add("gics_sector")
         return {f for f in needed if f in self.catalog}
 
-    def _mcap_mode(self) -> bool:
+    def _mcap_mode(self) -> str:
+        """How market caps at past dates are obtained (module docstring, "Market cap").
+
+        * ``snapshot`` - ``provider.get_universe(spec, t)`` at every date: providers declaring
+          ``point_in_time_market_cap = True`` and the (cheap, offline) synthetic provider.
+        * ``anchored`` - the default: ``get_universe(spec, a)`` (point-in-time by the provider
+          contract) only at the last session of each June and December ``a``, rolled forward to
+          ``t`` with the adjusted-price ratio P(t) / P(a) (about two snapshot calls a year).
+        * ``end_scaled`` - providers declaring ``point_in_time_market_cap = False`` (their snapshots
+          at past dates are not point-in-time): END cap x P(t) / P(end), reported as NOT
+          point-in-time in ``data_usage`` and the warnings.
+        """
         flag = getattr(self.provider, "point_in_time_market_cap", None)
+        if flag is None:
+            return "snapshot" if self.provider_name == "synthetic" else "anchored"
+        return "snapshot" if bool(flag) else "end_scaled"
+
+    def _prices_as_traded(self) -> bool:
+        """True when the provider's closes are the prices the stocks traded at (no later split /
+        dividend restatement): providers declaring ``prices_as_traded = True`` and the synthetic
+        market (no corporate actions). Every other provider serves adjusted prices (the
+        ``PricePanel`` contract)."""
+        flag = getattr(self.provider, "prices_as_traded", None)
         if flag is not None:
             return bool(flag)
         return self.provider_name == "synthetic"
+
+    @staticmethod
+    def _needs_mcap(spec: StrategySpec, needed: set[str]) -> bool:
+        return spec.kind == "factor_model" or bool(set(needed) & MARKET_CAP_FEATURES)
 
     def _time_series_universe(self, spec: StrategySpec, end: date) -> pd.DataFrame:
         assets = list(dict.fromkeys(str(a) for a in spec.time_series.assets))  # type: ignore[union-attr]
@@ -510,7 +692,8 @@ class StrategyRunner:
         close = prices.close
         valid = close.notna().any(axis=1)
         if not valid.any():
-            raise ValueError(f"no price data for {len(tickers)} ticker(s) between {preload_start} and {end}")
+            raise ValueError(f"provider '{self.provider_name}' has no price data for {len(tickers)} ticker(s) "
+                             f"({_names(tickers)}) between {preload_start} and {end}")
         last_px = pd.Timestamp(close.index[valid.to_numpy()][-1]).date()
         first_px = pd.Timestamp(close.index[valid.to_numpy()][0]).date()
         if last_px < end:
@@ -521,10 +704,13 @@ class StrategyRunner:
                 f"features have enough history after {first_px}"
             )
         wrapped = PreloadedProvider(self.provider, prices, window=(preload_start, end), memo=self._memo)
+        needed = self._needed_features(spec)
         ctx = _Context(
             spec=spec, start=start, end=end, preload_start=preload_start, universe=universe, tickers=tickers, prices=prices,
-            wrapped=wrapped, engine=FeatureEngine(wrapped, self.catalog), needed=self._needed_features(spec),
-            mcap_point_in_time=self._mcap_mode(), universe_spec=universe_spec, warnings=warnings, data_start=first_px,
+            wrapped=wrapped, engine=FeatureEngine(wrapped, self.catalog), needed=needed,
+            mcap_mode=self._mcap_mode(), universe_spec=universe_spec, mcap_needed=self._needs_mcap(spec, needed),
+            prices_as_traded=self._prices_as_traded(), price_floor_from=self._latest_data_date(),
+            warnings=warnings, data_start=first_px,
         )
         if with_benchmark:
             ctx.benchmark, ctx.benchmark_label = self._benchmark(spec, ctx)
@@ -535,11 +721,14 @@ class StrategyRunner:
         symbols.append(None)
         for sym in symbols:
             try:
-                ser = ctx.wrapped.get_benchmark_history(ctx.preload_start, ctx.end, sym)
-                ser = pd.Series(ser, dtype=float).dropna()
+                raw = ctx.wrapped.get_benchmark_history(ctx.preload_start, ctx.end, sym)
+                ser = pd.Series(raw, dtype=float).dropna()
                 ser = ser[ser > 0]
                 if len(ser) >= 2:
-                    label = sym or str(getattr(self.provider, "benchmark", None) or "provider default index")
+                    series_name = getattr(raw, "name", None)
+                    label = sym or str(getattr(self.provider, "benchmark", None)
+                                       or (series_name if isinstance(series_name, str) and series_name else None)
+                                       or "provider default index")
                     if sym is None and spec.benchmark:
                         ctx.warnings.append(f"benchmark {spec.benchmark} unavailable; using the provider's default index ({label})")
                     return ser.sort_index(), label
@@ -550,50 +739,147 @@ class StrategyRunner:
         return None, ""
 
     # ------------------------------------------------------------------ point-in-time market cap
+    @staticmethod
+    def _close_row(ctx: _Context, t: pd.Timestamp) -> pd.Series:
+        """Forward-filled closes on the last session on or before ``t`` (NaN before the data)."""
+        ff = ctx.close_ffill()
+        pos = int(ff.index.searchsorted(pd.Timestamp(t), side="right")) - 1
+        return ff.iloc[pos] if pos >= 0 else pd.Series(np.nan, index=ff.columns)
+
+    def _month_end_sessions(self, ctx: _Context, months: tuple[int, ...] | None = None) -> pd.DatetimeIndex:
+        """Sessions in the loaded data that are the LAST trading session of their calendar month
+        (restricted to ``months`` when given). The last session of the data counts only when the
+        next business day falls in another month (the data may stop mid-month)."""
+        s = ctx.sessions
+        if not len(s):
+            return pd.DatetimeIndex([])
+        per = s.to_period("M")
+        last = pd.Series(s, index=s).groupby(per).max()
+        out = [d for d in pd.DatetimeIndex(last.to_numpy()) if months is None or d.month in months]
+        if out and out[-1] == s[-1] and (s[-1] + pd.offsets.BDay(1)).month == s[-1].month:
+            out = out[:-1]
+        return pd.DatetimeIndex(out)
+
+    def _is_month_end_session(self, ctx: _Context, d: pd.Timestamp) -> bool:
+        """True when ``d`` is the last trading session of its month: the next session in the data is
+        in a later month, or ``d`` ends the data and the next business day is in another month."""
+        s = ctx.sessions
+        d = pd.Timestamp(d)
+        later = s[s > d]
+        if len(later):
+            return later[0].to_period("M") != d.to_period("M")
+        return (d + pd.offsets.BDay(1)).month != d.month
+
+    def _snapshot_caps(self, ctx: _Context, a: pd.Timestamp) -> pd.Series:
+        """Market caps from the provider's universe snapshot as of ``a`` (point-in-time by the
+        provider contract), indexed like the universe. In ``anchored`` mode a failed or empty
+        snapshot falls back to the END-cap estimate for that date, with a NOT point-in-time warning."""
+        key = pd.Timestamp(a)
+        if key in ctx._mcap_snapshots:
+            return ctx._mcap_snapshots[key]
+        try:
+            snap = ctx.wrapped.get_universe(ctx.universe_spec, key.date())
+            if F.TICKER in snap.columns and snap.index.name != F.TICKER:
+                snap = snap.set_index(F.TICKER)
+            snap = snap[~snap.index.duplicated(keep="last")]
+            if F.MARKET_CAP in snap.columns:
+                out = pd.to_numeric(snap[F.MARKET_CAP], errors="coerce").astype(float)
+            else:
+                out = pd.Series(np.nan, index=snap.index, dtype=float)
+            out.index = pd.Index([str(i) for i in out.index])
+            out = out.reindex(ctx.universe.index)
+            if ctx.mcap_mode == "anchored" and not np.isfinite(out.to_numpy()).any() \
+                    and np.isfinite(self._mcap_end_scaled(ctx, key).to_numpy()).any():
+                raise ValueError("the snapshot has no market cap for any name")
+        except Exception as exc:  # noqa: BLE001 - anchored mode degrades to the END-cap estimate, flagged
+            if ctx.mcap_mode != "anchored":
+                raise
+            if not ctx.mcap_fallback:
+                ctx.warnings.append(
+                    f"market caps: provider '{self.provider_name}' gave no universe snapshot with market caps as of "
+                    f"{_fmt(key)} ({type(exc).__name__}: {str(exc)[:160]}); the end-date market cap x the adjusted-price "
+                    "ratio is used for the dates that depend on it, so share changes and dividends after those dates leak "
+                    "into them (not point-in-time)"
+                )
+            ctx.mcap_fallback.append(_fmt(key))
+            out = self._mcap_end_scaled(ctx, key)
+        ctx._mcap_snapshots[key] = out
+        return out
+
+    def _mcap_end_scaled(self, ctx: _Context, t: pd.Timestamp) -> pd.Series:
+        """END market cap x P_adj(t) / P_adj(end): the END share count and later dividends are used at
+        every earlier date (NOT point-in-time)."""
+        if ctx._mcap_scale is None:
+            ff = ctx.close_ffill()
+            last = ff.iloc[-1] if len(ff) else pd.Series(np.nan, index=ctx.universe.index)
+            cap_end = pd.to_numeric(ctx.universe[F.MARKET_CAP], errors="coerce").astype(float)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                ctx._mcap_scale = (cap_end / last.where(last > 0)).astype(float)
+        return (self._close_row(ctx, t) * ctx._mcap_scale).astype(float)
+
+    def _mcap_anchor(self, ctx: _Context, t: pd.Timestamp) -> pd.Timestamp:
+        """The snapshot date for ``t`` in anchored mode: the latest last-session-of-June/December on
+        or before ``t``, or ``t`` itself before the first one."""
+        if ctx._mcap_anchors is None:
+            ctx._mcap_anchors = self._month_end_sessions(ctx, MCAP_ANCHOR_MONTHS)
+        anchors = ctx._mcap_anchors
+        k = int(anchors.searchsorted(pd.Timestamp(t), side="right")) - 1
+        return anchors[k] if k >= 0 else pd.Timestamp(t)
+
     def _mcap_at(self, ctx: _Context, t: pd.Timestamp) -> pd.Series:
+        """Market cap of every universe name at ``t`` (NaN when unknown), per ``ctx.mcap_mode``."""
         key = pd.Timestamp(t)
         if key in ctx._mcap_cache:
             return ctx._mcap_cache[key]
         if F.MARKET_CAP not in ctx.universe.columns:
             out = pd.Series(np.nan, index=ctx.universe.index, dtype=float)
-        elif ctx.mcap_point_in_time:
-            snap = ctx.wrapped.get_universe(ctx.universe_spec, key.date())
-            if F.TICKER in snap.columns and snap.index.name != F.TICKER:
-                snap = snap.set_index(F.TICKER)
-            snap = snap[~snap.index.duplicated(keep="last")]
-            out = pd.to_numeric(snap[F.MARKET_CAP], errors="coerce").astype(float)
-            out.index = pd.Index([str(i) for i in out.index])
-            out = out.reindex(ctx.universe.index)
+        elif ctx.mcap_mode == "snapshot":
+            out = self._snapshot_caps(ctx, key)
         else:
-            if ctx._close_ffill is None:
-                ff = ctx.close.reindex(columns=ctx.universe.index).ffill()
-                ctx._close_ffill = ff
-                last = ff.iloc[-1] if len(ff) else pd.Series(np.nan, index=ctx.universe.index)
-                cap_end = pd.to_numeric(ctx.universe[F.MARKET_CAP], errors="coerce").astype(float)
+            if ctx.mcap_mode == "anchored":
+                a = self._mcap_anchor(ctx, key)
+                base = self._snapshot_caps(ctx, a)
+                p_a, p_t = self._close_row(ctx, a), self._close_row(ctx, key)
                 with np.errstate(invalid="ignore", divide="ignore"):
-                    ctx._mcap_scale = (cap_end / last.where(last > 0)).astype(float)
-            ff = ctx._close_ffill
-            pos = int(ff.index.searchsorted(key, side="right")) - 1
-            row = ff.iloc[pos] if pos >= 0 else pd.Series(np.nan, index=ff.columns)
-            out = (row * ctx._mcap_scale).astype(float)
+                    out = (base * (p_t / p_a.where(p_a > 0))).astype(float)
+            else:
+                out = self._mcap_end_scaled(ctx, key)
+            out = out.where(ctx.fresh(key).reindex(out.index, fill_value=False))
         out = out.where(np.isfinite(out.to_numpy()) & (out > 0))
         ctx._mcap_cache[key] = out
         return out
 
     def _universe_at(self, ctx: _Context, t: pd.Timestamp) -> pd.DataFrame:
         uni = ctx.universe.copy()
+        if not ctx.mcap_needed:
+            # nothing uses market cap: never let the END snapshot's caps stand in for a past date
+            uni[F.MARKET_CAP] = np.nan
+            return uni
         if ctx.spec.kind == "time_series" and not uni[F.MARKET_CAP].notna().any():
             return uni
         uni[F.MARKET_CAP] = self._mcap_at(ctx, t).reindex(uni.index).to_numpy()
         return uni
 
     # ------------------------------------------------------------------ per-date portfolio
+    def _universe_filters(self, ctx: _Context, t: pd.Timestamp) -> Any:
+        """``spec.universe`` as applied at ``t``. On adjusted prices the price floor is suspended at
+        dates before the latest data date: an adjusted close is restated for every later split and
+        dividend, so "adjusted close < min_price" says nothing about the price the stock traded at on
+        ``t`` and would exclude later winners because of splits that had not happened yet."""
+        u = ctx.spec.universe
+        if u.min_price is None or ctx.prices_as_traded:
+            return u
+        if ctx.price_floor_from is not None and pd.Timestamp(t).date() >= ctx.price_floor_from:
+            return u
+        ctx.floor_suspended.append(pd.Timestamp(t))
+        return u.model_copy(update={"min_price": None})
+
     def _cross_section(self, ctx: _Context, t: pd.Timestamp) -> _DateOutcome:
         spec = ctx.spec
         uni = self._universe_at(ctx, t)
         ff = ctx.engine.build(uni, t.date(), features=ctx.needed)
         frame = ff.frame
-        mask, _ = apply_universe(spec.universe, frame)
+        mask, _ = apply_universe(self._universe_filters(ctx, t), frame)
         px = pd.to_numeric(frame["price"], errors="coerce")
         mask &= px.notna() & (px > 0)
         for cond in spec.filters:
@@ -627,12 +913,12 @@ class StrategyRunner:
         return _DateOutcome(weights=weights.astype(float), signal=signal, formable=formable, coverage=dict(ff.coverage),
                             warnings=list(ff.warnings), n_universe=len(frame), n_eligible=int(mask.sum()))
 
-    def _time_series_flags(self, ctx: _Context, t: pd.Timestamp) -> tuple[dict[str, tuple[bool, bool, bool]], dict[str, float], list[str]]:
-        """Per asset: (entry holds, exit holds, entry inputs available) at ``t``."""
+    def _time_series_flags(self, ctx: _Context, t: pd.Timestamp) -> tuple[dict[str, tuple[bool, bool, bool, bool]], dict[str, float], list[str]]:
+        """Per asset: (entry holds, exit holds, entry inputs and price available, price available) at ``t``."""
         rule = ctx.spec.time_series
         assert rule is not None
         uni_all = self._universe_at(ctx, t)
-        out: dict[str, tuple[bool, bool, bool]] = {}
+        out: dict[str, tuple[bool, bool, bool, bool]] = {}
         cov: dict[str, list[float]] = {}
         warns: list[str] = []
         entry_feats = sorted({f for c in rule.entry for f in c.features()})
@@ -654,8 +940,8 @@ class StrategyRunner:
                 exit_ok = False
             has = bool(frame[entry_feats].notna().all(axis=1).iloc[0]) if entry_feats else True
             px = pd.to_numeric(frame["price"], errors="coerce").iloc[0] if "price" in frame else np.nan
-            has = has and bool(np.isfinite(px) and px > 0)
-            out[str(asset)] = (bool(entry.iloc[0]), exit_ok, has)
+            has_px = bool(np.isfinite(px) and px > 0)
+            out[str(asset)] = (bool(entry.iloc[0]), exit_ok, has and has_px, has_px)
         coverage = {k: float(np.mean(v)) for k, v in cov.items()}
         return out, coverage, warns
 
@@ -667,19 +953,28 @@ class StrategyRunner:
             return not exit_ok
         return entry_ok
 
-    def _ts_weights(self, ctx: _Context, state: dict[str, bool]) -> pd.Series:
+    def _ts_weights(self, ctx: _Context, state: dict[str, bool], available: dict[str, bool]) -> pd.Series:
+        """+1/n for long assets; -1/n for flat assets when ``when_flat='short'`` - only where the rule
+        could be evaluated at this date (``available``): missing data never opens a position."""
         rule = ctx.spec.time_series
         assert rule is not None
         n = len(ctx.universe.index)
         w = {}
         for asset in ctx.universe.index:
-            if state.get(str(asset), False):
-                w[str(asset)] = 1.0 / n
-            elif rule.when_flat == "short":
-                w[str(asset)] = -1.0 / n
+            a = str(asset)
+            if state.get(a, False):
+                w[a] = 1.0 / n
+            elif rule.when_flat == "short" and available.get(a, False):
+                w[a] = -1.0 / n
         return pd.Series(w, dtype=float, name="weight").sort_index()
 
     def _time_series_path(self, ctx: _Context, dates: list[pd.Timestamp]) -> tuple[dict[pd.Timestamp, pd.Series], list[bool], dict[str, list[float]], list[str]]:
+        """Replay the timing rule over ``dates``. An asset without a price at ``t`` (not listed yet,
+        halted, delisted) holds no position and its state resets to flat. An asset with a price but
+        without its entry inputs (e.g. the 200-day average during the first 200 sessions) cannot open
+        a position either way - neither long nor, with ``when_flat='short'``, short; a long position
+        already open under an exit rule keeps following that exit rule. Dates per asset without a
+        signal are kept in ``ctx.ts_unavailable`` (reported as a warning)."""
         rule = ctx.spec.time_series
         assert rule is not None
         has_exit = bool(rule.exit)
@@ -688,6 +983,7 @@ class StrategyRunner:
         formable: list[bool] = []
         cov: dict[str, list[float]] = {}
         warns: list[str] = []
+        ctx.ts_unavailable = {}
         for i, t in enumerate(dates):
             if i % 24 == 0:
                 self._say(f"{ctx.spec.name}: signal {i + 1}/{len(dates)} ({_fmt(t)})")
@@ -695,11 +991,36 @@ class StrategyRunner:
             warns.extend(w)
             for k, v in coverage.items():
                 cov.setdefault(k, []).append(v)
-            for asset, (entry_ok, exit_ok, _has) in flags.items():
-                state[asset] = self._ts_step(state[asset], entry_ok, exit_ok, has_exit)
-            formable.append(any(h for _, _, h in flags.values()))
-            targets[t] = self._ts_weights(ctx, state)
+            available: dict[str, bool] = {}
+            for asset, (entry_ok, exit_ok, has, has_px) in flags.items():
+                if not has_px:
+                    state[asset] = False
+                elif has or (state[asset] and has_exit):
+                    state[asset] = self._ts_step(state[asset], entry_ok, exit_ok, has_exit)
+                else:
+                    state[asset] = False
+                available[asset] = has
+                if not has:
+                    ctx.ts_unavailable.setdefault(asset, []).append(t)
+            formable.append(any(available.values()))
+            targets[t] = self._ts_weights(ctx, state, available)
         return targets, formable, cov, warns
+
+    def _ts_unavailable_warnings(self, ctx: _Context, dates: list[pd.Timestamp]) -> None:
+        rule = ctx.spec.time_series
+        if rule is None or not dates:
+            return
+        first = dates[0]
+        for asset, ds in sorted(ctx.ts_unavailable.items()):
+            ds = [d for d in ds if d >= first]
+            if not ds:
+                continue
+            side = "neither long nor short" if rule.when_flat == "short" else "flat"
+            ctx.warnings.append(
+                f"time-series rule: {asset} had no price or no data for its entry conditions at {len(ds)} of {len(dates)} "
+                f"rebalance date(s) ({_fmt(ds[0])} to {_fmt(ds[-1])}); the rule cannot be evaluated there, so no position "
+                f"is held in it ({side})"
+            )
 
     # ------------------------------------------------------------------ backtest
     def backtest(self, spec: StrategySpec, *, label: str | None = None) -> BacktestResult:
@@ -712,14 +1033,16 @@ class StrategyRunner:
         n_provider_warnings = len(getattr(self.provider, "warnings", []) or [])
         self._say(f"Backtesting '{spec.name}' ({spec.kind}) from {start} to {end}")
         ctx = self._context(spec, start, end, warnings)
-        survivorship = self._survivorship_warning(spec, ctx)
         rf_daily, rf_source = self._daily_rf(warnings)
         if spec.kind == "factor_model":
             result = self._factor_model_backtest(spec, ctx, rf_daily, rf_source, label, started)
         else:
             result = self._portfolio_backtest(spec, ctx, rf_daily, rf_source, label, started)
+        survivorship = self._survivorship_warning(spec, ctx, result.start)
+        mcap = self._mcap_warning(ctx)
         prov_w = list(getattr(self.provider, "warnings", []) or [])[n_provider_warnings:]
-        all_w = _dedupe(([survivorship] if survivorship else []) + ctx.warnings + [f"data: {w}" for w in prov_w])
+        all_w = _dedupe(([survivorship] if survivorship else []) + ([mcap] if mcap else []) + ctx.warnings
+                        + [f"provider {self.provider_name}: {w}" for w in prov_w])
         if len(all_w) > _MAX_WARNINGS:
             all_w = all_w[:_MAX_WARNINGS] + [f"... {len(all_w) - _MAX_WARNINGS} more warnings omitted"]
         result.warnings = all_w
@@ -727,30 +1050,84 @@ class StrategyRunner:
         self._say(f"Finished '{spec.name}': run {result.run_id}")
         return result
 
+    def _mcap_warning(self, ctx: _Context) -> str | None:
+        if ctx.mcap_mode != "end_scaled" or not ctx.mcap_needed or not ctx._mcap_cache:
+            return None
+        return (
+            f"MARKET CAPS NOT POINT-IN-TIME: provider '{self.provider_name}' declares no point-in-time market caps, so the "
+            f"market cap at each date before {ctx.end} is the end-date market cap x the adjusted-price ratio. Share counts "
+            f"known only on {ctx.end} (buybacks, issuance) and later dividends feed every earlier date: size, value weights "
+            "and valuation ratios (book-to-market, FCF / earnings yield, EV) carry look-ahead bias."
+        )
+
     def _spec_errors(self, spec: StrategySpec) -> list[str]:
         from aitrading.strategy.nl import spec_errors  # local import: nl imports the template library
 
         return spec_errors(spec, self.catalog)
 
-    def _survivorship_warning(self, spec: StrategySpec, ctx: _Context) -> str | None:
+    def _survivorship_warning(self, spec: StrategySpec, ctx: _Context, first: date) -> str | None:
         if spec.kind == "time_series" or bool(getattr(self.provider, "point_in_time_universe", False)):
             return None
         return (
             f"SURVIVORSHIP BIAS: the universe is the provider's constituents as of {ctx.end} ({len(ctx.tickers)} names) "
-            f"applied to every date back to {ctx.start}, not point-in-time membership. Companies that were delisted, "
+            f"applied to every date back to {first} instead of the index membership on each date. Companies that were delisted, "
             f"acquired or dropped before {ctx.end} are missing, which usually flatters backtested returns "
             "(point-in-time index membership needs institutional data)."
         )
 
-    def _run_id(self, spec: StrategySpec, start: date, end: date, label: str | None) -> str:
-        payload = json.dumps(
-            {"spec": spec.model_dump(mode="json"), "provider": self.provider_name, "start": start.isoformat(),
-             "end": end.isoformat(), "execution_lag": self.execution_lag},
-            sort_keys=True, separators=(",", ":"),
-        )
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:10]
+    def provider_fingerprint(self) -> dict[str, str]:
+        """What identifies the provider's data beyond its name: ``provider.fingerprint`` (a string or a
+        callable returning one) when the provider defines it, else its class and its configuration
+        attributes (``seed``, ``n_tickers``, ``start``, ``end``, ``benchmark``, and a hash of its
+        ``tickers`` list), so two differently configured providers never share a run id."""
+        p = self.provider
+        try:
+            fp = getattr(p, "fingerprint", None)
+            fp = fp() if callable(fp) else fp
+        except Exception:  # noqa: BLE001 - a broken fingerprint falls back to the attributes
+            fp = None
+        if fp is not None:
+            return {"fingerprint": str(fp)}
+        out = {"class": f"{type(p).__module__}.{type(p).__qualname__}"}
+        for attr in ("seed", "n_tickers", "start", "end", "benchmark"):
+            try:
+                v = getattr(p, attr, None)
+            except Exception:  # noqa: BLE001
+                v = None
+            if isinstance(v, (bool, int, float, str, date)):
+                out[attr] = str(v)
+        try:
+            tickers = getattr(p, "tickers", None)
+        except Exception:  # noqa: BLE001
+            tickers = None
+        if isinstance(tickers, (list, tuple)):
+            out["tickers"] = _sha(sorted(str(t) for t in tickers))[:16]
+        return out
+
+    def _run_id(self, spec: StrategySpec, start: date, end: date, label: str | None, *,
+                tickers: list[str] | tuple[str, ...] = ()) -> str:
+        """``<spec name>-<hash>[-<label>]``; the hash covers the spec, the provider (name and
+        :meth:`provider_fingerprint`), the universe (sorted ``tickers``), the window and the execution lag."""
+        digest = _sha({"spec": spec.model_dump(mode="json"), "provider": self.provider_name,
+                       "provider_config": self.provider_fingerprint(),
+                       "universe": _sha(sorted(str(t) for t in tickers))[:16],
+                       "start": start.isoformat(), "end": end.isoformat(), "execution_lag": self.execution_lag})[:10]
         rid = f"{_slug(spec.name)}-{digest}"
         return f"{rid}-{_slug(label, 32)}" if label else rid
+
+    def _price_floor_warning(self, ctx: _Context, dates: list[pd.Timestamp]) -> None:
+        kept = set(dates)
+        sus = sorted(t for t in set(ctx.floor_suspended) if t in kept)
+        if not sus:
+            return
+        floor = ctx.spec.universe.min_price
+        ctx.warnings.append(
+            f"price floor (universe min_price ${floor:g}) not applied at {len(sus)} rebalance date(s) ({_fmt(sus[0])} to "
+            f"{_fmt(sus[-1])}): provider '{self.provider_name}' serves split- and dividend-adjusted prices, so an adjusted "
+            f"close under ${floor:g} does not mean the stock traded under ${floor:g} then (later splits and dividends lower "
+            "earlier adjusted prices) and the floor would drop later winners using splits that had not happened yet. It "
+            f"applies from {ctx.price_floor_from} (current prices); the liquidity floor and every filter still apply."
+        )
 
     def _signal_dates(self, ctx: _Context) -> list[pd.Timestamp]:
         dates = rebalance_dates(ctx.close.index, ctx.spec.rebalance, ctx.start, ctx.end)
@@ -785,10 +1162,12 @@ class StrategyRunner:
         ctx.warnings.extend(engine_w)
         self._coverage_warnings(spec, ctx, cov)
 
-        # leading dates without enough history: the track record starts at the first portfolio
+        # leading dates without enough history: the track record starts at the first portfolio. Not when the
+        # gap comes from snapshot data without history (it would leave only the last dates: report cash instead)
+        snapshot_gap = not self._snapshots_point_in_time(ctx) and bool(snapshot_only_features(spec.features()))
         if any(formable):
             k = formable.index(True)
-            if k > 0:
+            if k > 0 and not snapshot_gap and len(dates) - k >= 2:
                 ctx.warnings.append(
                     f"no portfolio could be formed at the first {k} rebalance date(s) ({_fmt(dates[0])} to {_fmt(dates[k - 1])}): "
                     f"the features did not have enough history yet; the backtest starts on {_fmt(dates[k])}"
@@ -797,6 +1176,7 @@ class StrategyRunner:
                     targets.pop(t, None)
                     signals.pop(t, None)
                 dates = dates[k:]
+                n_eligible = n_eligible[k:]
         else:
             ctx.warnings.append(
                 "no portfolio could be formed at any rebalance date (no name had data for the signal / every filter); "
@@ -804,6 +1184,10 @@ class StrategyRunner:
             )
         if spec.kind == "screen" and targets and all(len(w) == 0 for w in targets.values()):
             ctx.warnings.append("no name passed the screen at any rebalance date: the strategy held cash throughout")
+        if spec.kind == "time_series":
+            self._ts_unavailable_warnings(ctx, dates)
+        self._price_floor_warning(ctx, dates)
+        ctx.eligible_counts = n_eligible
 
         self._say(f"{spec.name}: simulating {len(targets)} rebalance(s)")
         try:
@@ -812,7 +1196,7 @@ class StrategyRunner:
         except ValueError as exc:
             raise ValueError(f"'{spec.name}' cannot be simulated from {ctx.start} to {ctx.end} "
                              f"({len(targets)} rebalance date(s)): {exc}") from exc
-        ctx.warnings.extend(sim.warnings)
+        ctx.warnings.extend(_compress_dated(sim.warnings))
         long_short = spec.kind == "cross_sectional" and spec.portfolio.style == "long_short"
         strat = sim.daily_returns.rename("strategy")
         if not long_short:
@@ -849,10 +1233,10 @@ class StrategyRunner:
         run_start = dates[0].date() if dates else ctx.start
         data_usage = self._data_usage(spec, ctx, cov, rf_daily, rf_source, regression is not None)
         self.last_run = RunDetails(spec=spec, start=run_start, end=ctx.end, rebalance_dates=list(dates), target_weights=targets,
-                                   signals=signals, simulation=sim, daily_returns=strat)
+                                   signals=signals, simulation=sim, daily_returns=strat, universe=list(ctx.tickers))
         out_dates, returns = self._monthly_table(monthly)
         return BacktestResult(
-            run_id=self._run_id(spec, ctx.start, ctx.end, label),
+            run_id=self._run_id(spec, ctx.start, ctx.end, label, tickers=ctx.tickers),
             idea=spec.idea,
             spec=spec.model_dump(mode="json"),
             provider=self.provider_name,
@@ -875,11 +1259,14 @@ class StrategyRunner:
     # ------------------------------------------------------------------ pieces
     @staticmethod
     def _cash_credit(sim: SimulationResult, rf_daily: pd.Series | None, index: pd.DatetimeIndex) -> pd.Series:
-        """Daily risk-free interest on idle cash: (1 - sum of the executed weights, clipped to [0, 1]) x RF,
-        earned from the day after each execution (drift between executions ignored)."""
+        """Daily risk-free interest on cash: max(0, 1 - sum of the executed weights) x RF, earned from the
+        day after each execution (drift between executions ignored). A net-short book holds its capital
+        plus the short-sale proceeds in cash (e.g. 2 for a -1 short), which earn RF (full rebate), so a
+        short position's excess return is -(r - rf). Leverage (sum > 1) is not financed (it never arises:
+        long books sum to at most 1)."""
         if rf_daily is None or not len(index) or not sim.weights_history:
             return pd.Series(0.0, index=index)
-        cash = pd.Series({pd.Timestamp(d): float(np.clip(1.0 - float(w.sum()), 0.0, 1.0)) for d, w in sim.weights_history.items()})
+        cash = pd.Series({pd.Timestamp(d): max(0.0, 1.0 - float(w.sum())) for d, w in sim.weights_history.items()})
         cash = cash.sort_index().reindex(index.union(cash.index)).ffill().reindex(index).shift(1).fillna(0.0)
         rf = rf_daily.reindex(rf_daily.index.union(index)).ffill().reindex(index)
         if rf.isna().all():
@@ -988,10 +1375,11 @@ class StrategyRunner:
     def _coverage_warnings(self, spec: StrategySpec, ctx: _Context, cov: dict[str, list[float]]) -> None:
         used = sorted(f for f in spec.features() if f in self.catalog and self.catalog[f].dtype != "category")
         snapshot_pit = self._snapshots_point_in_time(ctx)
+        snap_only = snapshot_only_features(used)
         for f in used:
             vals = cov.get(f, [])
             mean = float(np.mean(vals)) if vals else 0.0
-            snap = sorted(d for d in _SNAPSHOT_DATASETS if d in FEATURE_DATASETS.get(f, ()))
+            snap = snap_only.get(f, [])
             if snap and not snapshot_pit:
                 ctx.warnings.append(
                     f"feature {f} has no point-in-time history in the free edition (the {'/'.join(snap)} data is a "
@@ -1002,6 +1390,35 @@ class StrategyRunner:
                 ctx.warnings.append(f"feature {f} had no data at any rebalance date; results exclude it")
             elif vals and mean < 0.5:
                 ctx.warnings.append(f"feature {f} covered only {mean * 100:.0f}% of the universe on average across rebalance dates")
+
+    def _mcap_usage(self, ctx: _Context) -> DataUsage | None:
+        """The ``market_cap`` provenance entry, when market caps fed the run (``point_in_time=False``
+        when any date used the END-cap estimate, which caps the interpreter's verdict)."""
+        if not ctx.mcap_needed or not ctx._mcap_cache:
+            return None
+        name = self.provider_name
+        n = len(ctx._mcap_snapshots)
+        if ctx.mcap_mode == "snapshot":
+            return DataUsage(dataset="market_cap", source=f"{name}: universe snapshot at each date",
+                             coverage=f"{len(ctx._mcap_cache)} date(s)", point_in_time=True,
+                             notes="market cap as of each date from the provider")
+        if ctx.mcap_mode == "end_scaled":
+            return DataUsage(dataset="market_cap", source=f"{name}: end-date market cap x adjusted-price ratio",
+                             coverage=f"{len(ctx._mcap_cache)} date(s)", point_in_time=False,
+                             notes=(f"the provider declares no point-in-time market caps: the share count of {ctx.end} and "
+                                    "later dividends are used at every earlier date (look-ahead in size, value weights and "
+                                    "valuation ratios)"))
+        fb = sorted(set(ctx.mcap_fallback))
+        notes = ("provider snapshots on the last session of each June and December (and on dates before the first one), "
+                 "rolled forward to each date with the adjusted-price ratio: share changes between snapshots are not "
+                 "reflected, dividends since the snapshot count as reinvested, and a name listed after a snapshot has no "
+                 "market cap until the next one")
+        if fb:
+            notes = (f"NOT point-in-time on {len(fb)} snapshot date(s) ({fb[0]} to {fb[-1]}): the provider gave no snapshot, "
+                     "so the end-date market cap x adjusted-price ratio was used; otherwise " + notes)
+        return DataUsage(dataset="market_cap", source=f"{name}: universe snapshots (point-in-time)",
+                         coverage=f"{n} snapshot date(s) for {len(ctx._mcap_cache)} date(s)", point_in_time=not fb,
+                         notes=notes)
 
     def _snapshots_point_in_time(self, ctx: _Context) -> bool:
         is_stale = getattr(self.provider, "is_stale", None)
@@ -1029,12 +1446,22 @@ class StrategyRunner:
         else:
             pit = bool(getattr(self.provider, "point_in_time_universe", False))
             notes = ("point-in-time membership" if pit else
-                     f"constituents as of {ctx.end} applied to every date (not point-in-time membership): survivorship bias")
-            notes += ("; market caps point-in-time" if ctx.mcap_point_in_time else
-                      "; market caps before the end date = end market cap x adjusted price ratio (share issuance, "
-                      "buybacks and dividends not reflected)")
-            out.append(DataUsage(dataset="universe", source=name, coverage=f"{len(ctx.tickers)} names as of {ctx.end}",
-                                 point_in_time=True, notes=notes))
+                     f"constituents as of {ctx.end} applied to every date (today's survivors): survivorship bias")
+            sus = sorted(set(ctx.floor_suspended))
+            if sus and spec.kind in ("cross_sectional", "screen"):
+                notes += (f"; the ${spec.universe.min_price:g} price floor is not applied before {ctx.price_floor_from} "
+                          "(adjusted prices are restated for later splits and dividends)")
+            coverage = f"{len(ctx.tickers)} names as of {ctx.end}"
+            if ctx.eligible_counts:
+                counts = np.asarray(ctx.eligible_counts)
+                coverage += (f"; eligible per rebalance after filters: median {int(np.median(counts))} "
+                             f"(min {int(counts.min())}, max {int(counts.max())})")
+            elif spec.kind == "factor_model":
+                coverage += " (no price / liquidity floors: every name with data enters the sorts)"
+            out.append(DataUsage(dataset="universe", source=name, coverage=coverage, point_in_time=True, notes=notes))
+        mcap_usage = self._mcap_usage(ctx)
+        if mcap_usage is not None:
+            out.append(mcap_usage)
         feats = set(spec.features())
         fund_feats = sorted(f for f in feats if "fundamentals" in FEATURE_DATASETS.get(f, ()))
         if fund_feats or factor_model_fund:
@@ -1045,20 +1472,28 @@ class StrategyRunner:
             out.append(DataUsage(dataset="fundamentals", source=src, coverage=cover, point_in_time=True,
                                  notes="latest filing public on each rebalance date"))
         snapshot_pit = self._snapshots_point_in_time(ctx)
+        snap_only = snapshot_only_features(feats)
         for ds in _SNAPSHOT_DATASETS:
             used = sorted(f for f in feats if ds in FEATURE_DATASETS.get(f, ()))
             if not used:
                 continue
             vals = [np.mean(cov[f]) for f in used if cov.get(f)]
             cover = f"{np.mean(vals) * 100:.0f}% average coverage of {', '.join(used)}" if vals else "none"
-            out.append(DataUsage(
-                dataset=ds, source=name, coverage=cover, point_in_time=snapshot_pit,
-                notes="" if snapshot_pit else "current snapshot only: no history in the free edition (NaN at historical dates)",
-            ))
+            current_only = [f for f in used if ds in snap_only.get(f, ())]
+            if snapshot_pit:
+                pit_ds, notes = True, ""
+            elif current_only:
+                pit_ds, notes = False, ("current snapshot only: no history in the free edition (NaN at historical dates) for "
+                                        + ", ".join(current_only))
+            else:
+                pit_ds, notes = True, (f"only {', '.join(used)}, which is point-in-time: dated earnings releases / filings "
+                                       "(the snapshot-only estimate fields are not used)")
+            out.append(DataUsage(dataset=ds, source=name, coverage=cover, point_in_time=pit_ds, notes=notes))
         if ctx.benchmark is not None:
-            b = ctx.benchmark
-            out.append(DataUsage(dataset="benchmark", source=f"{name}: {ctx.benchmark_label}",
-                                 coverage=f"{_fmt(b.index[0])} to {_fmt(b.index[-1])}", point_in_time=True))
+            b = ctx.benchmark[ctx.benchmark.index >= pd.Timestamp(ctx.start)]
+            if len(b):
+                out.append(DataUsage(dataset="benchmark", source=f"{name}: {ctx.benchmark_label}",
+                                     coverage=f"{_fmt(b.index[0])} to {_fmt(b.index[-1])}", point_in_time=True))
         model = spec.factor_model if spec.kind == "factor_model" else spec.attribution_model
         if model is not None:
             f, err = self._official(model, "monthly")
@@ -1084,7 +1519,7 @@ class StrategyRunner:
     # ------------------------------------------------------------------ factor models
     def _month_days(self, ctx: _Context, upto: pd.Timestamp | None = None) -> pd.DatetimeIndex:
         """Last trading day of each calendar month in the preloaded data (up to ``upto``)."""
-        idx = ctx.close.index[ctx.close.notna().any(axis=1).to_numpy()]
+        idx = ctx.sessions
         if upto is not None:
             idx = idx[idx <= upto]
         if not len(idx):
@@ -1110,6 +1545,68 @@ class StrategyRunner:
         return (pd.to_numeric(fr["operating_profitability_pct"], errors="coerce") / 100.0,
                 pd.to_numeric(fr["asset_growth_yoy_pct"], errors="coerce") / 100.0)
 
+    def _monthly_panel(self, ctx: _Context, days: pd.DatetimeIndex, labels: pd.DatetimeIndex,
+                       delisting_return: float) -> tuple[pd.DataFrame, pd.DataFrame, list[tuple[str, pd.Timestamp]]]:
+        """(month-end closes, monthly returns, names that stopped trading) on the calendar month-end labels.
+
+        A name that stopped trading has no later monthly price (its last close is not carried forward).
+        When ``delisting_return`` is not 0 it is booked on the name's first missing session, as
+        ``simulate`` does: compounded into that month's return, or as the next month's return when the
+        last close was the month's last session."""
+        raw = ctx.close.reindex(columns=ctx.tickers)
+        close_m = pd.DataFrame(raw.ffill().loc[days].to_numpy(), index=labels, columns=ctx.tickers)
+        last_valid = raw.apply(lambda s: s.last_valid_index())
+        sessions = ctx.sessions
+        data_last = sessions[-1] if len(sessions) else None
+        dead: list[tuple[str, pd.Timestamp]] = []
+        for tk, lv in last_valid.items():
+            if lv is None or pd.isna(lv):
+                close_m[tk] = np.nan
+                continue
+            lv = pd.Timestamp(lv)
+            close_m.loc[labels > (lv + pd.offsets.MonthEnd(0)), tk] = np.nan
+            if data_last is not None and lv < data_last:
+                dead.append((str(tk), lv))
+        returns = close_m / close_m.shift(1) - 1.0
+        if delisting_return != 0.0:
+            for tk, lv in dead:
+                nxt = sessions[int(sessions.searchsorted(lv, side="right"))]
+                lab_lv = (lv + pd.offsets.MonthEnd(0)).normalize()
+                lab_nx = (nxt + pd.offsets.MonthEnd(0)).normalize()
+                if lab_nx == lab_lv:
+                    if lab_lv in returns.index and np.isfinite(returns.at[lab_lv, tk]):
+                        returns.at[lab_lv, tk] = (1.0 + returns.at[lab_lv, tk]) * (1.0 + delisting_return) - 1.0
+                elif lab_nx in returns.index:
+                    returns.at[lab_nx, tk] = delisting_return
+        return close_m, returns, dead
+
+    def _factor_trades(self, ctx: _Context, months: pd.DatetimeIndex, labels: pd.DatetimeIndex,
+                       days: pd.DatetimeIndex, returns: pd.DataFrame) -> tuple[dict[pd.Timestamp, pd.Series], pd.Series]:
+        """Factor-mimicking weights at each month-end session from the one before ``months[0]`` to the one
+        before ``months[-1]``, and the traded notional sum |w_target - w_drifted| of the trade at the end
+        of each month, keyed by the NEXT month's label (the month whose return bears its cost). The book
+        is built from cash at the first trade; between trades weights drift with the monthly returns
+        (names without a return - stopped trading - leave the book without a trade)."""
+        pos = {lab: k for k, lab in enumerate(labels)}
+        k0, k1 = pos[months[0]] - 1, pos[months[-1]] - 1
+        weights: dict[pd.Timestamp, pd.Series] = {}
+        traded: dict[pd.Timestamp, float] = {}
+        prev = pd.Series(dtype=float)
+        for k in range(max(k0, 0), k1 + 1):
+            w = self._factor_weights_at(ctx, days[k])
+            weights[days[k]] = w
+            drift = pd.Series(dtype=float)
+            if len(prev):
+                r = returns.loc[labels[k]].reindex(prev.index)
+                ok = r.notna().to_numpy()
+                nav = 1.0 + float((prev[ok] * r[ok]).sum())
+                if nav > 0:
+                    drift = prev[ok] * (1.0 + r[ok]) / nav
+            t_al, d_al = w.align(drift, fill_value=0.0)
+            traded[labels[k + 1]] = float(np.abs(t_al.to_numpy() - d_al.to_numpy()).sum())
+            prev = w
+        return weights, pd.Series(traded, dtype=float)
+
     def _factor_model_backtest(self, spec: StrategySpec, ctx: _Context, rf_daily: pd.Series | None, rf_source: str,
                                label: str | None, started: datetime) -> BacktestResult:
         model = spec.factor_model
@@ -1118,16 +1615,7 @@ class StrategyRunner:
         if len(days) < 3:
             raise ValueError("factor models need at least three months of prices")
         labels = pd.DatetimeIndex([d + pd.offsets.MonthEnd(0) for d in days]).normalize()
-        close_m = pd.DataFrame(ctx.close.reindex(columns=ctx.tickers).ffill().loc[days].to_numpy(),
-                               index=labels, columns=ctx.tickers)
-        # a name that stopped trading has no later monthly price: do not carry its last close forward
-        last_valid = ctx.close.reindex(columns=ctx.tickers).apply(lambda s: s.last_valid_index())
-        for tk, lv in last_valid.items():
-            if lv is None or pd.isna(lv):
-                close_m[tk] = np.nan
-            else:
-                close_m.loc[labels > (pd.Timestamp(lv) + pd.offsets.MonthEnd(0)), tk] = np.nan
-        returns = close_m / close_m.shift(1) - 1.0
+        close_m, returns, dead = self._monthly_panel(ctx, days, labels, float(spec.delisting_return))
         self._say(f"{spec.name}: point-in-time market caps at {len(days)} month-ends")
         me = pd.DataFrame({lab: self._mcap_at(ctx, d) for lab, d in zip(labels, days)}).T.reindex(columns=ctx.tickers)
         me.index = labels
@@ -1161,10 +1649,41 @@ class StrategyRunner:
                      for lab in frame.index]
         fac = frame.loc[in_window, cols]
         fac = fac.loc[fac.notna().any(axis=1).cumsum() > 0]  # drop leading months before the first formation
+        # a last month the data does not cover to its end is not a monthly return: leave it out
+        last_session = ctx.sessions[-1] if len(ctx.sessions) else pd.Timestamp(ctx.end)
+        last_label = (last_session + pd.offsets.MonthEnd(0)).normalize()
+        if len(fac) and fac.index[-1] == last_label and last_session < last_label - pd.Timedelta(days=3):
+            fac = fac.iloc[:-1]
+            ctx.warnings.append(
+                f"the last month ({last_label:%Y-%m}) is incomplete (the data ends on {_fmt(last_session)}): it is left out "
+                "of the factor returns, the statistics and the attribution"
+            )
         if fac.empty or fac.notna().sum().max() < 2:
             raise ValueError(f"could not construct {model} factors in {ctx.start} to {ctx.end} (too little data)")
         nonmarket = [c for c in cols if c != "Mkt-RF"] or ["Mkt-RF"]
-        strategy = fac[nonmarket].mean(axis=1, skipna=False).rename("strategy")
+        gross = fac[nonmarket].mean(axis=1, skipna=False).rename("strategy")
+
+        # trading the headline portfolio: costs on the traded notional of the factor-mimicking weights
+        costs = pd.Series(0.0, index=gross.index)
+        turnover: pd.Series | None = None
+        trade_weights: dict[pd.Timestamp, pd.Series] = {}
+        first = gross.first_valid_index()
+        if first is not None:
+            self._say(f"{spec.name}: factor-mimicking portfolio turnover")
+            try:
+                trade_weights, traded = self._factor_trades(ctx, gross.index[gross.index >= first], labels, days, returns)
+                costs = (traded * float(spec.costs_bps) / 1e4).reindex(gross.index).fillna(0.0)
+                turnover = (traded / 2.0).reindex(gross.index).dropna()
+                cost_note = (f"net of {spec.costs_bps:g} bps one-way costs on the traded notional of the factor-mimicking "
+                             "portfolio (re-weighted at every month-end, re-formed each June"
+                             + ("; momentum re-formed monthly" if model == "carhart4" else "") + ")")
+            except Exception as exc:  # noqa: BLE001 - report gross returns rather than fail the run
+                cost_note = (f"GROSS of trading costs: the factor-mimicking turnover could not be computed "
+                             f"({type(exc).__name__}: {str(exc)[:160]})")
+        else:
+            cost_note = "gross of trading costs (no month with every factor)"
+        strategy = (gross - costs).rename("strategy")
+
         bench_m = None
         if ctx.benchmark is not None:
             b = ctx.benchmark
@@ -1173,12 +1692,13 @@ class StrategyRunner:
             bd = bd[(bd.index > first_lab - pd.offsets.MonthEnd(1)) & (bd.index <= pd.Timestamp(ctx.end))]
             if len(bd) >= 2:
                 bench_m = compound(bd, "M")
+                bench_m = bench_m[bench_m.index <= fac.index[-1]]
 
         stats: dict[str, PerformanceStats] = {}
         for c in cols:
             self._add_stats(stats, c, fac[c], None, None, None, ctx.warnings, periods_per_year=12.0)
-        self._add_stats(stats, "strategy", strategy, None, bench_m, None, ctx.warnings, periods_per_year=12.0)
-        if bench_m is not None:
+        self._add_stats(stats, "strategy", strategy, None, bench_m, turnover, ctx.warnings, periods_per_year=12.0)
+        if bench_m is not None and len(bench_m) >= 2:
             self._add_stats(stats, "benchmark", bench_m, rf_m if rf_m is not None else rf_daily, None, None, ctx.warnings,
                             periods_per_year=12.0)
         if official_m is not None:
@@ -1217,15 +1737,29 @@ class StrategyRunner:
         out_dates, returns_out = self._monthly_table(monthly)
         data_usage = self._data_usage(spec, ctx, {}, rf_daily, rf_source, regression is not None,
                                       factor_model_fund=model != "capm")
+        what = ("non-market factors (" + ", ".join(nonmarket) + ")" if nonmarket != ["Mkt-RF"] else "market factor (Mkt-RF)")
         ctx.warnings.append(
-            "factor model: 'strategy' is the equal-weighted average of the constructed "
-            + ("non-market factors (" + ", ".join(nonmarket) + ")" if nonmarket != ["Mkt-RF"] else "market factor (Mkt-RF)")
-            + "; the factors are value-weighted 2x3 sorts formed each June (momentum monthly)"
+            f"factor model: 'strategy' is the equal-weighted average of the constructed {what}, {cost_note}; the factor "
+            "series themselves are gross, like the official ones. The factors are value-weighted 2x3 sorts formed each June "
+            "(momentum monthly), formed and traded at the month-end close (the Fama-French convention: the "
+            f"{self.execution_lag}-session execution lag of the other strategy kinds is not applied)"
         )
-        self.last_run = RunDetails(spec=spec, start=fac.index[0].date(), end=ctx.end, rebalance_dates=list(days),
-                                   factor_returns=fac.assign(strategy=strategy))
+        in_window_dead = [(tk, lv) for tk, lv in dead if pd.Timestamp(ctx.start) <= lv]
+        if in_window_dead:
+            names = _names([f"{tk} ({_fmt(lv)})" for tk, lv in in_window_dead])
+            if spec.delisting_return != 0.0:
+                ctx.warnings.append(f"{len(in_window_dead)} name(s) stopped trading inside the window ({names}): a "
+                                    f"{spec.delisting_return * 100:+.1f}% delisting return is booked after the last price")
+            else:
+                ctx.warnings.append(f"{len(in_window_dead)} name(s) stopped trading inside the window ({names}): no delisting "
+                                    "return is booked after the last price (0%; optimistic if they were delisted for "
+                                    "performance reasons)")
+        details = fac.assign(strategy_gross=gross, costs=costs, strategy=strategy)
+        self.last_run = RunDetails(spec=spec, start=fac.index[0].date(), end=ctx.end,
+                                   rebalance_dates=sorted(trade_weights) if trade_weights else list(days),
+                                   target_weights=trade_weights, factor_returns=details, universe=list(ctx.tickers))
         return BacktestResult(
-            run_id=self._run_id(spec, ctx.start, ctx.end, label),
+            run_id=self._run_id(spec, ctx.start, ctx.end, label, tickers=ctx.tickers),
             idea=spec.idea,
             spec=spec.model_dump(mode="json"),
             provider=self.provider_name,
@@ -1245,8 +1779,39 @@ class StrategyRunner:
             started_at=started,
         )
 
+    def _june_sorts(self, ctx: _Context, j: pd.Timestamp) -> dict[str, pd.Series]:
+        """2x3 portfolio labels of the June formation at session ``j`` (B/M; ff5 also OP and INV),
+        exactly as ``construct_factors`` forms them: size = cap at ``j``, B/M = book equity public at
+        ``j`` / cap at the last December session before it. Cached per context."""
+        key = ("june", pd.Timestamp(j))
+        if key in ctx._formations:
+            return ctx._formations[key]
+        model = ctx.spec.factor_model
+        exchange = ctx.universe[F.EXCHANGE] if F.EXCHANGE in ctx.universe.columns else None
+        days = self._month_days(ctx, j)
+        size = self._mcap_at(ctx, j)
+        dec_days = [d for d in days if d.year == j.year - 1 and d.month == 12]
+        me_dec = self._mcap_at(ctx, dec_days[-1]) if dec_days else size
+        be = self._book_equity(ctx, j)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            bm = (be / me_dec).where((be > 0) & (me_dec > 0))
+        out = {"bm": two_by_three_sort(size, bm, exchange=exchange)[0].dropna()}
+        if model == "ff5":
+            op, inv = self._op_inv(ctx, j)
+            with np.errstate(invalid="ignore"):
+                op = op.where(be.reindex(op.index) > 0)
+            out["op"] = two_by_three_sort(size, op, exchange=exchange, labels=("W", "N", "R"))[0].dropna()
+            out["inv"] = two_by_three_sort(size, inv, exchange=exchange, labels=("C", "N", "A"))[0].dropna()
+        ctx._formations[key] = out
+        return out
+
     def _factor_weights_at(self, ctx: _Context, as_of: pd.Timestamp) -> pd.Series:
-        """Factor-mimicking weights of the factor model's headline portfolio at ``as_of`` (module docstring)."""
+        """Factor-mimicking weights of the factor model's headline portfolio at ``as_of`` (module docstring).
+
+        The annual sorts are the latest June formation whose session (the last trading session of June,
+        the date ``construct_factors`` forms on) is on or before ``as_of`` - on that session itself the
+        NEW formation is used. Within each 2x3 portfolio names are weighted by their market cap at the
+        last session on or before ``as_of``."""
         model = ctx.spec.factor_model
         assert model is not None
         days = self._month_days(ctx, as_of)
@@ -1254,8 +1819,10 @@ class StrategyRunner:
             return pd.Series(dtype=float)
         now = days[-1]  # last session on or before as_of
         cap_now = self._mcap_at(ctx, now)
-        alive = ctx.close.reindex(columns=ctx.tickers).loc[:now].iloc[-1]
-        cap_now = cap_now.where(alive.notna() & (alive > 0))
+        pos = int(ctx.close.index.searchsorted(now, side="right")) - 1
+        alive = pd.to_numeric(ctx.close.iloc[pos].reindex(ctx.tickers), errors="coerce") if pos >= 0 \
+            else pd.Series(np.nan, index=ctx.tickers)
+        cap_now = cap_now.where(alive.reindex(cap_now.index).notna() & (alive.reindex(cap_now.index) > 0))
         exchange = ctx.universe[F.EXCHANGE] if F.EXCHANGE in ctx.universe.columns else None
 
         def vw(names: list[str]) -> pd.Series:
@@ -1278,27 +1845,15 @@ class StrategyRunner:
             w = vw(list(cap_now.dropna().index))
             return w[w != 0].sort_index()
         factors: list[pd.Series] = []
-        june_days = [d for d in days if d.month == 6 and pd.Timestamp(d.year, 6, 30) <= as_of]
+        june_days = [d for d in days if d.month == 6 and self._is_month_end_session(ctx, d)]
         if june_days:
-            j = june_days[-1]
-            size = self._mcap_at(ctx, j)
-            dec_days = [d for d in days if d.year == j.year - 1 and d.month == 12]
-            me_dec = self._mcap_at(ctx, dec_days[-1]) if dec_days else size
-            be = self._book_equity(ctx, j)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                bm = (be / me_dec).where((be > 0) & (me_dec > 0))
-            lbl, _ = two_by_three_sort(size, bm, exchange=exchange)
-            p = ports(lbl.dropna(), ("L", "M", "H"))
+            sorts = self._june_sorts(ctx, june_days[-1])
+            p = ports(sorts["bm"], ("L", "M", "H"))
             smb_bm = combo([(1 / 3, p["S/L"]), (1 / 3, p["S/M"]), (1 / 3, p["S/H"]),
                             (-1 / 3, p["B/L"]), (-1 / 3, p["B/M"]), (-1 / 3, p["B/H"])])
             hml = combo([(0.5, p["S/H"]), (0.5, p["B/H"]), (-0.5, p["S/L"]), (-0.5, p["B/L"])])
             if model == "ff5":
-                op, inv = self._op_inv(ctx, j)
-                with np.errstate(invalid="ignore"):
-                    op = op.where(be.reindex(op.index) > 0)
-                lo, _ = two_by_three_sort(size, op, exchange=exchange, labels=("W", "N", "R"))
-                li, _ = two_by_three_sort(size, inv, exchange=exchange, labels=("C", "N", "A"))
-                po, pi = ports(lo.dropna(), ("W", "N", "R")), ports(li.dropna(), ("C", "N", "A"))
+                po, pi = ports(sorts["op"], ("W", "N", "R")), ports(sorts["inv"], ("C", "N", "A"))
                 smb_op = combo([(1 / 3, po[k]) for k in ("S/W", "S/N", "S/R")] + [(-1 / 3, po[k]) for k in ("B/W", "B/N", "B/R")])
                 smb_inv = combo([(1 / 3, pi[k]) for k in ("S/C", "S/N", "S/A")] + [(-1 / 3, pi[k]) for k in ("B/C", "B/N", "B/A")])
                 if smb_bm is not None and smb_op is not None and smb_inv is not None:
@@ -1311,9 +1866,10 @@ class StrategyRunner:
             else:
                 factors.extend(f for f in (smb_bm, hml) if f is not None)
         if model == "carhart4" and len(days) >= 13:
-            px = ctx.close.reindex(columns=ctx.tickers).ffill()
+            px = ctx.close_ffill()
             p1, p12 = px.loc[days[-2]], px.loc[days[-13]]
-            mom = (p1 / p12 - 1.0).where((p1 > 0) & (p12 > 0))
+            with np.errstate(invalid="ignore", divide="ignore"):
+                mom = (p1 / p12 - 1.0).where((p1 > 0) & (p12 > 0))
             lm, _ = two_by_three_sort(cap_now, mom, exchange=exchange, labels=("Down", "Mid", "Up"))
             pm = ports(lm.dropna(), ("Down", "Mid", "Up"))
             f = combo([(0.5, pm["S/Up"]), (0.5, pm["B/Up"]), (-0.5, pm["S/Down"]), (-0.5, pm["B/Down"])])
