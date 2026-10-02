@@ -1323,6 +1323,12 @@ def test_websearch_ignores_urls_seen_only_in_code_execution_output():
     assert invented not in sources_offered
     assert canonical_url(invented) in src.last_trace.code_only_urls()
 
+    # code output alone verifies nothing: no structuring call, no documents
+    client = FakeAnthropic([_research(blocks[2:])], [_structure(items)])
+    src = make_source(client)
+    assert src.discover("sentiment") == [] and not any(r["method"] == "parse" for r in client.requests)
+    assert any("no search or fetch results" in w for w in src.warnings)
+
 
 def test_websearch_malformed_or_unconfirmed_model_output_does_not_abort_discovery():
     # regression: a model-written URL with a bad port raised ValueError out of canonical_url()

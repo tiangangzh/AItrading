@@ -9,9 +9,15 @@
   never leaves a half-written inbox; on Windows ``os.replace`` is retried briefly when another
   process has the file open.
 * Concurrency: every read-modify-write runs under an exclusive lock file (``ideas.json.lock``,
-  created with ``O_CREAT | O_EXCL``, works on Windows, macOS and Linux). A lock older than
-  ``stale_lock_s`` (left behind by a crashed process) is broken; a process only ever removes a
-  lock file carrying its own token. Reads need no lock because writes are atomic.
+  created with ``O_CREAT | O_EXCL``, works on Windows, macOS and Linux). While a process holds the
+  lock, a heartbeat thread refreshes the lock file's mtime, so a long ``locked()`` block is never
+  mistaken for a crashed one. A lock whose mtime is older than ``stale_lock_s`` (left behind by a
+  crashed process) is broken - under a short-lived breaker file (``ideas.json.lock.break``) and only
+  after re-checking that it is still the same stale lock, so two waiters can never both break it (and
+  one delete the other's fresh lock). A process only ever releases a lock file carrying its own token.
+  Reads need no lock because writes are atomic.
+* Encoding: the file is written as UTF-8 and read as UTF-8 with or without a BOM (Windows editors
+  add one when the file is edited by hand).
 """
 
 from __future__ import annotations
@@ -87,14 +93,31 @@ def _retry_os(fn: Callable[[], Any], attempts: int = 20, delay_s: float = 0.05) 
 
 
 class _LockFile:
-    """Exclusive inter-process lock using an ``O_EXCL`` lock file (portable, stdlib only)."""
+    """Exclusive inter-process lock using an ``O_EXCL`` lock file (portable, stdlib only).
+
+    * The holder refreshes the lock file's mtime from a heartbeat thread (every ``stale_after_s / 4``,
+      at most 30 s), so only a lock whose holder died goes stale.
+    * Breaking a stale lock is serialised by a breaker file created with ``O_EXCL``; inside it the
+      lock is re-read and removed only if it is still the very lock (same content, still stale) that
+      was judged stale. A waiter that judged an old lock stale can therefore never delete a fresh lock
+      another waiter created after breaking the old one.
+    """
+
+    BREAKER_STALE_S = 10.0  # a breaker file older than this was left by a process that crashed mid-break
 
     def __init__(self, path: Path, *, timeout_s: float, stale_after_s: float, poll_s: float = 0.02):
         self.path = path
+        self.breaker_path = path.with_name(path.name + ".break")
         self.timeout_s = timeout_s
         self.stale_after_s = stale_after_s
         self.poll_s = poll_s
         self._token = ""
+        self._stop_heartbeat: threading.Event | None = None
+        self._heartbeat: threading.Thread | None = None
+
+    @property
+    def heartbeat_interval_s(self) -> float:
+        return max(0.01, min(self.stale_after_s / 4.0, 30.0))
 
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +134,7 @@ class _LockFile:
                 self._token = f"pid={os.getpid()} token={uuid.uuid4().hex} acquired={time.time():.3f}"
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     fh.write(self._token + "\n")
+                self._start_heartbeat()
                 return
             if time.monotonic() >= deadline:
                 raise InboxLockTimeout(
@@ -119,26 +143,90 @@ class _LockFile:
                 )
             time.sleep(self.poll_s)
 
-    def _break_if_stale(self) -> bool:
+    def _read(self) -> tuple[str, float] | None:
+        """(content, mtime) of the lock file, or None when it does not exist."""
         try:
-            age = time.time() - os.path.getmtime(self.path)
+            mtime = os.path.getmtime(self.path)
+            content = self.path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
+            return None
+        except OSError:  # unreadable (Windows sharing violation): treat as held and fresh
+            return ("<unreadable>", time.time())
+        return content, mtime
+
+    def _break_if_stale(self) -> bool:
+        """Remove the lock if its holder is gone. Returns True when the caller should retry at once."""
+        seen = self._read()
+        if seen is None:
             return True  # released between our attempts: retry immediately
+        if time.time() - seen[1] <= self.stale_after_s:
+            return False
+        try:
+            gfd = os.open(str(self.breaker_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            self._remove_stale_breaker()
+            return False  # another process is breaking it right now
         except OSError:
             return False
-        if age <= self.stale_after_s:
-            return False
-        log.warning("breaking stale inbox lock %s (age %.0fs)", self.path, age)
+        os.close(gfd)
         try:
-            os.unlink(self.path)
-        except FileNotFoundError:
+            now = self._read()  # re-check inside the breaker: is it still the same stale lock?
+            if now is None:
+                return True
+            if now[0] != seen[0] or time.time() - now[1] <= self.stale_after_s:
+                return False  # a live process re-took (or refreshed) the lock meanwhile
+            log.warning("breaking stale inbox lock %s (age %.0fs, %s)", self.path, time.time() - now[1], now[0] or "no owner info")
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+            except PermissionError:
+                return False
+            return True
+        finally:
+            try:
+                os.unlink(self.breaker_path)
+            except OSError:  # pragma: no cover - left for _remove_stale_breaker
+                pass
+
+    def _remove_stale_breaker(self) -> None:
+        try:
+            if time.time() - os.path.getmtime(self.breaker_path) > self.BREAKER_STALE_S:
+                os.unlink(self.breaker_path)
+                log.warning("removed stale inbox lock breaker %s", self.breaker_path)
+        except OSError:
             pass
-        except PermissionError:
-            return False
-        return True
+
+    # ---------------------------------------------------------------- heartbeat
+    def _start_heartbeat(self) -> None:
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=self._beat, args=(stop, self._token, self.heartbeat_interval_s), name="aitrading-inbox-lock-heartbeat", daemon=True
+        )
+        self._stop_heartbeat, self._heartbeat = stop, thread
+        thread.start()
+
+    def _beat(self, stop: threading.Event, token: str, interval: float) -> None:
+        while not stop.wait(interval):
+            try:
+                if self.path.read_text(encoding="utf-8").strip() != token:
+                    return  # no longer ours
+                os.utime(self.path, None)
+            except FileNotFoundError:
+                return
+            except OSError:
+                continue
+
+    def _stop_beating(self) -> None:
+        if self._stop_heartbeat is not None:
+            self._stop_heartbeat.set()
+        if self._heartbeat is not None and self._heartbeat is not threading.current_thread():
+            self._heartbeat.join(timeout=5.0)
+        self._stop_heartbeat = self._heartbeat = None
 
     def release(self) -> None:
         """Remove the lock file - only if it is still ours (it may have been broken as stale and re-taken)."""
+        self._stop_beating()
         try:
             owner = self.path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
@@ -202,7 +290,7 @@ class IdeaInbox:
     def _load(self, *, for_write: bool = False) -> dict[str, Any]:
         state: dict[str, Any] = {"ideas": [], "pruned": [], "quarantined": []}
         try:
-            raw = _retry_os(lambda: self.path.read_text(encoding="utf-8"))
+            raw = _retry_os(lambda: self.path.read_text(encoding="utf-8-sig"))  # accepts a BOM from hand edits
         except FileNotFoundError:
             return state
         if not raw.strip():
@@ -304,7 +392,8 @@ class IdeaInbox:
         """Add new candidates; returns those actually added (with novelty and score set).
 
         Duplicates of existing inbox items, of earlier items in the same batch and of pruned ideas are
-        skipped.
+        skipped. A candidate whose duplicate / novelty / score check raises is logged and skipped; the
+        rest of the batch is still stored.
         """
         incoming = list(candidates)
         if not incoming:
@@ -314,13 +403,18 @@ class IdeaInbox:
         with self._mutate() as state:
             ideas: list[IdeaCandidate] = state["ideas"]
             for cand in incoming:
-                if self._is_pruned(cand, state["pruned"]):
+                try:  # one malformed candidate (e.g. an unparsable URL from a search result) must not sink the batch
+                    if self._is_pruned(cand, state["pruned"]):
+                        continue
+                    novelty = assess_novelty(cand, ideas, templates)
+                    if novelty == "duplicate":
+                        continue
+                    c = cand.model_copy(update={"novelty": novelty})
+                    c = c.model_copy(update={"score": score_candidate(c, today=self._clock().date())})
+                except Exception as e:  # noqa: BLE001 - logged and skipped; the rest of the batch is stored
+                    log.warning("skipping idea %s (%s): could not check it against the inbox: %s: %s",
+                                getattr(cand, "idea_id", "?"), getattr(getattr(cand, "source", None), "url", "?"), type(e).__name__, e)
                     continue
-                novelty = assess_novelty(cand, ideas, templates)
-                if novelty == "duplicate":
-                    continue
-                c = cand.model_copy(update={"novelty": novelty})
-                c = c.model_copy(update={"score": score_candidate(c, today=self._clock().date())})
                 ideas.append(c)
                 added.append(c)
         return added

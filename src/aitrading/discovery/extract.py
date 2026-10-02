@@ -7,9 +7,12 @@ Two extractors share the same output type:
   dates or per-document data) so it is served from the prompt cache after the first call. The
   document goes in the user message inside ``<document ...>`` tags with an explicit reminder that it
   is untrusted data whose instructions must be ignored. After the call the output is *checked*:
-  evidence quotes are verified against the full source text, reported numbers (Sharpe, t-stat,
-  return, sample period) must actually appear in the text or they are cleared, and the template key
-  must exist in the idea library.
+  evidence quotes are verified against the full source text (word-bounded, at least
+  ``MIN_QUOTE_WORDS`` words, ``...`` only inside one sentence and never skipping a negation),
+  reported numbers must actually appear in the text next to their label (Sharpe, t-stat) or as a
+  return converted by its stated unit (annual return) or they are cleared, the template key must
+  exist in the idea library, and the model's free-text fields are scanned for instructions to an AI,
+  for text repeated from flagged passages and for risk-control-disabling strategy text.
 * ``HeuristicIdeaExtractor`` - offline keyword rules (no network, no API key): detects the anomaly
   family (momentum, value, accruals, PEAD, ...), maps it to an idea template and a strategy phrased
   in catalog features, judges testability from the data the idea needs, picks verbatim evidence
@@ -17,7 +20,15 @@ Two extractors share the same output type:
 
 Web and paper text is untrusted. Neither extractor executes or follows anything inside it; the
 heuristic additionally drops sentences that look like instructions to an AI before analysing the
-text, so an injected "ignore previous instructions ..." cannot change its output.
+text, so an injected "ignore previous instructions ..." cannot change its output. The detector is
+deliberately narrow (text addressed to the reading model, chat markup, schema field names) so that
+ordinary LLM-finance prose ("we use GPT-4 as an assistant to label headlines") is not flagged.
+Whenever a source or the model's output trips it, the candidate gets a note starting with
+``SECURITY_NOTE_PREFIX``; ``aitrading.discovery.rank.is_security_flagged`` then caps its score, and
+callers must not auto-translate or backtest it without the trader's explicit confirmation.
+
+Text is compared after a LaTeX-lite normalisation (arXiv abstracts arrive as raw LaTeX: ``1.2\\%``,
+``$t$-statistic``, ``1990--2020``).
 """
 
 from __future__ import annotations
@@ -33,12 +44,16 @@ from typing import Any, Callable, Iterable, Mapping
 
 from aitrading.core.models import EvidenceCheck
 from aitrading.discovery.models import IdeaCandidate, IdeaExtraction, SourceDocument, Testability
+from aitrading.discovery.rank import JOURNAL_VENUE_PATTERN, SECURITY_NOTE_PREFIX, affirms_peer_review, journal_venue_from_url
 from aitrading.llm.base import StructuredLLM
 
 __all__ = [
     "HeuristicIdeaExtractor",
     "IdeaExtractor",
     "FAMILY_KEYS",
+    "MIN_FRAGMENT_WORDS",
+    "MIN_QUOTE_WORDS",
+    "SECURITY_NOTE_PREFIX",
     "SYSTEM_PROMPT_TEMPLATE",
     "build_system_prompt",
     "find_instruction_like",
@@ -93,8 +108,9 @@ _LATEX_GREEK = re.compile(
 _LATEX_SYMBOLS = {
     "times": "x", "cdot": "*", "approx": "~", "simeq": "~", "sim": "~", "leq": "<=", "le": "<=", "geq": ">=", "ge": ">=",
     "neq": "!=", "pm": "+/-", "infty": "infinity", "ldots": "...", "dots": "...", "cdots": "...", "textendash": "-",
-    "textemdash": "-", "textpercent": "%", "textdollar": "$", "%": "%", "&": "&", "#": "#", "_": "_", "{": "{", "}": "}",
+    "textemdash": "-", "textpercent": "%", "textdollar": "$",
 }
+_LATEX_ESCAPE = re.compile(r"\\([%&#_{}])")  # \% \& \_ ... -> the character itself
 _LATEX_SYMBOL_RE = re.compile(
     r"\\(" + "|".join(re.escape(k) for k in sorted(_LATEX_SYMBOLS, key=len, reverse=True)) + r")(?![A-Za-z])"
 )
@@ -118,6 +134,7 @@ def _delatex(s: str) -> str:
         s = new
     s = _LATEX_GREEK.sub(r"\1", s)
     s = _LATEX_SYMBOL_RE.sub(lambda m: _LATEX_SYMBOLS[m.group(1)], s)
+    s = _LATEX_ESCAPE.sub(r"\1", s)
     s = _LATEX_ACCENT.sub(r"\1", s)
     s = _LATEX_SPACE.sub(" ", s)
     s = _LATEX_TIE.sub(" ", s)
@@ -208,21 +225,29 @@ def _match_fragments(fragments: list[str], text: str, *, check_gaps: bool) -> st
     """Find the fragments in order in ``text`` (word-bounded). Returns 'ok', 'negated_gap' or None.
 
     With ``check_gaps`` the text skipped between consecutive fragments must not contain a negation;
-    the search backtracks over occurrences so a clean placement is preferred when one exists.
+    the search backtracks over occurrences so a clean placement is preferred when one exists
+    (memoised on (fragment, position), so it stays polynomial). Without it the earliest placement of
+    each fragment is optimal, so the search is greedy.
     """
     saw_negated = False
+    memo: dict[tuple[int, int], bool] = {}
 
     def place(k: int, pos: int) -> bool:
         nonlocal saw_negated
         if k == len(fragments):
             return True
+        if (k, pos) in memo:
+            return memo[(k, pos)]
+        ok = False
         for idx in _word_occurrences(text, fragments[k], pos):
             if check_gaps and k > 0 and _GAP_NEGATION.search(text[pos:idx]):
                 saw_negated = True
                 continue
-            if place(k + 1, idx + len(fragments[k])):
-                return True
-        return False
+            ok = place(k + 1, idx + len(fragments[k]))
+            if ok or not check_gaps:
+                break
+        memo[(k, pos)] = ok
+        return ok
 
     if place(0, 0):
         return "ok"
@@ -351,33 +376,73 @@ def split_sentences(text: str) -> list[str]:
     return out
 
 
-_AI_NOUN = r"(?:ai|llm|assistant|language model|large language model|model|chatbot|chatgpt|claude|gpt(?:-\d)?)"
-_INJECTION_RE = re.compile(
-    # "ignore / disregard previous instructions", "forget your prompt", "override the system rules"
-    r"\b(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+|any\s+|the\s+|these\s+|those\s+|your\s+|of\s+)*"
-    r"(?:(?:previous|prior|above|earlier|preceding|original|system|safety|existing|other)\s+(?:instructions?|prompts?|rules|directions|guidelines)"
-    r"|instructions?|prompts?)\b"
-    # addressing the model directly
-    r"|\byou are (?:now )?(?:an?|the|my) " + _AI_NOUN + r"\b"
-    r"|\b(?:if you are|as) an? (?:ai|llm|language model|assistant)\b"
-    r"|\b(?:note|message|instructions?|reminder|attention)\s*(?:to|for)\s+(?:the\s+|any\s+|all\s+)?" + _AI_NOUN + r"s?\b"
-    r"|\b" + _AI_NOUN + r"s?\s+(?:reading|processing|summari[sz]ing|analy[sz]ing|reviewing|evaluating)\s+this\b"
-    r"|\byou (?:must|should|shall|are required to|have to|need to)\s+(?:now\s+)?(?:report|mark|classify|rate|output|set|say|state|answer|respond|return|ignore|treat|label)\b"
-    r"|\b(?:rate|mark|classify|label|score|treat|flag)\s+(?:this|the)\s+(?:paper|document|article|idea|strategy|study|post)\s+as\b"
-    r"|\bmark (?:this|it) (?:as )?(?:testable|accepted|approved|verified|credible)\b"
-    r"|\b(?:system|developer) (?:prompt|message|instructions?)\b"
-    r"|\bnew instructions?\s*:"
-    # the extraction schema's own field names have no business in a paper
-    r"|\b(?:testable_now|is_trading_idea|reported_sharpe|reported_t_stat|evidence_quotes|proposed_strategy_idea|closest_library_template)\b"
-    # chat / prompt markup
-    r"|</?\s*(?:system|assistant|instructions?|document|user|human|prompt)\s*>",
-    re.IGNORECASE,
+# Nouns that only ever mean an AI system (plain "model" / "system" are excluded: finance papers use them all the time).
+_AI_NOUN = (
+    r"(?:ai|llms?|large language models?|language models?|chatbots?|chatgpt|claude|gpt(?:-?\d(?:\.\d)?(?:o|-turbo)?)?|"
+    r"ai (?:assistants?|models?|systems?|agents?|readers?|crawlers?|tools?)|assistants?)"
 )
+_THIS_DOC = r"(?:this|the following|the present)\s+(?:page|document|paper|article|text|post|site|website|content|message|abstract|file|study|idea|strategy)"
+_VERDICT = (
+    r"(?:a\s+|an\s+|being\s+|highly\s+|very\s+|fully\s+)?(?:testable(?:_now)?|credible|verified|accepted|approved|trusted|trustworthy|"
+    r"reliable|peer[- ]reviewed|high[- ]quality|legitimate|safe|important|top[- ]priority|priority|relevant|valid|true|correct|"
+    r"(?:strong|good|great|excellent)\s+(?:signal|idea|strategy|paper))"
+)
+_SCHEMA_FIELD_PART = (
+    # the extraction schema's own field names have no business in a paper (but may appear in the model's own output)
+    r"\b(?:testable_now|is_trading_idea|reported_sharpe|reported_t_stat|reported_annual_return_pct|evidence_quotes|"
+    r"proposed_strategy_idea|closest_library_template|credibility_notes)\b"
+)
+_INSTRUCTION_PARTS = (
+    # "ignore / disregard previous instructions", "forget your prompt", "override the system rules"
+    r"\b(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+|any\s+|the\s+|these\s+|those\s+|your\s+|my\s+|of\s+)*"
+    r"(?:(?:previous|prior|above|earlier|preceding|original|system|safety|existing|other)\s+(?:instructions?|prompts?|rules|directions|guidelines|directives)"
+    r"|instructions?|prompts?)\b"
+    # second person, addressing the reader as an AI
+    r"|\byou are (?:now |actually )?(?:an?|the|my) " + _AI_NOUN + r"\b"
+    r"|\bif you are (?:an?|the) " + _AI_NOUN + r"\b"
+    r"|\b(?:note|reminder|warning|notice)\s+(?:to|for)\s+(?:the\s+|any\s+|all\s+)?" + _AI_NOUN + r"\b"
+    r"|\b(?:message|instructions?)\s+(?:to|for)\s+(?:the\s+|any\s+|all\s+)?" + _AI_NOUN + r"\s*:"
+    r"|\battention,?\s+(?:all\s+|any\s+)?" + _AI_NOUN + r"\b"
+    r"|\b" + _AI_NOUN + r"\s+(?:reading|processing|summari[sz]ing|analy[sz]ing|reviewing|evaluating|parsing|ingesting|crawling|scraping)\s+" + _THIS_DOC + r"\b"
+    r"|\bwhen\s+(?:you\s+(?:are\s+)?)?(?:summari[sz]|extract|triag|classify|classifi|categori[sz]|rat|scor|grad)\w*\s+" + _THIS_DOC + r"\b"
+    r"|\byou (?:must|should|shall|will|are required to|have to|need to)\s+(?:now\s+)?(?:report|mark|classify|rate|output|answer|respond|label|set|state|say|return)\b"
+    r"[^.]{0,40}?\b(?:sharpe|t-?stat\w*|testab\w*|credib\w*|json|fields?|score|rating|" + _THIS_DOC + r")"
+    r"|\b" + _AI_NOUN + r"\s+(?:must|should|shall|need to|have to|are required to)\s+(?:now\s+)?(?:rate|mark|classify|label|report|output|treat|flag|score|ignore)\s+" + _THIS_DOC + r"\b"
+    # directives that grade this very document
+    r"|(?<!\bwe )(?<!\bi )\b(?:rate|mark|classify|label|score|treat|flag|categori[sz]e|tag|report|describe|consider)\s+(?:it|" + _THIS_DOC + r")\s+as\s+" + _VERDICT + r"\b"
+    r"|\bmark (?:this|it) (?:as )?(?:testable|accepted|approved|verified|credible)\b"
+    # prompt-format headers and chat roles
+    r"|\b(?:system|developer)\s+(?:prompt|message|instructions?)\s*:"
+    r"|\b(?:new|updated|revised|real|actual|hidden|additional)\s+instructions?\s*:"
+    r"|^\W*(?:system|assistant|developer|human)\s*:"
+    # chat / prompt markup
+    r"|</?\s*(?:system|assistant|instructions?|document|user|human|prompt)\s*>|<\|im_(?:start|end)\|>|\[/?INST\]|<</?SYS>>"
+)
+# High-precision patterns for text addressed to the model that reads the document. Ordinary finance /
+# LLM-finance prose ("we treat the strategy as self-financing", "we use GPT-4 as an assistant to label
+# headlines", "the system prompt instructs the LLM to rate each article") must NOT match: a hit excludes
+# the sentence from evidence and number checks and security-flags the candidate.
+_INJECTION_RE = re.compile(_INSTRUCTION_PARTS + "|" + _SCHEMA_FIELD_PART, re.IGNORECASE)
+# The same check for the model's OWN output, where schema values such as "testable_now" are legitimate.
+_OUTPUT_INJECTION_RE = re.compile(_INSTRUCTION_PARTS, re.IGNORECASE)
+
+
+def _output_has_instructions(value: str) -> bool:
+    return any(
+        _OUTPUT_INJECTION_RE.search(sent) or _OUTPUT_INJECTION_RE.search(re.sub(r"\s+", " ", _ascii_punct(sent)))
+        for sent in split_sentences(value)
+    )
+
+
+def _is_instruction_like(sentence: str) -> bool:
+    # match on the normalised form so LaTeX escapes (testable\_now), full-width letters or zero-width
+    # characters cannot hide a phrase
+    return bool(_INJECTION_RE.search(sentence) or _INJECTION_RE.search(re.sub(r"\s+", " ", _ascii_punct(sentence))))
 
 
 def find_instruction_like(text: str) -> list[str]:
-    """Sentences of ``text`` that look like instructions addressed to an AI system."""
-    return [s for s in split_sentences(text) if _INJECTION_RE.search(s)]
+    """Sentences of ``text`` that look like instructions addressed to an AI system (prompt injection)."""
+    return [s for s in split_sentences(text) if _is_instruction_like(s)]
 
 
 def strip_instruction_like(text: str) -> tuple[str, list[str]]:
@@ -389,7 +454,7 @@ def strip_instruction_like(text: str) -> tuple[str, list[str]]:
     kept: list[str] = []
     flagged: list[str] = []
     for s in split_sentences(text):
-        (flagged if _INJECTION_RE.search(s) else kept).append(s)
+        (flagged if _is_instruction_like(s) else kept).append(s)
     return " ".join(kept), flagged
 
 
@@ -417,6 +482,7 @@ _ANNUAL_RES = [
     re.compile(_PCT + r"\s*(?:per (?:year|annum)|a year|each year|annually|annuali[sz]ed|p\.a\.|yearly)", re.I),
     re.compile(r"\b(?:annual(?:i[sz]ed)?|yearly)\s+(?:average\s+)?(?:[a-z\-]+\s+){0,3}?(?:returns?|alphas?|premi(?:um|a)|profits?|spreads?|excess returns?)\s*"
                r"(?:of|is|was|=|:)?\s*" + _PREFIX + _PCT, re.I),
+    re.compile(r"\bannuali[sz]ed\s*(?:of|is|was|=|:|,)?\s*" + _PREFIX + _PCT, re.I),  # "(annualized 14.4%)"
 ]
 _BP_ANNUAL_RE = re.compile(_NUM + r"\s*(?:basis points|bps?)\s*(?:per (?:year|annum)|a year|annually)", re.I)
 _MONTH = r"(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+)?"
@@ -623,12 +689,16 @@ def _truncate_at_sentence(text: str, max_chars: int) -> str:
     return window[:space] if space >= max_chars // 2 else window
 
 
-_DOC_TAG_RE = re.compile(r"<(/?)(\s*document)", re.IGNORECASE)
+_DOC_TAG_RE = re.compile(r"<(?=\s*/?\s*document)", re.IGNORECASE)
 
 
 def _neutralise_doc_tags(text: str) -> str:
-    """Stop the document from closing (or re-opening) its own <document> wrapper."""
-    return _DOC_TAG_RE.sub(lambda m: "&lt;" + m.group(1) + m.group(2), text)
+    """Stop the document from closing (or re-opening) its own <document> wrapper.
+
+    Every ``<`` that starts a document tag - ``</document>``, ``< /document>``, ``</ document>``,
+    ``<document`` - is escaped.
+    """
+    return _DOC_TAG_RE.sub("&lt;", text)
 
 
 def _attr(value: Any) -> str:
@@ -638,7 +708,101 @@ def _attr(value: Any) -> str:
 _NUM_TOKEN = re.compile(r"-?\d+(?:\.\d+)?|-?\.\d+")
 _SHARPE_ANCHOR = re.compile(r"\bSharpe\b|\bSR\b", re.I)
 _TSTAT_ANCHOR = re.compile(r"\bt[- ]?(?:stat(?:istic)?s?|values?|ratios?)\b|(?<![\w.])t\s*[=:(]", re.I)
-_PCT_TOKEN = re.compile(r"(-?\d+(?:\.\d+)?|-?\.\d+)\s*(?:%|percent\b|per ?cent\b|basis points|bps?\b)", re.I)
+# --- annual-return verification: a percentage next to a return-type word, converted by its stated unit ---
+_RETURN_ANCHOR = re.compile(
+    r"\b(?:returns?|alphas?|premi(?:um|a)|spreads?|profits?|profitability|earn(?:s|ed)?|outperform\w*|underperform\w*|"
+    r"gains?|cagr|excess|abnormal|performance|payoffs?)\b",
+    re.I,
+)
+_PCT_UNIT_TOKEN = re.compile(r"(?<![\w.])(-?\d+(?:\.\d+)?|-?\.\d+)\s*(%|percent\b|per ?cent\b|basis points?\b|bps?\b)", re.I)
+_NOT_A_RETURN_AFTER = re.compile(r"^\s*(?:of\b|quantiles?\b|percentiles?\b|deciles?\b|quintiles?\b|most\b|least\b)", re.I)
+_NOT_A_RETURN_BEFORE = re.compile(r"\b(?:top|bottom|highest|lowest|largest|smallest|first|last|best|worst|extreme)\s*$", re.I)
+_RETURN_UNITS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("month", re.compile(r"\b(?:per|a|each|every)\s+month\b|\bmonthly\b|\bper\s+mo\b|\bp\.m\.", re.I)),
+    ("year", re.compile(r"\b(?:per|a|each|every)\s+(?:year|annum)\b|\bannual(?:ly|i[sz]ed)?\b|\byearly\b|\bp\.a\.|\bper\s+yr\b", re.I)),
+    ("quarter", re.compile(r"\b(?:per|a|each|every)\s+quarter\b|\bquarterly\b|\b(?:over|in)\s+the\s+(?:following|next|subsequent)\s+quarter\b", re.I)),
+    ("week", re.compile(r"\b(?:per|a|each|every)\s+week\b|\bweekly\b", re.I)),
+    ("day", re.compile(r"\b(?:per|a|each|every)\s+(?:trading\s+)?day\b|\bdaily\b", re.I)),
+)
+_TO_ANNUAL: dict[str, tuple[Callable[[float], float], ...]] = {
+    "year": (lambda v: v,),
+    "month": (lambda v: 12 * v, lambda v: ((1 + v / 100) ** 12 - 1) * 100),
+    "quarter": (lambda v: 4 * v, lambda v: ((1 + v / 100) ** 4 - 1) * 100),
+    "week": (lambda v: 52 * v,),
+    "day": (lambda v: 252 * v,),
+}
+
+
+def _unit_near(window: str, *, last: bool) -> str | None:
+    """The return unit mentioned in ``window`` - the first one (after a number) or the last one (before it)."""
+    best: tuple[int, str] | None = None
+    for unit, rx in _RETURN_UNITS:
+        hits = list(rx.finditer(window))
+        if not hits:
+            continue
+        pos = hits[-1].start() if last else hits[0].start()
+        if best is None or (pos > best[0] if last else pos < best[0]):
+            best = (pos, unit)
+    return best[1] if best else None
+
+
+def _annual_return_supported(value: float, text: str) -> bool:
+    """Is ``value`` (an annual % return) stated in ``text``? Only percentages in a sentence with a
+    return-type word count ("earns", "alpha", "spread" ...), percentile mentions ("top 20% of stocks")
+    never do, and the conversion follows the stated unit: x12 (or compounded) only for "per month",
+    x4 for "per quarter", and so on. A unit stated before the number ("monthly returns of 1.2%") is
+    ambiguous, so the figure itself is accepted too.
+    """
+    for sent in split_sentences(text):
+        if not _RETURN_ANCHOR.search(sent):
+            continue
+        for m in _PCT_UNIT_TOKEN.finditer(sent):
+            after, before = sent[m.end(): m.end() + 32], sent[max(0, m.start() - 36): m.start()]
+            if _NOT_A_RETURN_AFTER.search(after) or _NOT_A_RETURN_BEFORE.search(before):
+                continue
+            v = float(m.group(1))
+            if m.group(2)[:1].lower() == "b":  # basis points
+                v /= 100.0
+            unit = _unit_near(after[:28], last=False)
+            if unit is not None:
+                fns: tuple[Callable[[float], float], ...] = _TO_ANNUAL[unit]
+            else:
+                unit = _unit_near(before, last=True)
+                fns = (lambda x: x,) + (_TO_ANNUAL[unit] if unit and unit != "year" else ())
+            try:
+                if any(_close(fn(v), value) for fn in fns):
+                    return True
+            except OverflowError:  # pragma: no cover - absurd compounding input
+                continue
+    return False
+
+
+# --- checks on the model's own free-text output ---
+_STRATEGY_RED_FLAGS = re.compile(
+    r"\b(?:ignore|disregard|disable|bypass|override|turn\s+off|remove|skip|without)\s+(?:all\s+|any\s+|the\s+|your\s+)?"
+    r"(?:stop[- ]?loss(?:es)?|risk\s+(?:limits?|checks?|controls?|management)|position\s+limits?|limits|instructions?|rules|safeguards?)\b"
+    r"|\b(?:leverage|lever(?:ed|age)?\s+up)\s+(?:of\s+|at\s+|by\s+)?(?:[3-9]|\d{2,})(?:\.\d+)?\s*x\b"
+    r"|\b(?:[3-9]|\d{2,})(?:\.\d+)?\s*x\s+leverage\b"
+    r"|\b(?:all[- ]in|bet\s+everything|entire\s+(?:account|portfolio|capital)\s+(?:in|on)\s+(?:one|a\s+single))\b",
+    re.I,
+)
+_SNAKE_TOKEN = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
+_SPEC_VOCAB = frozenset({
+    "cross_sectional", "time_series", "factor_model", "higher_is_better", "lower_is_better", "long_only", "long_short",
+    "top_n", "inverse_vol", "us_equities", "global_equities",
+})
+_OUTPUT_TEXT_FIELDS = ("title", "summary", "claimed_effect", "signal_description", "proposed_strategy_idea", "holding_period")
+_OUTPUT_LIST_FIELDS = ("data_requirements", "missing_data")
+_ECHO_NGRAM = 5
+
+
+def _ngrams(text: str, n: int = _ECHO_NGRAM) -> set[tuple[str, ...]]:
+    words = re.findall(r"[a-z0-9]+(?:[.'%][a-z0-9]+)*%?", normalize_for_match(text))
+    return {tuple(words[i: i + n]) for i in range(len(words) - n + 1)}
+
+
+def _security(note: str) -> str:
+    return SECURITY_NOTE_PREFIX + note
 
 
 def _floats(tokens: Iterable[str]) -> list[float]:
@@ -651,11 +815,22 @@ def _floats(tokens: Iterable[str]) -> list[float]:
     return out
 
 
+_WINDOW_SENT_END = re.compile(r"[.!?][\"')\]]?\s+(?=[A-Z(\"'])")
+
+
 def _numbers_near(text: str, anchor: re.Pattern[str], before: int = 40, after: int = 120) -> list[float]:
+    """Numbers within ``before`` / ``after`` characters of each anchor match, never across a sentence end."""
     vals: list[float] = []
     for m in anchor.finditer(text):
-        window = text[max(0, m.start() - before): m.end() + after]
-        vals.extend(_floats(_NUM_TOKEN.findall(window)))
+        pre = text[max(0, m.start() - before): m.start()]
+        ends = list(_WINDOW_SENT_END.finditer(pre))
+        if ends:
+            pre = pre[ends[-1].end():]
+        post = text[m.start(): m.end() + after]
+        cut = _WINDOW_SENT_END.search(post, m.end() - m.start())
+        if cut:
+            post = post[: cut.start() + 1]
+        vals.extend(_floats(_NUM_TOKEN.findall(pre + " " + post)))
     return vals
 
 
@@ -723,7 +898,7 @@ class IdeaExtractor:
         full = doc.text or ""
         shown = _truncate_at_sentence(full, self.max_chars)
         truncated = len(shown) < len(full)
-        flagged = find_instruction_like(shown)
+        flagged = find_instruction_like(doc.title or "") + find_instruction_like(shown)
 
         attrs = [f'url="{_attr(doc.url)}"', f'title="{_attr(doc.title)}"', f'source="{_attr(doc.source_name or doc.source_type)}"']
         if doc.published:
@@ -774,21 +949,26 @@ class IdeaExtractor:
             extraction = IdeaExtraction.model_validate(extraction)
 
         full_text = f"{doc.title}\n{doc.text or ''}"
-        clean_body, flagged = strip_instruction_like(doc.text or "")
+        # the title is as untrusted as the body: an injected title must not validate numbers or quotes
+        clean_title, flagged_title = strip_instruction_like(doc.title or "")
+        clean_body, flagged_body = strip_instruction_like(doc.text or "")
+        flagged = flagged_title + flagged_body
+        clean_text = f"{clean_title}\n{clean_body}"
         notes: list[str] = []
         if meta["truncated"]:
             notes.append(f"Document truncated to {meta['shown_chars']:,} of {meta['total_chars']:,} characters for extraction.")
         if flagged:
-            notes.append(
-                f"Source text contains {len(flagged)} passage(s) that look like instructions to an AI (possible prompt "
-                "injection); they were flagged to the model and excluded from the number checks."
-            )
+            notes.append(_security(
+                f"Source contains {len(flagged)} passage(s){' (including the title)' if flagged_title else ''} that look like "
+                "instructions to an AI (possible prompt injection, or a prompt quoted by an LLM paper); they were flagged to "
+                "the model and excluded from the number and quote checks. Read the source before translating or testing this idea."
+            ))
 
-        extraction, fix_notes = self._sanitize(extraction, f"{doc.title}\n{clean_body}")
+        extraction, fix_notes = self._sanitize(extraction, clean_text, flagged)
         notes.extend(fix_notes)
 
         checks = verify_quotes(extraction.evidence_quotes, full_text, ref=doc.url)
-        checks = _flag_quotes_from_injected(checks, flagged, f"{doc.title}\n{clean_body}")
+        checks = _flag_quotes_from_injected(checks, flagged, clean_text)
         return IdeaCandidate(
             idea_id=doc.doc_key,
             source=doc,
@@ -798,10 +978,15 @@ class IdeaExtractor:
             notes=notes,
         )
 
-    def _sanitize(self, ext: IdeaExtraction, clean_text: str) -> tuple[IdeaExtraction, list[str]]:
-        """Post-checks on the model output; returns the corrected extraction and notes on what changed."""
+    def _sanitize(self, ext: IdeaExtraction, clean_text: str, flagged: Iterable[str] = ()) -> tuple[IdeaExtraction, list[str]]:
+        """Post-checks on the model output; returns the corrected extraction and notes on what changed.
+
+        ``clean_text`` is the title + body with instruction-like passages removed; ``flagged`` are those
+        passages (used to detect output that repeats them).
+        """
         notes: list[str] = []
         update: dict[str, Any] = {}
+        flagged = list(flagged)
 
         tpl = ext.closest_library_template
         if tpl is not None:
@@ -818,36 +1003,84 @@ class IdeaExtractor:
         if self.verify_numbers:
             text = re.sub(r"\s+", " ", _ascii_punct(clean_text))
             ident = (lambda n: n,)
+            # A Sharpe / t-stat counts only next to its label: a matching decimal elsewhere ("0.85 billion")
+            # is not evidence, and the value would otherwise become the replication's claimed_sharpe.
             if ext.reported_sharpe is not None:
                 where = _check_number(ext.reported_sharpe, text, _SHARPE_ANCHOR, (*ident, lambda n: n * math.sqrt(12)))
-                if where == "absent":
+                if where != "near":
                     update["reported_sharpe"] = None
-                    notes.append(f"Model-reported Sharpe ratio {ext.reported_sharpe:g} does not appear in the source text; cleared.")
-                elif where == "anywhere":
-                    notes.append(f"Model-reported Sharpe ratio {ext.reported_sharpe:g} appears in the text but not next to 'Sharpe'; check it.")
+                    notes.append(
+                        f"Model-reported Sharpe ratio {ext.reported_sharpe:g} does not appear in the source text; cleared."
+                        if where == "absent" else
+                        f"Model-reported Sharpe ratio {ext.reported_sharpe:g} appears in the text only away from a 'Sharpe' label; cleared."
+                    )
             if ext.reported_t_stat is not None:
                 where = _check_number(ext.reported_t_stat, text, _TSTAT_ANCHOR, ident, use_abs=True)
-                if where == "absent":
+                if where != "near":
                     update["reported_t_stat"] = None
-                    notes.append(f"Model-reported t-statistic {ext.reported_t_stat:g} does not appear in the source text; cleared.")
-                elif where == "anywhere":
-                    notes.append(f"Model-reported t-statistic {ext.reported_t_stat:g} appears in the text but not next to a t-stat label; check it.")
-            if ext.reported_annual_return_pct is not None:
-                pct_numbers = _floats(_PCT_TOKEN.findall(text))
-                transforms = (lambda n: n, lambda n: 12 * n, lambda n: 12 * n / 100, lambda n: n / 100, lambda n: 4 * n, lambda n: 52 * n)
-                if not _appears(ext.reported_annual_return_pct, pct_numbers, transforms):
-                    update["reported_annual_return_pct"] = None
                     notes.append(
-                        f"Model-reported annual return {ext.reported_annual_return_pct:g}% (or a monthly / quarterly / basis-point "
-                        "equivalent) does not appear in the source text; cleared."
+                        f"Model-reported t-statistic {ext.reported_t_stat:g} does not appear in the source text; cleared."
+                        if where == "absent" else
+                        f"Model-reported t-statistic {ext.reported_t_stat:g} appears in the text only away from a t-stat label; cleared."
                     )
+            if ext.reported_annual_return_pct is not None and not _annual_return_supported(ext.reported_annual_return_pct, text):
+                update["reported_annual_return_pct"] = None
+                notes.append(
+                    f"Model-reported annual return {ext.reported_annual_return_pct:g}% does not match a return stated in the "
+                    "source text (annual, or a monthly / quarterly / basis-point figure converted by its stated unit); cleared."
+                )
             if ext.sample_period:
                 years = re.findall(r"(?:1[89]|20)\d{2}", ext.sample_period)
                 if years and not all(re.search(rf"(?<!\d){y}(?!\d)", text) for y in years):
                     update["sample_period"] = None
                     notes.append(f"Model-reported sample period '{ext.sample_period}' does not appear in the source text; cleared.")
 
+        notes.extend(self._check_output_text(ext, flagged, update))
         return (ext.model_copy(update=update) if update else ext), notes
+
+    def _check_output_text(self, ext: IdeaExtraction, flagged: list[str], update: dict[str, Any]) -> list[str]:
+        """Injection checks on the model's free-text fields (the strategy translator consumes them).
+
+        A field that itself contains instructions to an AI, or repeats a flagged passage, is reported
+        with a SECURITY note; ``proposed_strategy_idea`` is also cleared in that case, and when it asks
+        to disable risk controls or use extreme leverage, so the idea is never auto-translated.
+        """
+        notes: list[str] = []
+        bad: dict[str, str] = {}
+        flagged_grams: set[tuple[str, ...]] = set()
+        for passage in flagged:
+            flagged_grams |= _ngrams(passage)
+        values = {name: str(getattr(ext, name) or "") for name in _OUTPUT_TEXT_FIELDS}
+        values.update({name: " | ".join(getattr(ext, name) or []) for name in _OUTPUT_LIST_FIELDS})
+        for name, value in values.items():
+            if not value.strip():
+                continue
+            if _output_has_instructions(value):
+                bad[name] = "contains instructions addressed to an AI"
+            elif flagged_grams and _ngrams(value) & flagged_grams:
+                bad[name] = "repeats a passage flagged as instructions to an AI"
+        idea = ext.proposed_strategy_idea or ""
+        if idea and "proposed_strategy_idea" not in bad and _STRATEGY_RED_FLAGS.search(_ascii_punct(idea)):
+            bad["proposed_strategy_idea"] = "asks to disable risk controls or to use extreme leverage"
+        if not flagged and any(_output_has_instructions(n) for n in ext.credibility_notes):
+            bad["credibility_notes"] = "quote instructions to an AI that the source scan did not flag"
+        if bad:
+            cleared = "proposed_strategy_idea" in bad
+            if cleared:
+                update["proposed_strategy_idea"] = ""
+            notes.append(_security(
+                "Model output failed the injection checks (" + "; ".join(f"{k} {v}" for k, v in bad.items()) + ")"
+                + ("; proposed_strategy_idea was cleared so it cannot be auto-translated." if cleared else ".")
+            ))
+        if idea and "proposed_strategy_idea" not in bad:
+            names = set(self.catalog.names()) if hasattr(self.catalog, "names") else set()
+            unknown = sorted({t for t in _SNAKE_TOKEN.findall(idea) if t not in names and t not in _SPEC_VOCAB and t not in self.templates})
+            if names and unknown:
+                notes.append(
+                    f"proposed_strategy_idea names feature(s) not in the catalog ({', '.join(unknown)}); the translator must map "
+                    "them to catalog features or reject the idea."
+                )
+        return notes
 
 
 def _flag_quotes_from_injected(checks: list[EvidenceCheck], flagged: list[str], clean_text: str) -> list[EvidenceCheck]:
@@ -1204,13 +1437,18 @@ _EQUITY_RE = re.compile(r"\b(?:stocks?|equit(?:y|ies)|shares|firms|companies|CRS
 _US_RE = re.compile(r"\bU\.S\.|\bUS\b|\bUSA\b|(?i:\bunited states\b|\bamerican\b|\bNYSE\b|\bNASDAQ\b|\bAMEX\b|\bCRSP\b|\bS&P ?500\b|\bSPY\b)")
 _GLOBAL_RE = re.compile(r"\b(?:international|global|emerging markets?|developed markets?|\d+ countries|european|japan(?:ese)?|chinese|china)\b", re.I)
 _ML_RE = re.compile(r"\b(?:machine learning|neural networks?|deep learning|random forests?|gradient[- ]boost(?:ed|ing)?|LSTM|transformer models?|reinforcement learning)\b", re.I)
-_JOURNAL_RE = re.compile(
-    r"\b(?:journal of (?:finance|financial economics|accounting research|accounting and economics|portfolio management|"
-    r"financial and quantitative analysis|empirical finance|banking and finance|financial markets)|review of financial studies|"
-    r"review of (?:accounting studies|finance|asset pricing studies)|the accounting review|management science|financial analysts journal|"
-    r"quarterly journal of economics|journal of political economy|econometrica|peer[- ]reviewed|refereed|"
-    r"forthcoming in (?:the )?(?:journal|review)|published in (?:the )?(?:journal|review))\b", re.I)
-_NOT_PEER_RE = re.compile(r"\bnot (?:yet )?(?:been )?(?:peer[- ]reviewed|refereed)\b|\bnon[- ]peer[- ]reviewed\b|\bunrefereed\b", re.I)
+# "Published in / forthcoming in <journal>" said about the document itself (not a citation of other work).
+_SELF_PUBLICATION_RE = re.compile(
+    r"^\W*(?:(?:this|the present|our)\s+(?:paper|article|study|manuscript)\s+(?:is\s+|was\s+|has\s+been\s+|will\s+be\s+|is\s+now\s+)?"
+    r"|we\s+(?:are|were)\s+)?(?:published|forthcoming|accepted\s+for\s+publication|accepted|to\s+appear)\s+in\s+(?:the\s+)?"
+    r"(?:" + JOURNAL_VENUE_PATTERN + r"|(?:journal|review)\b)",
+    re.I,
+)
+_NOT_PEER_RE = re.compile(
+    r"\bnot\s+(?:yet\s+)?(?:been\s+)?(?:peer[- ]reviewed|refereed|published)\b|\bnon[- ]peer[- ]reviewed\b|\bunrefereed\b"
+    r"|\byet\s+to\s+be\s+(?:peer[- ]reviewed|refereed|published)\b|\bunder\s+review\b",
+    re.I,
+)
 _OOS_RE = re.compile(r"\b(?:out[- ]of[- ]sample|post[- ]publication|holdout|hold-out|international (?:evidence|markets|samples?)|replicat(?:e|es|ed|ion))\b", re.I)
 _VARIANTS_RE = re.compile(
     r"\b(?:we |i )?(?:test|examine|consider|study|analy[sz]e|evaluate)\s+(?:over |more than |nearly |about )?(\d{2,5})\s+"
@@ -1284,9 +1522,10 @@ class HeuristicIdeaExtractor:
         extraction = self.extract_fields(doc, clean_title, clean_body)
         notes = ["Extracted offline with keyword rules (HeuristicIdeaExtractor); confirm by reading the source."]
         if flagged or flagged_t:
-            notes.append(
-                f"Ignored {len(flagged) + len(flagged_t)} sentence(s) that look like instructions to an AI (possible prompt injection)."
-            )
+            notes.append(_security(
+                f"Ignored {len(flagged) + len(flagged_t)} sentence(s) that look like instructions to an AI (possible prompt "
+                "injection, or a prompt quoted by an LLM paper). Read the source before translating or testing this idea."
+            ))
         checks = verify_quotes(extraction.evidence_quotes, f"{doc.title}\n{doc.text or ''}", ref=doc.url)
         return IdeaCandidate(
             idea_id=doc.doc_key,
@@ -1418,7 +1657,7 @@ class HeuristicIdeaExtractor:
         """Up to ``k`` verbatim sentences: family keyword + a reported number first, then keyword only."""
         ranked: list[tuple[float, int, str]] = []
         for i, s in enumerate(sentences):
-            if len(s) < 25:
+            if len(s) < 25 or _n_words(s) < MIN_QUOTE_WORDS:  # too short to count as a verifiable quote
                 continue
             plain = _ascii_punct(s)
             fam_hit = any(rx.search(plain) for rx, _ in _COMPILED[fam.key])
@@ -1448,12 +1687,18 @@ class HeuristicIdeaExtractor:
     @staticmethod
     def _credibility(doc: SourceDocument, text: str, nums: dict[str, Any]) -> list[str]:
         notes: list[str] = []
+        venue = journal_venue_from_url(doc.url)
+        self_pub = next(
+            (s for s in split_sentences(text) if _SELF_PUBLICATION_RE.search(s) and affirms_peer_review(_ascii_punct(s))),
+            None,
+        )
         not_peer = _NOT_PEER_RE.search(text)
-        journal = None if not_peer else _JOURNAL_RE.search(text)
-        if not_peer:
+        if venue:
+            notes.append(f"Published in a peer-reviewed journal (journal article page: {venue}).")
+        elif self_pub:
+            notes.append(f"Published in a peer-reviewed journal (the source states: '{self_pub[:150]}').")
+        elif not_peer:
             notes.append("Source states it is not peer-reviewed.")
-        elif journal:
-            notes.append(f"Mentions peer-reviewed publication ('{journal.group(0)}').")
         elif doc.source_type == "arxiv":
             notes.append("arXiv preprint: not peer-reviewed.")
         elif doc.source_type in ("rss", "web_search", "url"):

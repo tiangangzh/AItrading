@@ -276,6 +276,8 @@ def non_public_reason(url: str) -> str | None:
     or resolve to, loopback / private / link-local / multicast / reserved / unspecified addresses
     (IPv4 and IPv6, including IPv4-mapped IPv6). A host that cannot be resolved locally is allowed
     (behind a proxy only the proxy can resolve it); the request then fails or goes through the proxy.
+    The name is resolved just before the request; the connection does not pin that address, so a
+    DNS-rebinding server could still answer differently a moment later (defence in depth, not a sandbox).
     """
     try:
         parts = urlsplit(url)

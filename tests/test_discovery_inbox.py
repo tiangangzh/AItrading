@@ -510,3 +510,138 @@ def test_inbox_uses_library_templates_lazily(tmp_path, monkeypatch):
     inbox = IdeaInbox(tmp_path / "ideas.json", clock=Clock())
     [c] = inbox.add([make_candidate(idea_title="Betting against beta")])
     assert c.novelty == "new"
+
+
+# =============================================================================================
+# Regression tests from the extraction / inbox review
+# =============================================================================================
+
+from aitrading.discovery import inbox as inbox_mod  # noqa: E402
+from aitrading.discovery import rank as rank_mod  # noqa: E402
+from aitrading.discovery.rank import (  # noqa: E402
+    SECURITY_NOTE_PREFIX,
+    SECURITY_SCORE_CAP,
+    canonical_url,
+    is_security_flagged,
+    journal_venue_from_url,
+)
+
+
+@pytest.mark.parametrize("note,expected", [
+    ("Published in the Review of Financial Studies.", True),
+    ("Published in the Journal of Finance, Vol. 48, No. 1, May 1993.", True),
+    ("Forthcoming in the Journal of Financial Economics; in-sample only.", True),
+    ("Peer-reviewed journal article (JFE, 2015).", True),
+    ("arXiv preprint, not yet published in a peer-reviewed journal.", False),
+    ("Blog post; not yet published in a peer-reviewed journal.", False),
+    ("Working paper, not published in a peer-reviewed journal.", False),
+    ("Unclear whether it was peer-reviewed.", False),
+    ("The paper may have been published in the Journal of Finance.", False),
+    ("Peer-reviewed? Unknown.", False),
+    ("Cites Jegadeesh and Titman (Journal of Finance, 1993).", False),
+    ("Mentions peer-reviewed publication ('Journal of Finance').", False),
+])
+def test_peer_review_handles_negation_and_uncertainty(note, expected):
+    c = make_candidate(url="https://blog.example/post", notes=(note,))
+    assert rank_mod.is_peer_reviewed(c) is expected
+
+
+def test_peer_review_from_metadata_and_not_from_flagged_notes():
+    blog_notes = ("Blog post.",)
+    assert rank_mod.is_peer_reviewed(make_candidate(url="https://onlinelibrary.wiley.com/doi/10.1111/jofi.13000", notes=blog_notes))
+    assert rank_mod.is_peer_reviewed(make_candidate(url="https://doi.org/10.1016/j.jfineco.2013.01.003", notes=blog_notes))
+    assert not rank_mod.is_peer_reviewed(make_candidate(url="https://doi.org/10.48550/arXiv.2401.00001", notes=blog_notes))
+    assert journal_venue_from_url("https://www.sciencedirect.com/science/article/pii/S0304405X13000044") == "sciencedirect.com"
+    assert journal_venue_from_url("https://www.sciencedirect.com/search?q=momentum") is None
+    assert journal_venue_from_url("https://x.example:99999/a") is None
+
+    flagged = make_candidate(url="https://evil.example/p", notes=("Published in the Journal of Finance.",))
+    flagged = flagged.model_copy(update={"notes": [SECURITY_NOTE_PREFIX + "Source contains 1 passage(s) that look like instructions."]})
+    assert is_security_flagged(flagged)
+    assert not rank_mod.is_peer_reviewed(flagged)  # the document may have steered the notes
+
+
+def test_security_flag_caps_the_score():
+    c = make_candidate(sample="1963-2019")
+    assert score_candidate(c, today=TODAY) == 1.0
+    flagged = c.model_copy(update={"notes": [SECURITY_NOTE_PREFIX + "Model output failed the injection checks."]})
+    parts = score_breakdown(flagged, today=TODAY)
+    assert parts["total"] == SECURITY_SCORE_CAP and set(parts) == {*WEIGHTS, "total"}
+
+
+def test_bad_url_never_sinks_an_add_batch(inbox, monkeypatch, caplog):
+    assert canonical_url("https://example.com:99999/a")  # never raises on an out-of-range port
+    monkeypatch.setattr(rank_mod, "_canonical_url_impl", lambda url: (_ for _ in ()).throw(ValueError("Port out of range")))
+    assert canonical_url("HTTPS://Example.com:99999/a") == "https://example.com:99999/a"
+    monkeypatch.undo()
+
+    inbox.add([make_candidate(url="https://a.example/1", title="First idea")])
+    real = inbox_mod.assess_novelty
+
+    def flaky(c, existing, templates=None):
+        if "bad" in c.source.url:
+            raise ValueError("Port out of range 0-65535")
+        return real(c, existing, templates)
+
+    monkeypatch.setattr(inbox_mod, "assess_novelty", flaky)
+    added = inbox.add([make_candidate(url="https://bad.example:99999/x", title="Broken URL idea"),
+                       make_candidate(url="https://c.example/y", title="Good idea")])
+    assert [c.source.title for c in added] == ["Good idea"]
+    assert len(inbox) == 2
+    assert any("skipping idea" in r.getMessage() for r in caplog.records)
+
+
+def test_hand_edited_file_with_bom_is_read_not_discarded(tmp_path):
+    path = tmp_path / "ideas.json"
+    data = {"schema_version": 1, "ideas": [make_candidate().model_dump(mode="json")]}
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps(data).encode("utf-8"))  # UTF-8 with BOM (Windows Notepad)
+    inbox = IdeaInbox(path, templates=TEMPLATES, clock=Clock())
+    assert len(inbox.list()) == 1
+    assert len(inbox.add([make_candidate(url="u/2", title="Second")])) == 1
+    assert not list(tmp_path.glob("ideas.json.corrupt-*"))
+    assert len(IdeaInbox(path, templates=TEMPLATES).all()) == 2
+
+
+def test_held_lock_is_kept_alive_by_the_heartbeat(tmp_path, caplog):
+    path = tmp_path / "ideas.json"
+    a = IdeaInbox(path, templates=TEMPLATES, clock=Clock(), stale_lock_s=0.3)
+    b = IdeaInbox(path, templates=TEMPLATES, clock=Clock(), stale_lock_s=0.3, lock_timeout_s=10)
+    [c] = a.add([make_candidate()])
+    done: dict[str, float] = {}
+
+    def other_writer() -> None:
+        b.set_status(c.idea_id, "accepted")
+        done["at"] = time.monotonic()
+
+    with a.locked():
+        t = threading.Thread(target=other_writer)
+        t.start()
+        time.sleep(1.0)  # > 3 x stale_lock_s: without the heartbeat the lock would be broken as stale
+        assert t.is_alive() and "at" not in done
+        released_at = time.monotonic()
+    t.join(10)
+    assert done["at"] >= released_at
+    assert not any("breaking stale" in r.getMessage() for r in caplog.records)
+    assert b.get(c.idea_id).status == "accepted"
+
+
+def test_stale_lock_breaker_rechecks_before_deleting(tmp_path, monkeypatch):
+    lock = tmp_path / "ideas.json.lock"
+    lock.write_text("pid=2 token=fresh-owner\n")  # A broke the dead lock and took a fresh one
+    lf = inbox_mod._LockFile(lock, timeout_s=1.0, stale_after_s=60)
+    real_read = lf._read
+    observations = iter([("pid=1 token=dead-owner", time.time() - 3600)])  # what B saw a moment ago
+    monkeypatch.setattr(lf, "_read", lambda: next(observations, None) or real_read())
+    assert lf._break_if_stale() is False
+    assert lock.read_text() == "pid=2 token=fresh-owner\n"  # B did not delete A's fresh lock
+    assert not lf.breaker_path.exists()
+
+    # a breaker held by another process blocks breaking; one left by a crash is cleaned up
+    old = time.time() - 3600
+    os.utime(lock, (old, old))
+    lf2 = inbox_mod._LockFile(lock, timeout_s=1.0, stale_after_s=60)
+    lf2.breaker_path.write_text("")
+    assert lf2._break_if_stale() is False and lock.exists()
+    os.utime(lf2.breaker_path, (old, old))
+    assert lf2._break_if_stale() is False and not lf2.breaker_path.exists()
+    assert lf2._break_if_stale() is True and not lock.exists()

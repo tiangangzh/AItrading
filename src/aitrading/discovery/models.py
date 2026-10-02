@@ -47,6 +47,11 @@ class SourceDocument(BaseModel):
     text: str = Field(description="Abstract or extracted article text (plain text).")
     fetched_at: datetime
     source_name: str = Field("", description='e.g. "arXiv q-fin.PM", a blog name, "Claude web search".')
+    text_origin: Literal["page", "pdf", "abstract", "feed_item", "cited_passages", "not_read"] | None = Field(
+        None, description="Where `text` came from; 'not_read' means the page itself was never fetched."
+    )
+    journal_ref: str | None = Field(None, description="Journal reference when the source states one (e.g. arXiv journal_ref).")
+    doi: str | None = None
 
     @property
     def doc_key(self) -> str:
@@ -89,6 +94,10 @@ class IdeaCandidate(BaseModel):
     score: float = Field(0.0, description="Ranking score in [0, 1] (testability, credibility, novelty, evidence).")
     novelty: Literal["new", "variant_of_library", "duplicate"] = "new"
     status: IdeaStatus = "new"
+    security_flags: list[str] = Field(
+        default_factory=list,
+        description="Prompt-injection or integrity concerns found in the source; flagged ideas need explicit trader confirmation.",
+    )
     discovered_at: datetime
     decided_at: datetime | None = None
     strategy_spec: dict | None = Field(None, description="StrategySpec JSON once translated.")

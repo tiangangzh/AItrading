@@ -61,6 +61,8 @@ from aitrading.llm.anthropic_client import FALLBACK_BETA
 from aitrading.llm.base import LLMError, LLMRefusalError
 
 __all__ = [
+    "CITED_ONLY_MARK",
+    "NOT_READ_MARK",
     "RESEARCH_SYSTEM",
     "STRUCTURE_SYSTEM",
     "ClaudeWebSearchSource",
@@ -330,6 +332,9 @@ class ClaudeWebSearchSource:
     def discover(self, brief: str, *, max_ideas: int = 10) -> list[SourceDocument]:
         """Search the web for ideas matching ``brief``; return verified-URL SourceDocuments.
 
+        Each document's ``text`` is real page text returned by the server tools (see the module
+        docstring), never the model's own excerpt; it is empty, and ``source_name`` ends in
+        ``NOT_READ_MARK``, when the page could not be read - fetch those with ``fetch_url``.
         Raises ``LLMError`` / ``LLMRefusalError`` when an API call fails as a whole (e.g. no API key,
         or the model and its fallback declined). Per-item problems go to ``.warnings``.
         """
@@ -343,7 +348,7 @@ class ClaudeWebSearchSource:
         if not trace.text.strip():
             self.warnings.append("the research call returned no report text")
             return []
-        if not trace.hits:
+        if not trace.allowed_urls():
             self.warnings.append("the research call returned no search or fetch results; nothing can be verified")
             return []
         items = self._structure(trace, max_ideas)

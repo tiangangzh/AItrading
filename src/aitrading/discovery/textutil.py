@@ -11,6 +11,7 @@ import codecs
 import io
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -128,20 +129,24 @@ class _HtmlExtractor(HTMLParser):
     ...) or "inner" (an ordinary element nested inside a skipped region, tracked so that end tags
     match the right element). The stack is empty while reading normal text. ``self._open`` tracks the
     elements open outside skipped regions, so that an end tag closing one of them also ends a skipped
-    region left open inside it (``<h1>Title <span hidden>x</h1>``), as browsers do.
+    region left open inside it (``<h1>Title <span hidden>x</h1>``), as browsers do. Counters keep
+    every callback O(1) amortised, so hostile pages with thousands of unclosed tags stay fast.
     """
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)  # decodes &amp; &#8217; &nbsp; ...
         self._stack: list[tuple[str, str]] = []
+        self._stack_tags: Counter[str] = Counter()
+        self._stack_kinds: Counter[str] = Counter()
         self._open: list[str] = []
+        self._open_tags: Counter[str] = Counter()
         self._pre = 0
         self._blocks: list[str] = []
         self._buf: list[str] = []
-        # text of the currently open soft element, and of the closed ones (with their position)
+        # text of the currently open soft element, and of the closed ones
         self._soft_buf: list[str] = []
         self._soft_blocks: list[str] = []
-        self._closed_soft: list[tuple[int, list[str]]] = []
+        self._closed_soft: list[str] = []
         self._in_title = False
         self._title: list[str] = []
         self._in_h1 = False
@@ -168,30 +173,47 @@ class _HtmlExtractor(HTMLParser):
         """"normal", "soft" (inside an open nav/footer/...) or "hard" (inside dropped content)."""
         if not self._stack:
             return "normal"
-        kinds = {kind for _, kind in self._stack}
-        return "hard" if "hard" in kinds else "soft"
+        return "hard" if self._stack_kinds["hard"] else "soft"
 
-    def _close_soft_capture(self) -> None:
-        """A soft element was closed: its text is furniture; keep it only for the empty-page fallback."""
-        self._flush_soft()
-        if self._soft_blocks:
-            self._closed_soft.append((len(self._blocks), self._soft_blocks))
-        self._soft_blocks = []
+    def _push(self, tag: str, kind: str) -> None:
+        if kind == "soft" and not self._stack_kinds["soft"]:
+            self._soft_buf, self._soft_blocks = [], []  # a new piece of furniture starts
+        self._stack.append((tag, kind))
+        self._stack_tags[tag] += 1
+        self._stack_kinds[kind] += 1
 
     def _pop_to(self, index: int) -> None:
-        had_soft = any(kind == "soft" for _, kind in self._stack)
+        had_soft = self._stack_kinds["soft"] > 0
+        for tag, kind in self._stack[index:]:
+            self._stack_tags[tag] -= 1
+            self._stack_kinds[kind] -= 1
         del self._stack[index:]
-        if had_soft and not any(kind == "soft" for _, kind in self._stack):
-            self._close_soft_capture()
+        if had_soft and not self._stack_kinds["soft"]:
+            # The furniture was closed: drop its text, but keep it for the empty-page fallback.
+            self._flush_soft()
+            self._closed_soft += self._soft_blocks
+            self._soft_blocks = []
+
+    def _rindex(self, items: list[str], tag: str, window: int | None = None) -> int:
+        stop = -1 if window is None else max(-1, len(items) - 1 - window)
+        for i in range(len(items) - 1, stop, -1):
+            if items[i] == tag:
+                return i
+        return -1
+
+    def _open_pop_to(self, index: int) -> None:
+        for tag in self._open[index:]:
+            self._open_tags[tag] -= 1
+        del self._open[index:]
 
     def _close_implied(self, tag: str) -> None:
         """Pop open (non-skipped) elements whose end tag is implied by start tag ``tag`` (HTML5)."""
-        if tag in _P_CLOSERS and "p" in self._open:
-            i = len(self._open) - 1 - self._open[::-1].index("p")
-            if not any(t in _SCOPE_TAGS for t in self._open[i + 1 :]):
-                del self._open[i:]
+        if tag in _P_CLOSERS and self._open_tags["p"]:
+            i = self._rindex(self._open, "p", window=64)
+            if i >= 0 and not any(t in _SCOPE_TAGS for t in self._open[i + 1 :]):
+                self._open_pop_to(i)
         while self._open and tag in _IMPLIED_END.get(self._open[-1], ()):
-            self._open.pop()
+            self._open_pop_to(len(self._open) - 1)
 
     def _maybe_close_head(self) -> None:
         """HTML5 ends <head> implicitly at the first body element or text, even without </head>.
@@ -213,11 +235,11 @@ class _HtmlExtractor(HTMLParser):
             return
         if tag == "title":
             # <title> lives in <head> (otherwise skipped); ignore <svg><title> and repeats.
-            self._in_title = not any(t == "svg" for t, _ in self._stack) and not self._title
+            self._in_title = not self._stack_tags["svg"] and not self._title
             return
         if tag not in _HEAD_TAGS:
             self._maybe_close_head()
-        # omitted end tags: <p>a<p>b, <li>a<li>b, ... (only matters inside skipped regions)
+        # omitted end tags inside a skipped region: <p>a<p>b, <li>a<li>b, ...
         while self._stack and tag in _IMPLIED_END.get(self._stack[-1][0], ()):
             self._pop_to(len(self._stack) - 1)
         if tag in _CLOSES_SOFT and self._stack and self._mode() == "soft":
@@ -225,9 +247,7 @@ class _HtmlExtractor(HTMLParser):
             self._pop_to(0)  # ...and read the main content
         hidden = _is_hidden(attrs)
         mode = self._mode()
-        if mode == "normal":
-            self._close_implied(tag)
-        else:
+        if mode != "normal":
             if tag in _VOID_TAGS:
                 if mode == "soft":
                     if tag == "br":
@@ -236,24 +256,22 @@ class _HtmlExtractor(HTMLParser):
                         self._flush_soft()
                 return
             kind = "hard" if (tag in _HARD_SKIP or hidden) else ("soft" if tag in _SOFT_SKIP else "inner")
-            self._stack.append((tag, kind))
+            self._push(tag, kind)
             if mode == "soft" and kind != "hard" and tag in _BLOCK_TAGS:
                 self._flush_soft()
             return
+        self._close_implied(tag)
         if tag in _VOID_TAGS:
             if hidden:
                 return
         elif tag in _HARD_SKIP or hidden or tag in _SOFT_SKIP:
             if tag in _BLOCK_TAGS or tag in ("nav", "footer"):
                 self._flush()  # a skipped block still separates the text before and after it
-            if tag in _SOFT_SKIP and not hidden:
-                self._stack.append((tag, "soft"))
-                self._soft_buf, self._soft_blocks = [], []
-            else:
-                self._stack.append((tag, "hard"))
+            self._push(tag, "soft" if (tag in _SOFT_SKIP and not hidden) else "hard")
             return
         else:
             self._open.append(tag)
+            self._open_tags[tag] += 1
         if tag == "h1" and self.h1 is None:
             self._in_h1 = True
         if tag == "pre":
@@ -287,19 +305,19 @@ class _HtmlExtractor(HTMLParser):
             self._in_title = False
             return
         if self._stack:
-            mode = self._mode()
-            for i in range(len(self._stack) - 1, -1, -1):
-                if self._stack[i][0] == tag:
-                    if mode == "soft" and tag in _BLOCK_TAGS:
-                        self._flush_soft()
-                    self._pop_to(i)
-                    return
-            if tag not in self._open or tag in ("body", "html"):
+            if self._stack_tags[tag]:
+                if self._mode() == "soft" and tag in _BLOCK_TAGS:
+                    self._flush_soft()
+                i = len(self._stack) - 1
+                while self._stack[i][0] != tag:  # the counter guarantees a match
+                    i -= 1
+                self._pop_to(i)
+                return
+            if not self._open_tags[tag] or tag in ("body", "html"):
                 return  # a stray end tag (ignored, like browsers do); </body> is treated as end of input
             self._pop_to(0)  # it closes an element that encloses the whole skipped region
-        if tag in self._open:
-            while self._open.pop() != tag:
-                pass
+        if self._open_tags[tag]:
+            self._open_pop_to(self._rindex(self._open, tag))
         if tag == "h1" and self._in_h1:
             self._in_h1 = False
             h1 = normalize_whitespace("".join(self._h1))
@@ -329,15 +347,14 @@ class _HtmlExtractor(HTMLParser):
     def result(self) -> ParsedHtml:
         self._flush()
         blocks = list(self._blocks)
-        if any(kind == "soft" for _, kind in self._stack):
+        if self._stack_kinds["soft"]:
             # A nav / footer / button / select that was never closed swallowed the rest of the page:
             # browsers still show that text, so keep it.
             self._flush_soft()
             blocks += self._soft_blocks
-        if not blocks and self._closed_soft:
+        if not blocks:
             # Nothing outside page furniture (e.g. a page laid out entirely inside <nav>): use the furniture.
-            for _, soft in self._closed_soft:
-                blocks += soft
+            blocks = list(self._closed_soft)
         title = normalize_whitespace("".join(self._title)) or None
         return ParsedHtml(text="\n\n".join(blocks), title=title, h1=self.h1, meta=self.meta)
 
