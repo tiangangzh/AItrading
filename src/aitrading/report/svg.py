@@ -61,7 +61,7 @@ SERIES_FALLBACK_COLORS = (
 
 _TEXT = "var(--chart-text, #0b0b0b)"
 _TEXT2 = "var(--chart-text-2, #52514e)"
-_MUTED = "var(--chart-muted, #898781)"
+_MUTED = "var(--chart-muted, #6b6a65)"  # >= 4.5:1 on the light chart surface
 _GRID = "var(--chart-grid, #e1e0d9)"
 _AXIS = "var(--chart-axis, #c3c2b7)"
 _SURFACE = "var(--chart-surface, #fcfcfb)"
@@ -222,9 +222,11 @@ def downsample(series: pd.Series, max_points: int = MAX_POINTS) -> pd.Series:
     """Reduce ``series`` to at most ``max_points`` points, keeping the shape and the extremes.
 
     The interior is split into equal buckets; each bucket keeps the positions of its minimum and
-    maximum (so the global extremes and every local spike survive) and - when it contains NaNs -
-    the position of its first NaN, so gaps still break the line. The first and last points are
-    always kept. Series that already fit are returned unchanged.
+    maximum (so the global extremes and every local spike survive). The first and last points are
+    always kept. Whenever the original series has a NaN between two consecutive kept finite points,
+    one of those NaN positions is kept too, so every gap that would separate two drawn points still
+    breaks the line (no segment is ever drawn across missing data). Series that already fit are
+    returned unchanged.
     """
     s = series if isinstance(series, pd.Series) else pd.Series(series)
     n = len(s)
@@ -233,8 +235,9 @@ def downsample(series: pd.Series, max_points: int = MAX_POINTS) -> pd.Series:
         return s
     vals = pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
     nan = ~np.isfinite(vals)
-    per_bucket = 3 if nan.any() else 2
-    n_buckets = max(1, (max_points - 2) // per_bucket)
+    has_nan = bool(nan.any())
+    # K kept extremes need at most K - 1 gap markers: 4 per bucket + 3 stays within max_points
+    n_buckets = (max_points - 3) // 4 if has_nan else (max_points - 2) // 2
     edges = np.linspace(1, n - 1, n_buckets + 1).astype(int)
     keep: set[int] = {0, n - 1}
     for b in range(n_buckets):
@@ -242,13 +245,19 @@ def downsample(series: pd.Series, max_points: int = MAX_POINTS) -> pd.Series:
         if hi <= lo:
             continue
         seg = vals[lo:hi]
-        seg_nan = nan[lo:hi]
-        ok = np.flatnonzero(~seg_nan)
+        ok = np.flatnonzero(~nan[lo:hi])
         if ok.size:
             keep.add(lo + int(ok[np.argmin(seg[ok])]))
             keep.add(lo + int(ok[np.argmax(seg[ok])]))
-        if seg_nan.any():
-            keep.add(lo + int(np.argmax(seg_nan)))
+    if has_nan:
+        kept = np.array(sorted(keep))
+        nan_pos = np.flatnonzero(nan)
+        a, b = kept[:-1], kept[1:]
+        # first original NaN after each kept point; it lies inside (a, b) iff it is < b
+        j = np.searchsorted(nan_pos, a, side="right")
+        first = nan_pos[np.minimum(j, nan_pos.size - 1)]
+        bridged = (j < nan_pos.size) & (first < b) & ~nan[a] & ~nan[b]
+        keep.update(int(x) for x in first[bridged])
     return s.iloc[sorted(keep)]
 
 
@@ -446,10 +455,15 @@ def _hover_bands(
         return ""
     k = min(_MAX_HOVER_BANDS, ux.size)
     anchors = ux[np.unique(np.linspace(0, ux.size - 1, k).round().astype(int))]
-    lookup: list[tuple[np.ndarray, np.ndarray]] = []
+    lookup: list[tuple[np.ndarray, np.ndarray, float, float]] = []
     for s in cleaned:
         xs, _ = _x_numbers(s.index)
-        lookup.append((xs, s.to_numpy(dtype=float)))
+        fin = xs[np.isfinite(xs)]
+        # a series only has values inside its own date span (+- half its typical spacing);
+        # outside it (it starts later / ends earlier) the tooltip says n/a instead of reusing an end value
+        tol = 0.5 * float(np.median(np.diff(fin))) if fin.size > 1 else 0.0
+        span = (float(fin.min()) - tol, float(fin.max()) + tol) if fin.size else (math.inf, -math.inf)
+        lookup.append((xs, s.to_numpy(dtype=float), *span))
     out: list[str] = ['<g class="hover-layer">']
     px = [sx(a) for a in anchors]
     span = (anchors[-1] - anchors[0]) if anchors.size > 1 else 0.0
@@ -457,10 +471,13 @@ def _hover_bands(
         left = (px[i - 1] + px[i]) / 2 if i > 0 else px[i] - (px[1] - px[0]) / 2 if len(px) > 1 else px[i] - 4
         right = (px[i] + px[i + 1]) / 2 if i + 1 < len(px) else px[i] + (px[i] - px[i - 1]) / 2 if len(px) > 1 else px[i] + 4
         rows = [_fmt_x(a, is_date, span)]
-        for name, (xs, vs) in zip(names, lookup):
+        for name, (xs, vs, lo, hi) in zip(names, lookup):
             if xs.size == 0:
                 continue
-            j = int(np.argmin(np.abs(xs - a)))
+            if not (lo - 1e-9 <= a <= hi + 1e-9):
+                rows.append(f"{name}: n/a")
+                continue
+            j = int(np.nanargmin(np.abs(xs - a)))
             v = vs[j]
             rows.append(f"{name}: {fmt(v) if math.isfinite(v) else 'n/a'}")
         out.append(f'<rect class="hz" x="{_n(left)}" y="{_n(top)}" width="{_n(max(right - left, 0.5))}" height="{_n(height)}" '
@@ -568,7 +585,7 @@ def line_chart(
         legend_svg, lh = _legend(legend_items, left, top + 10, width - right)
         top += lh + 4
     if y_label:
-        top += 14
+        top += 18
     bottom = 26.0
     plot_h = height - top - bottom
     if plot_h < 80:
@@ -593,7 +610,7 @@ def line_chart(
     head, _ = _svg_open(width, height, title, desc, cls="chart chart-line")
     out = [head, _visible_title(title)]
     if y_label:
-        out.append(f'<text x="0" y="{_n(top - 6)}" font-size="11" style="fill:{_MUTED}">{_e(y_label)}</text>')
+        out.append(f'<text x="0" y="{_n(top - 10)}" font-size="11" style="fill:{_MUTED}">{_e(y_label)}</text>')
     out.append(legend_svg)
 
     # grid + y ticks
@@ -617,7 +634,7 @@ def line_chart(
     out.append(_x_axis(x0, x1, is_date, sx, base_y, left, width - right))
 
     # lines
-    for name, c, xs in zip(names, cleaned, xs_list):
+    for name, c in zip(names, cleaned):
         if not len(c):
             continue
         ds = downsample(c, max_points)

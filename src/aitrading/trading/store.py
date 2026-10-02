@@ -197,12 +197,18 @@ def write_json_atomic(path: Path, obj: Any) -> None:
 
 
 def read_json(path: Path) -> Any:
-    """Parse a JSON file (``FileNotFoundError`` if missing, ``StoreError`` if not valid JSON)."""
+    """Parse a JSON file (``FileNotFoundError`` if missing, ``StoreError`` if it is not valid JSON).
+
+    The bytes are decoded the way RFC 8259 JSON text may be encoded - UTF-8 (also with the BOM some
+    Windows editors add) or UTF-16/32 - so a file re-saved by such an editor still reads. Anything
+    else (binary garbage after a crash or disk error, a cp1252 file with non-ASCII characters) is a
+    ``StoreError`` like any other unreadable file, never a raw ``UnicodeDecodeError``.
+    """
     path = Path(path)
-    raw = _retry_os(lambda: path.read_text(encoding="utf-8"))
+    raw = _retry_os(path.read_bytes)
     try:
         return json.loads(raw)
-    except json.JSONDecodeError as e:
+    except (ValueError, RecursionError) as e:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
         raise StoreError(f"{path} is not valid JSON ({e}); fix or delete the file") from e
 
 
@@ -238,6 +244,18 @@ def _template_key(spec: StrategySpec) -> str | None:
     except Exception:  # pragma: no cover - library unavailable
         return None
     return spec.name if spec.name in TEMPLATES else None
+
+
+def _overwrite_template(spec: StrategySpec, old_meta: dict[str, Any]) -> str | None:
+    """Template provenance of a re-saved spec when no ``template`` is given: the library template
+    the new spec comes from, else the old one only if the spec is still the same spec (same
+    ``spec.name``) - never a template the new spec does not come from."""
+    key = _template_key(spec)
+    if key is not None:
+        return key
+    if old_meta.get("spec_name") == spec.name:
+        return old_meta.get("template")
+    return None
 
 
 def _backtest_headline(bt: BacktestResult) -> dict[str, Any]:
@@ -298,9 +316,11 @@ class StrategyStore:
 
         ``idea`` defaults to ``spec.idea``; ``template`` to the library template the spec was
         built from (``spec.name`` if it is a template key). With ``overwrite=True`` an existing
-        strategy keeps its ``created`` time (and notes/template unless new ones are given) and
-        any paper-trading ledger; its old ``backtest.json`` is removed even when no new backtest
-        is given, because it no longer describes the saved spec. Raises
+        strategy keeps its ``created`` time, its notes unless new ones are given, and any
+        paper-trading ledger; without a new ``template`` it records the template the new spec
+        comes from, keeping the old one only when ``spec.name`` is unchanged. Its old
+        ``backtest.json`` is removed even when no new backtest is given, because it no longer
+        describes the saved spec. Raises
         :class:`StrategyExistsError` if the strategy exists and ``overwrite`` is false.
         """
         if not isinstance(spec, StrategySpec):
@@ -324,7 +344,7 @@ class StrategyStore:
             "created": old_meta.get("created") or now,
             "updated": now,
             "idea": idea if idea is not None else spec.idea,
-            "template": template if template is not None else (old_meta.get("template") or _template_key(spec)),
+            "template": template if template is not None else _overwrite_template(spec, old_meta),
             "notes": notes if notes is not None else (old_meta.get("notes") or ""),
             "spec_name": spec.name,
             "kind": spec.kind,

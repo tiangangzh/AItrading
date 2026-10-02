@@ -21,7 +21,13 @@ each week (Mon-Sun) / month / quarter / calendar year, or every business day for
 
 Otherwise it only marks the book to market. A second call on a day that already rebalanced returns
 ``skipped_reason == 'already rebalanced today'`` without touching the ledger (idempotent). Runs
-must move forward in time; an ``as_of`` before the last run raises ``ValueError``.
+must move forward in time; an ``as_of`` before the last run raises ``ValueError``, and so does an
+``as_of`` in the future (more than one day after the account clock's UTC date, the slack covering
+time zones), since it would block every later real run.
+
+A rebalance whose target cannot mostly be priced - more than half of the target's gross weight has
+no price, as in a data-provider outage - trades nothing and is not recorded as a rebalance, so the
+next run retries it (as ``initial`` / ``late``) instead of leaving the book in cash for a period.
 
 Accounting convention
 ---------------------
@@ -40,13 +46,19 @@ Accounting convention
   cash. ``costs_bps`` defaults to ``spec.costs_bps``.
 * Missing prices: a target name without a price is not traded (warning); a held name without a
   price is carried at its last known price (warning) and cannot be traded until it has a price.
-  A held name without a price for more than ``stale_price_days`` business days is treated as
-  delisted and closed at ``last price x (1 + spec.delisting_return)`` (warning).
-* Corporate actions: prices are adjusted closes, so at each mark the account re-reads the price
-  of the previous mark date. If the provider's history has been re-adjusted since (a split or a
-  dividend), the position is scaled by the adjustment factor - splits do not show up as fake
-  losses and dividends are reinvested (cash in lieu for whole-share accounts), matching the
-  total-return convention of the backtest.
+  The mark records the first run that found the price missing (``PriceMark.missing_since``,
+  cleared when a price comes back); a held name still without a price more than
+  ``stale_price_days`` business days after that run is treated as delisted and closed at
+  ``last price x (1 + spec.delisting_return)`` (warning). The gap is measured from when the price
+  went missing, not from the last priced run, so an account run once a month is not force-closed
+  by a one-day data gap; it always takes at least two runs without a price.
+* Corporate actions: prices are adjusted closes, whose history the provider rescales after a
+  split or dividend. With every mark the account also records an *anchor* price two business days
+  earlier (a final close even when the run happens intraday, before today's close is final). At
+  the next run the anchor is re-read; if the provider's history has been re-adjusted since, the
+  position is scaled by the adjustment factor (and its mark divided by it, so its value is
+  unchanged) - splits do not show up as fake losses and dividends are reinvested (cash in lieu
+  for whole-share accounts), matching the total-return convention of the backtest.
 
 Paper results differ from the backtest because the backtest trades at the next session's close
 (``execution_lag=1``) while paper fills use the ``as_of`` close, because of whole shares, skipped
@@ -58,7 +70,8 @@ from __future__ import annotations
 import logging
 import math
 import os
-from datetime import date, datetime, timezone
+import re
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -85,6 +98,8 @@ __all__ = [
     "ALREADY_REBALANCED",
     "DEFAULT_MIN_TRADE_PCT",
     "DEFAULT_STALE_PRICE_DAYS",
+    "ANCHOR_LAG_BDAYS",
+    "MAX_UNPRICED_TARGET_WEIGHT",
     "LedgerError",
     "Order",
     "Trade",
@@ -109,6 +124,10 @@ _PERIOD_CODES = {"weekly": "W-SUN", "monthly": "M", "quarterly": "Q", "annual": 
 _BDAY = pd.offsets.BDay()
 _SPLIT_WARN = 0.05  # adjustment factors further than this from 1 are reported as warnings
 _FACTOR_EPS = 1e-6  # ... closer than this are float noise
+ANCHOR_LAG_BDAYS = 2  # anchor prices are this many business days before the mark date
+MAX_UNPRICED_TARGET_WEIGHT = 0.5  # above this share of the target's gross weight unpriced: no rebalance
+FUTURE_SLACK_DAYS = 1  # as_of may be this many days after the clock's UTC date (time zones)
+_ARCHIVE_RE = re.compile(r"^ledger-(\d{8}T\d{6}Z)(?:-(\d+))?\.json$")
 
 
 # ------------------------------------------------------------------------------------------------
@@ -148,10 +167,15 @@ class Trade(Order):
 
 
 class PriceMark(BaseModel):
-    """Last valid price of a held name and the run date it was observed on."""
+    """Last valid price of a held name and the run date it was observed on, plus the anchor price
+    (``anchor_date`` = two business days earlier) used to detect re-adjusted price history.
+    ``missing_since`` is the first run since then that found no price (None while priced)."""
 
     price: float = Field(gt=0)
     as_of: date
+    anchor_date: date | None = None
+    anchor_price: float | None = Field(None, gt=0)
+    missing_since: date | None = None
 
 
 class PaperLedger(BaseModel):
@@ -257,6 +281,10 @@ def next_rebalance_date(after: date, frequency: str) -> date:
     return end.date()
 
 
+def _anchor_date(as_of: date) -> date:
+    return (pd.Timestamp(as_of) - ANCHOR_LAG_BDAYS * _BDAY).date()
+
+
 def is_rebalance_day(as_of: date, frequency: str) -> bool:
     """True when ``as_of`` is itself a scheduled rebalance date (a business day ending its period)."""
     d = _as_date(as_of)
@@ -328,7 +356,12 @@ class PaperAccount:
     ``min_trade_pct`` and ``stale_price_days`` are execution settings applied from now on. Every
     operation re-reads ``ledger.json`` first and writes it atomically at the end, so several
     ``PaperAccount`` objects (or CLI runs) on the same strategy see one consistent ledger and a
-    failing runner leaves the ledger untouched.
+    failing runner leaves the ledger untouched. Runs are not locked against each other: do not
+    run two operations on the same strategy at the same moment (the last write wins; the file
+    itself can never be left half-written). The constructor does not read the ledger: an
+    unreadable ``ledger.json`` raises :class:`LedgerError` from the operations that need it, so
+    :meth:`reset` can always be called on a freshly created account. ``clock`` (default: UTC now)
+    stamps the ledger and bounds ``as_of`` (no runs in the future).
     """
 
     def __init__(
@@ -361,7 +394,8 @@ class PaperAccount:
         self.min_trade_pct = float(min_trade_pct)
         self.stale_price_days = int(stale_price_days)
         self._clock = clock or _utcnow
-        self._ledger = self._read_ledger()
+        # Not read here (see the class docstring): a corrupt ledger must not prevent reset().
+        self._ledger: PaperLedger | None = None
 
     def __repr__(self) -> str:
         return f"PaperAccount(name={self.name!r}, ledger={str(self.ledger_path)!r})"
@@ -403,8 +437,9 @@ class PaperAccount:
         return led
 
     def _reload(self) -> PaperLedger:
-        self._ledger = self._read_ledger()
-        return self._ledger.model_copy(deep=True)
+        led = self._read_ledger()
+        self._ledger = led
+        return led.model_copy(deep=True)
 
     def _save(self, led: PaperLedger) -> None:
         led.positions = {t: s for t, s in sorted(led.positions.items()) if s != 0.0}
@@ -443,8 +478,19 @@ class PaperAccount:
         return float(led.cash + sum(sh * led.last_prices[t].price for t, sh in led.positions.items()))
 
     def archived_ledgers(self) -> list[Path]:
-        """Ledgers archived by :meth:`reset`, oldest first."""
-        return sorted(self.path.glob("ledger-*.json")) if self.path.is_dir() else []
+        """Ledgers archived by :meth:`reset`, oldest first: by archive time, then by the counter
+        that same-second archives get (``ledger-<stamp>.json``, ``-1``, ``-2``, ... ``-10``).
+        Other ``ledger-*.json`` files (e.g. hand-made copies) come first, by name."""
+        if not self.path.is_dir():
+            return []
+
+        def key(p: Path) -> tuple[int, str, int, str]:
+            m = _ARCHIVE_RE.match(p.name)
+            if m is None:
+                return (0, "", 0, p.name)
+            return (1, m.group(1), int(m.group(2) or 0), p.name)
+
+        return sorted(self.path.glob("ledger-*.json"), key=key)
 
     def _stored_spec(self) -> StrategySpec | None:
         try:
@@ -463,6 +509,21 @@ class PaperAccount:
         return float(stored.costs_bps) if stored is not None else None
 
     # ------------------------------------------------------------------ helpers
+    def _today(self) -> date:
+        """The clock's date in UTC (a naive clock is taken as is)."""
+        now = self._clock()
+        if now.tzinfo is not None:
+            now = now.astimezone(timezone.utc)
+        return now.date()
+
+    def _check_not_future(self, as_of: date) -> None:
+        today = self._today()
+        if as_of > today + timedelta(days=FUTURE_SLACK_DAYS):
+            raise ValueError(
+                f"as_of {as_of} is in the future (today is {today} UTC); paper trading only fills at prices that "
+                "exist, and a run recorded in the future would block every real run until that date - check the date"
+            )
+
     @staticmethod
     def _check_chronology(led: PaperLedger, as_of: date) -> None:
         last = led.runs[-1][0] if led.runs else None
@@ -511,40 +572,48 @@ class PaperAccount:
         warnings: list[str],
         notes: list[str],
     ) -> None:
-        """Scale held positions whose adjusted price history changed since their last mark."""
+        """Scale held positions whose adjusted price history changed since their last mark
+        (detected by re-reading the mark's anchor price, see the module docstring)."""
         groups: dict[date, list[str]] = {}
         for t in sorted(led.positions):
             mark = led.last_prices[t]
-            if mark.as_of < as_of and _valid_price(prices.get(t)):
-                groups.setdefault(mark.as_of, []).append(t)
-        for mark_date, names in sorted(groups.items()):
-            prev = self._fetch_prices(runner, names, mark_date)
+            if (
+                mark.as_of < as_of
+                and mark.anchor_date is not None
+                and mark.anchor_price is not None
+                and _valid_price(prices.get(t))
+            ):
+                groups.setdefault(mark.anchor_date, []).append(t)
+        for anchor_date, names in sorted(groups.items()):
+            reread = self._fetch_prices(runner, names, anchor_date)
             for t in names:
-                pv = prev.get(t)
+                pv = reread.get(t)
                 if not _valid_price(pv):
                     continue
                 pv = float(pv)
-                factor = led.last_prices[t].price / pv
+                mark = led.last_prices[t]
+                factor = float(mark.anchor_price) / pv
                 if abs(factor - 1.0) <= _FACTOR_EPS:
                     continue
                 if not (0.01 <= factor <= 100.0):
                     warnings.append(
-                        f"{t}: the provider's price for {mark_date} changed by a factor of {factor:.4g} since it was "
+                        f"{t}: the provider's price for {anchor_date} changed by a factor of {factor:.4g} since it was "
                         "recorded - too large for a split or dividend adjustment; position left unchanged, check the data"
                     )
                     continue
                 old = led.positions[t]
                 new = old * factor
+                adj_price = mark.price / factor
                 if self.allow_fractional:
                     new = round(new, 6)
                 else:
                     whole = float(math.trunc(new))
-                    led.cash += (new - whole) * pv  # cash in lieu of the fractional share
+                    led.cash += (new - whole) * adj_price  # cash in lieu of the fractional share
                     new = whole
                 led.positions[t] = new
-                led.last_prices[t] = PriceMark(price=pv, as_of=mark_date)
+                led.last_prices[t] = PriceMark(price=adj_price, as_of=mark.as_of, anchor_date=anchor_date, anchor_price=pv)
                 msg = (
-                    f"{t}: price history re-adjusted since {mark_date} (factor {factor:.4f}, a split or dividend); "
+                    f"{t}: price history re-adjusted since {mark.as_of} (factor {factor:.4f}, a split or dividend); "
                     f"position scaled from {_fmt_shares(old)} to {_fmt_shares(new)} shares"
                 )
                 (warnings if abs(factor - 1.0) > _SPLIT_WARN else notes).append(msg)
@@ -564,15 +633,29 @@ class PaperAccount:
         tickers = sorted(set(led.positions) | set(extra_tickers))
         prices = self._fetch_prices(runner, tickers, as_of)
         self._apply_corporate_actions(led, runner, as_of, prices, warnings, notes)
-        for t, p in prices.items():
-            if _valid_price(p):
-                led.last_prices[t] = PriceMark(price=float(p), as_of=as_of)
+        valid = [t for t, p in prices.items() if _valid_price(p)]
+        anchor_d = _anchor_date(as_of)
+        anchors = self._fetch_prices(runner, valid, anchor_d)
+        for t in valid:
+            a = anchors.get(t)
+            ok = _valid_price(a)
+            led.last_prices[t] = PriceMark(
+                price=float(prices[t]),
+                as_of=as_of,
+                anchor_date=anchor_d if ok else None,
+                anchor_price=float(a) if ok else None,
+            )
         delisted: list[Order] = []
         for t in sorted(led.positions):
             if _valid_price(prices.get(t)):
                 continue
             mark = led.last_prices[t]
-            gap = int(np.busday_count(mark.as_of, as_of))
+            if mark.missing_since is None or mark.missing_since > as_of:
+                mark = mark.model_copy(update={"missing_since": as_of})
+                led.last_prices[t] = mark
+            since = mark.missing_since
+            assert since is not None
+            gap = int(np.busday_count(since, as_of))  # business days since the first run without a price
             if delisting_return is not None and gap > self.stale_price_days:
                 shares = led.positions.pop(t)
                 px = mark.price * (1.0 + float(delisting_return))
@@ -589,13 +672,15 @@ class PaperAccount:
                 led.trades.append(Trade(as_of=as_of, **order.model_dump()))
                 delisted.append(order)
                 warnings.append(
-                    f"{t} has had no price for {gap} business days (since {mark.as_of}); treated as delisted and "
-                    f"closed at its last price x (1 + delisting_return {float(delisting_return):+.0%}) = {px:,.4f}"
+                    f"{t} has had no price for {gap} business days (missing since the run of {since}; last price "
+                    f"{mark.price:,.4f} from {mark.as_of}); treated as delisted and closed at its last price x "
+                    f"(1 + delisting_return {float(delisting_return):+.0%}) = {px:,.4f}"
                 )
             else:
+                missing = f", missing since the run of {since}" if since < as_of else ""
                 warnings.append(
-                    f"no price for held position {t} on {as_of}: carried at its last known price {mark.price:,.4f} "
-                    f"(from {mark.as_of}); it cannot be traded until a price is available"
+                    f"no price for held position {t} on {as_of}{missing}: carried at its last known price "
+                    f"{mark.price:,.4f} (from {mark.as_of}); it cannot be traded until a price is available"
                 )
         return prices, delisted
 
@@ -644,6 +729,7 @@ class PaperAccount:
         """Rebalance to ``runner.target_portfolio(spec, as_of)`` if due (see module docstring),
         otherwise mark to market; persists the ledger and returns what happened."""
         as_of = _as_date(as_of)
+        self._check_not_future(as_of)
         led = self._reload()
         self._check_chronology(led, as_of)
         nxt = next_rebalance_date(as_of, spec.rebalance)
@@ -716,10 +802,42 @@ class PaperAccount:
             )
 
         assert target is not None
-        for t, w in target.items():
-            if not _valid_price(prices.get(t)):
-                kept = " (the current position is kept)" if t in led.positions else ""
-                warnings.append(f"no price for {t} on {as_of}; its target weight {w:+.2%} was not traded{kept}")
+        unpriced = [t for t in target.index if not _valid_price(prices.get(t))]
+        gross = float(target.abs().sum())
+        unpriced_gross = float(target[unpriced].abs().sum()) if unpriced else 0.0
+        if gross > 0 and unpriced_gross > MAX_UNPRICED_TARGET_WEIGHT * gross:
+            # Most of the target cannot be priced (a data outage): trading the rest would leave the
+            # book mostly in cash for a whole period. Trade nothing and do not count this run as a
+            # rebalance, so the next run retries it (as "initial" / "late").
+            retry = (
+                "run again with force=True once prices are available"
+                if trigger == "forced"
+                else f"the {trigger} rebalance will be retried on the next run"
+            )
+            reason = (
+                f"{len(unpriced)} of {len(target)} target names ({unpriced_gross / gross:.0%} of the target's gross "
+                f"weight) have no price on {as_of} - probably a data outage; nothing was traded and {retry}"
+            )
+            warnings.append(reason)
+            self._record_run(led, as_of, nav_before, False, warnings)
+            self._save(led)
+            return RebalanceReport(
+                as_of=as_of,
+                rebalanced=False,
+                orders=delisted,
+                nav_before=nav_before,
+                nav_after=nav_before,
+                cash_after=led.cash,
+                target_weights={t: float(w) for t, w in target.items()},
+                skipped_reason=reason,
+                warnings=warnings,
+                notes=notes,
+                next_rebalance=nxt,
+            )
+        for t in unpriced:
+            w = float(target[t])
+            kept = " (the current position is kept)" if t in led.positions else ""
+            warnings.append(f"no price for {t} on {as_of}; its target weight {w:+.2%} was not traded{kept}")
         tradable = [t for t in sorted(set(led.positions) | set(target.index)) if _valid_price(prices.get(t))]
         costs_bps = self.costs_bps if self.costs_bps is not None else float(spec.costs_bps)
         rate = costs_bps / 1e4
@@ -783,9 +901,11 @@ class PaperAccount:
 
         Before the first rebalance the account holds only cash: the initial capital is returned
         and nothing is written. ``spec`` (default: the saved spec) supplies ``delisting_return``
-        for long-stale positions; without one, stale positions are just carried.
+        for long-stale positions; without one, stale positions are just carried. Raises
+        ``ValueError`` for an ``as_of`` before the last run or in the future.
         """
         as_of = _as_date(as_of)
+        self._check_not_future(as_of)
         led = self._reload()
         if led.started is None:
             return float(led.cash)
@@ -804,11 +924,13 @@ class PaperAccount:
         """Start the account over (with ``initial_capital``, default: the current ledger's).
 
         The old ledger is kept as ``ledger-<UTC timestamp>.json`` next to it; returns that path
-        (``None`` if there was no ledger yet). Works on a corrupt ledger too.
+        (``None`` if there was no ledger yet). Works on a corrupt or unreadable ledger too (its
+        capital then defaults to this object's ``initial_capital``), also from a newly created
+        account object - the constructor never reads the ledger.
         """
         try:
             old_capital = self._read_ledger().initial_capital
-        except LedgerError:
+        except Exception:  # noqa: BLE001 - best effort: the old ledger is only archived, never needed
             old_capital = self.initial_capital
         capital = old_capital if initial_capital is None else initial_capital
         if not _valid_price(capital):
@@ -849,6 +971,7 @@ class PaperAccount:
                     "market_value": value,
                     "weight": value / nav if nav > 0 else None,
                     "target_weight": led.last_target.get(t),
+                    "price_missing_since": mark.missing_since.isoformat() if mark.missing_since else None,
                 }
             )
         rows.sort(key=lambda r: (-abs(r["market_value"]), r["ticker"]))
@@ -860,7 +983,11 @@ class PaperAccount:
         Keys
         ----
         name, slug, status ("not_started" | "active"), started, last_run, last_rebalance,
-        next_rebalance, rebalance (ISO dates or None; frequency of the last rebalance),
+        next_rebalance, rebalance (ISO dates or None; frequency of the last rebalance) where
+        next_rebalance is the first scheduled rebalance date after ``last_rebalance``,
+        rebalance_due (True when next_rebalance is on or before ``last_run``: a run on or after it
+        only marked to market, so the next ``rebalance()`` trades whatever its date; None before
+        the start),
         initial_capital, cash, nav, long_value, short_value, gross_exposure_pct, net_exposure_pct,
         since_start_return_pct (NAV / initial capital - 1, %, None before the start),
         backtest_expected_return_pct (compounded backtest strategy return over (started,
@@ -868,9 +995,11 @@ class PaperAccount:
         backtest_window ({start, end, n_periods} of the periods used, or None),
         max_drawdown_pct (of the NAV path, <= 0, None before the start), total_costs, n_trades,
         nav_history [(date_iso, nav), ...] oldest first,
-        holdings [{ticker, shares, side, price, price_date, market_value, weight, target_weight}]
-        largest first, trades [{date, ticker, side, shares, price, notional, cost, reason}]
-        latest first, runs [(date_iso, rebalanced)], warnings (of the last run),
+        holdings [{ticker, shares, side, price, price_date, market_value, weight, target_weight,
+        price_missing_since}] largest first (``price_missing_since``: ISO date of the first run
+        without a price while the name is carried at a stale mark, else None),
+        trades [{date, ticker, side, shares, price, notional, cost, reason}] latest first,
+        runs [(date_iso, rebalanced)], warnings (of the last run),
         costs_bps (configured, else the saved spec's), allow_fractional, ledger_path.
         """
         led = self._reload()
@@ -899,9 +1028,16 @@ class PaperAccount:
             if backtest is not None:
                 window = backtest_return_over_window(backtest, started, last_run)
 
+        # The next scheduled rebalance after the last one actually made. When a run on or after that
+        # date only marked to market (mark_to_market, or an outage), it is still pending: the next
+        # rebalance() trades whatever its date, so the dashboard must show it as due, not the
+        # following period's date.
         nxt = None
-        if led.rebalance_frequency and last_run is not None:
-            nxt = next_rebalance_date(last_run, led.rebalance_frequency).isoformat()
+        due = None
+        if led.rebalance_frequency and led.last_rebalance is not None:
+            nxt_d = next_rebalance_date(led.last_rebalance, led.rebalance_frequency)
+            nxt = nxt_d.isoformat()
+            due = last_run is not None and nxt_d <= last_run
 
         def _iso(d: date | None) -> str | None:
             return d.isoformat() if d is not None else None
@@ -914,6 +1050,7 @@ class PaperAccount:
             "last_run": _iso(last_run),
             "last_rebalance": _iso(led.last_rebalance),
             "next_rebalance": nxt,
+            "rebalance_due": due,
             "rebalance": led.rebalance_frequency,
             "initial_capital": led.initial_capital,
             "cash": led.cash,
