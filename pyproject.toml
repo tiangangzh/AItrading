@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aitrading"
+version = "0.1.0"
+description = "Institutional-data equity research pipeline: NL screening, technical/fundamental scanners, narrative engine and an LLM agent that explains dislocations."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+dependencies = [
+    "anthropic>=1.11",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "pydantic>=2.7",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+# Vendor SDKs are licensed and/or only available inside the vendor environment.
+# They are imported lazily by the adapters; install the one you are entitled to.
+bloomberg = ["blpapi"]          # Desktop/Server API; BQL's `bql` package ships inside BQuant only
+lseg = ["lseg-data"]
+
+[project.scripts]
+aitrading = "aitrading.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
