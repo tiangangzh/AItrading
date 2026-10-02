@@ -41,14 +41,15 @@ Formation.
   library) using ``momentum_12_1`` at ``t`` (the caller's t-12..t-1 formation return known at
   ``t``), whichever ``formation`` is chosen.
 
-Breakpoints. Size: median market cap of NYSE names when at least ``MIN_NYSE_NAMES`` (20) NYSE
-names have data, otherwise the median of all names (a warning is issued). B/M, OP, INV and
-momentum: 30th/70th percentiles (``numpy.percentile``, linear interpolation) of NYSE names with
-data, under the same 20-name rule. Assignment follows the common WRDS replication convention:
+Breakpoints. Each 2x3 sort uses the names that can enter it (positive market cap at formation and
+a finite characteristic; for B/M, book equity <= 0 and a non-positive December cap are excluded).
+Size: the median market cap of the NYSE names among them when at least ``MIN_NYSE_NAMES`` (20)
+NYSE names qualify, otherwise the median of all of them (a warning is issued). B/M, OP, INV and
+momentum: 30th/70th percentiles (``numpy.percentile``, linear interpolation) of the same names,
+under the same 20-NYSE-name rule. This is the sample the standard WRDS replication of the French
+factors uses (NYSE names with positive BE and ME). Assignment follows the same convention:
 Small if cap <= median else Big; Low if x <= p30, Middle if p30 < x <= p70, High if x > p70.
-Names need a positive market cap and a finite characteristic to enter a 2x3 sort; for B/M, book
-equity <= 0 is excluded (and so is a non-positive December cap). OP and INV are used as given -
-set OP to NaN when book equity is not positive.
+OP and INV are used as given - set OP to NaN when book equity is not positive.
 
 Sorts are independent 2x3 sorts: size (S, B) x tercile of the characteristic:
 B/M -> L, M, H; OP -> W (weak), N, R (robust); INV -> C (conservative = low asset growth), N,
@@ -128,23 +129,17 @@ class CharacteristicsPanel:
 
 @dataclass(frozen=True)
 class SortBreakpoints:
+    """Breakpoints of one 2x3 sort: size median, 30th and 70th characteristic percentiles."""
+
     size: float
     low: float
     high: float
-    size_from_nyse: bool
-    char_from_nyse: bool
+    from_nyse: bool = False  # True when computed from NYSE names only (>= MIN_NYSE_NAMES of them)
+    n_names: int = 0         # names that entered the sort
+    n_nyse: int = 0          # NYSE names among them
 
 
 # ------------------------------------------------------------------------------------ sorting
-
-
-def _breakpoints(values: np.ndarray, nyse: np.ndarray | None, qs: tuple[float, ...], min_nyse: int) -> tuple[np.ndarray, bool]:
-    """Percentiles ``qs`` (0-100) of NYSE values when >= min_nyse are available, else of all values."""
-    if nyse is not None:
-        ny = values[nyse]
-        if ny.size >= min_nyse:
-            return np.percentile(ny, qs), True
-    return np.percentile(values, qs), False
 
 
 def _sort_codes(
@@ -152,16 +147,19 @@ def _sort_codes(
 ) -> tuple[np.ndarray, SortBreakpoints | None]:
     """2x3 codes (size_code * 3 + tercile, -1 = not sorted) for one formation date."""
     codes = np.full(size.shape, -1, dtype=np.int64)
-    size_ok = np.isfinite(size) & (size > 0)
-    ok = size_ok & np.isfinite(char)
+    with np.errstate(invalid="ignore"):
+        ok = np.isfinite(size) & (size > 0) & np.isfinite(char)
     if not ok.any():
         return codes, None
-    (size_bp,), size_nyse = _breakpoints(size[size_ok], None if nyse is None else nyse[size_ok], (50.0,), min_nyse)
-    (lo, hi), char_nyse = _breakpoints(char[ok], None if nyse is None else nyse[ok], (30.0, 70.0), min_nyse)
+    ny = np.zeros_like(ok) if nyse is None else (nyse & ok)
+    n_nyse = int(ny.sum())
+    base = ny if n_nyse >= min_nyse else ok
+    size_bp = float(np.percentile(size[base], 50.0))
+    lo, hi = (float(x) for x in np.percentile(char[base], [30.0, 70.0]))
     size_code = np.where(size <= size_bp, 0, 1)
     char_code = np.where(char <= lo, 0, np.where(char <= hi, 1, 2))
     codes[ok] = (size_code * 3 + char_code)[ok]
-    return codes, SortBreakpoints(float(size_bp), float(lo), float(hi), size_nyse, char_nyse)
+    return codes, SortBreakpoints(size_bp, lo, hi, n_nyse >= min_nyse, int(ok.sum()), n_nyse)
 
 
 def _nyse_mask(exchange: pd.Series | None, tickers: pd.Index) -> np.ndarray | None:
@@ -181,10 +179,12 @@ def two_by_three_sort(
 ) -> tuple[pd.Series, SortBreakpoints | None]:
     """Independent 2x3 sort of one cross-section (see the module docstring for the rules).
 
-    Returns ``(labels, breakpoints)``: labels such as ``"S/L"`` / ``"B/H"`` indexed by ticker (NaN
+    Returns ``(labels, breakpoints)``: labels such as ``"S/L"`` / ``"B/H"`` indexed by ticker (None
     for names that cannot be sorted) and the breakpoints used (None when nothing is sortable).
-    The size median uses every name with a positive size; the 30/70 breakpoints use names with a
-    positive size and a finite characteristic; both from NYSE names when >= ``min_nyse`` have data.
+    Names enter the sort with a positive size and a finite characteristic; the size median and the
+    30/70 breakpoints are computed from the NYSE names among them when at least ``min_nyse``
+    qualify, otherwise from all of them. ``exchange`` maps ticker -> exchange label
+    (see :data:`NYSE_CODES`).
     """
     tickers = size.index.union(characteristic.index)
     s = size.reindex(tickers).to_numpy(dtype=float)
@@ -303,10 +303,9 @@ class _Builder:
     def _record(self, label: str, bps: SortBreakpoints | None, row: int) -> None:
         if bps is None or self.nyse is None:
             return
-        for part, from_nyse in ((f"{label} size", bps.size_from_nyse), (label, bps.char_from_nyse)):
-            self._n_formations[part] = self._n_formations.get(part, 0) + 1
-            if not from_nyse:
-                self._fallbacks.setdefault(part, []).append(self.index[row])
+        self._n_formations[label] = self._n_formations.get(label, 0) + 1
+        if not bps.from_nyse:
+            self._fallbacks.setdefault(label, []).append(self.index[row])
 
     def held_codes(self, sort: _SortSpec, rows: list[int], size_rows: list[np.ndarray], chars: list[np.ndarray]) -> np.ndarray:
         """Codes held in each period: the portfolio formed at the latest formation row < period."""
@@ -346,12 +345,11 @@ class _Builder:
                 "so the size median and 30/70 breakpoints are tilted toward whatever the universe holds"
             )
             return
-        for part, dates in self._fallbacks.items():
-            kind = "median" if part.endswith(" size") else "30/70 breakpoints"
+        for label, dates in self._fallbacks.items():
             self.warnings.append(
-                f"{part} {kind}: fewer than {MIN_NYSE_NAMES} NYSE names with data at {len(dates)} of "
-                f"{self._n_formations.get(part, len(dates))} formation date(s) (first {_fmt(dates[0])}); "
-                f"all names were used instead"
+                f"{label} breakpoints: fewer than {MIN_NYSE_NAMES} NYSE names with data at {len(dates)} of "
+                f"{self._n_formations.get(label, len(dates))} formation date(s) (first {_fmt(dates[0])}); "
+                f"the size median and 30/70 percentiles of all names were used instead"
             )
 
 
@@ -451,22 +449,19 @@ def construct_factors(
         first_row = rows[0] if rows else None
         sizes = [b.ME[r] for r in rows]
 
-        # B/M
+        # B/M = book equity / (December or current) market cap; book equity <= 0 is excluded
         assert BE is not None
         bm_chars: list[np.ndarray] = []
         n_neg = 0
-        for r, d in zip(rows, denom_rows):
+        for r, d, size in zip(rows, denom_rows, sizes):
             be, me_d = BE[r], b.ME[d]
-            neg = np.isfinite(be) & (be <= 0)
-            n_neg += int((neg & np.isfinite(sizes[len(bm_chars)]) & (sizes[len(bm_chars)] > 0)).sum())
+            n_neg += int((np.isfinite(be) & (be <= 0) & np.isfinite(size) & (size > 0)).sum())
             with np.errstate(invalid="ignore", divide="ignore"):
-                bm = np.where((be > 0) & (me_d > 0), be / np.where(me_d > 0, me_d, 1.0), np.nan)
-            bm_chars.append(bm)
+                bm_chars.append(np.where((be > 0) & (me_d > 0), be / np.where(me_d > 0, me_d, 1.0), np.nan))
         if n_neg:
             b.warnings.append(
                 f"{n_neg} name-formation(s) with non-positive book equity were excluded from the B/M sorts"
             )
-        smb_users = {k: ["SMB"] for k in range(6)}
         bm_held = b.held_codes(_SORTS["bm"], rows, sizes, bm_chars)
         bm_rets = b.portfolios(_SORTS["bm"], bm_held, first_row,
                                {k: ["SMB"] + (["HML"] if k in (0, 2, 3, 5) else []) for k in range(6)})
@@ -490,7 +485,6 @@ def construct_factors(
         else:
             out[cols[1]] = smb_bm
             out[cols[2]] = hml
-        del smb_users
 
         if model == "carhart4":
             MOM = _asof(panel.momentum_12_1, b.index, b.tickers, "momentum_12_1")
@@ -546,19 +540,17 @@ def _monthly_key(s: pd.Series) -> pd.Series:
 
 
 def _align_pair(a: pd.Series, b: pd.Series) -> tuple[pd.Series, pd.Series, float]:
+    """Inner-join two factor series on comparable periods; also return periods per year."""
     a = a[~a.index.duplicated(keep="last")].sort_index()
     b = b[~b.index.duplicated(keep="last")].sort_index()
-    a_monthly, b_monthly = _periods_per_year(a.index) <= 12, _periods_per_year(b.index) <= 12
-    if a_monthly or b_monthly:
-        a = _monthly_key(a) if a_monthly else _to_monthly(a)
-        b = _monthly_key(b) if b_monthly else _to_monthly(b)
-        ppy = 12.0 if (a_monthly and b_monthly) or True else 12.0
-        if a_monthly and b_monthly:
-            ppy = min(_periods_per_year(a.index), _periods_per_year(b.index))
-    else:
+    a_low, b_low = _periods_per_year(a.index) <= 12, _periods_per_year(b.index) <= 12
+    if a_low or b_low:  # at least one side is monthly (or coarser): align on calendar months
+        a = _monthly_key(a) if a_low else _to_monthly(a)
+        b = _monthly_key(b) if b_low else _to_monthly(b)
+    else:  # both daily / weekly: align on dates
         a.index = pd.DatetimeIndex(a.index).normalize()
         b.index = pd.DatetimeIndex(b.index).normalize()
-        ppy = _periods_per_year(a.index)
+    ppy = _periods_per_year(a.index) if len(a) >= 2 else _periods_per_year(b.index)
     joined = pd.concat([a.rename("a"), b.rename("b")], axis=1, join="inner").dropna()
     return joined["a"], joined["b"], ppy
 

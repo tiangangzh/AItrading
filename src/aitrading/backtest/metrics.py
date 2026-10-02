@@ -202,16 +202,25 @@ def _clean(series: pd.Series, name: str) -> pd.Series:
     return s.dropna()
 
 
-def _compound_onto(series: pd.Series, target: pd.DatetimeIndex) -> pd.Series:
+_CALENDAR_PERIOD = {52.0: "W-FRI", 12.0: "M", 4.0: "Q", 1.0: "Y"}
+
+
+def _compound_onto(series: pd.Series, target: pd.DatetimeIndex, ppy: float) -> pd.Series:
     """Compound a finer series into the intervals (previous target date, target date].
 
-    The first interval starts one target spacing before the first target date. Intervals
-    without observations are NaN.
+    The first interval starts at the beginning of the calendar week / month / quarter / year
+    containing the first target date (for those periodicities), otherwise one target spacing
+    before it. Intervals without observations are NaN.
     """
     if len(target) < 2:
         return pd.Series(np.nan, index=target)
-    first_start = target[0] - (target[1] - target[0])
-    s = series[(series.index > first_start) & (series.index <= target[-1])]
+    code = _CALENDAR_PERIOD.get(float(ppy))
+    if code is not None:
+        lower = target[0].to_period(code).start_time
+        keep = series.index >= lower
+    else:
+        keep = series.index > target[0] - (target[1] - target[0])
+    s = series[keep & (series.index <= target[-1])]
     pos = target.searchsorted(s.index, side="left")
     grouped = (1.0 + s).groupby(pos).prod() - 1.0
     out = pd.Series(np.nan, index=target)
@@ -233,7 +242,7 @@ def _align_rf(rf: pd.Series, index: pd.DatetimeIndex, ppy: float) -> pd.Series:
         return pd.Series(0.0, index=index)
     rf_ppy = infer_periods_per_year(rf.index) if len(rf) >= 2 else ppy
     if rf_ppy > 1.5 * ppy and len(index) >= 2:
-        out = _compound_onto(rf, index)
+        out = _compound_onto(rf, index, ppy)
     else:
         conv = (1.0 + rf) ** (rf_ppy / ppy) - 1.0
         out = conv.reindex(conv.index.union(index)).ffill().reindex(index)
@@ -244,7 +253,7 @@ def _align_benchmark(bench: pd.Series, index: pd.DatetimeIndex, ppy: float) -> p
     """Benchmark returns on the return dates: exact date match, or compounded when finer."""
     bench = _clean(bench, "benchmark")
     if len(bench) >= 2 and infer_periods_per_year(bench.index) > 1.5 * ppy and len(index) >= 2:
-        return _compound_onto(bench, index)
+        return _compound_onto(bench, index, ppy)
     return bench.reindex(index)
 
 

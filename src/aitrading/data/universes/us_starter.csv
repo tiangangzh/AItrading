@@ -1,0 +1,151 @@
+ticker,name,gics_sector
+AAPL,Apple Inc.,Information Technology
+MSFT,Microsoft Corporation,Information Technology
+NVDA,NVIDIA Corporation,Information Technology
+AVGO,Broadcom Inc.,Information Technology
+ORCL,Oracle Corporation,Information Technology
+CRM,"Salesforce, Inc.",Information Technology
+ADBE,Adobe Inc.,Information Technology
+AMD,"Advanced Micro Devices, Inc.",Information Technology
+QCOM,QUALCOMM Incorporated,Information Technology
+INTU,Intuit Inc.,Information Technology
+FFIV,"F5, Inc.",Information Technology
+DOCU,"DocuSign, Inc.",Information Technology
+PSTG,"Pure Storage, Inc.",Information Technology
+MANH,"Manhattan Associates, Inc.",Information Technology
+ZBRA,Zebra Technologies Corporation,Information Technology
+TER,"Teradyne, Inc.",Information Technology
+CIEN,Ciena Corporation,Information Technology
+DT,"Dynatrace, Inc.",Information Technology
+TWLO,Twilio Inc.,Information Technology
+OKTA,"Okta, Inc.",Information Technology
+UNH,UnitedHealth Group Incorporated,Health Care
+LLY,Eli Lilly and Company,Health Care
+JNJ,Johnson & Johnson,Health Care
+ABBV,AbbVie Inc.,Health Care
+MRK,"Merck & Co., Inc.",Health Care
+TMO,Thermo Fisher Scientific Inc.,Health Care
+ISRG,"Intuitive Surgical, Inc.",Health Care
+VRTX,Vertex Pharmaceuticals Incorporated,Health Care
+EXEL,"Exelixis, Inc.",Health Care
+INCY,Incyte Corporation,Health Care
+MEDP,"Medpace Holdings, Inc.",Health Care
+DXCM,"DexCom, Inc.",Health Care
+NBIX,"Neurocrine Biosciences, Inc.",Health Care
+UTHR,United Therapeutics Corporation,Health Care
+HALO,"Halozyme Therapeutics, Inc.",Health Care
+ENSG,"The Ensign Group, Inc.",Health Care
+JPM,JPMorgan Chase & Co.,Financials
+BAC,Bank of America Corporation,Financials
+GS,"The Goldman Sachs Group, Inc.",Financials
+V,Visa Inc.,Financials
+MA,Mastercard Incorporated,Financials
+SPGI,S&P Global Inc.,Financials
+PGR,The Progressive Corporation,Financials
+EWBC,"East West Bancorp, Inc.",Financials
+WAL,Western Alliance Bancorporation,Financials
+ZION,"Zions Bancorporation, National Association",Financials
+FHN,First Horizon Corporation,Financials
+SF,Stifel Financial Corp.,Financials
+EVR,Evercore Inc.,Financials
+ALLY,Ally Financial Inc.,Financials
+KNSL,"Kinsale Capital Group, Inc.",Financials
+PRI,"Primerica, Inc.",Financials
+AMZN,"Amazon.com, Inc.",Consumer Discretionary
+TSLA,"Tesla, Inc.",Consumer Discretionary
+HD,"The Home Depot, Inc.",Consumer Discretionary
+MCD,McDonald's Corporation,Consumer Discretionary
+NKE,"NIKE, Inc.",Consumer Discretionary
+BKNG,Booking Holdings Inc.,Consumer Discretionary
+TJX,"The TJX Companies, Inc.",Consumer Discretionary
+DECK,Deckers Outdoor Corporation,Consumer Discretionary
+CROX,"Crocs, Inc.",Consumer Discretionary
+WING,Wingstop Inc.,Consumer Discretionary
+TXRH,"Texas Roadhouse, Inc.",Consumer Discretionary
+DPZ,"Domino's Pizza, Inc.",Consumer Discretionary
+ULTA,"Ulta Beauty, Inc.",Consumer Discretionary
+FIVE,"Five Below, Inc.",Consumer Discretionary
+LULU,lululemon athletica inc.,Consumer Discretionary
+BURL,"Burlington Stores, Inc.",Consumer Discretionary
+TOL,"Toll Brothers, Inc.",Consumer Discretionary
+LAD,"Lithia Motors, Inc.",Consumer Discretionary
+GE,GE Aerospace,Industrials
+CAT,Caterpillar Inc.,Industrials
+HON,Honeywell International Inc.,Industrials
+UNP,Union Pacific Corporation,Industrials
+RTX,RTX Corporation,Industrials
+DE,Deere & Company,Industrials
+ETN,Eaton Corporation plc,Industrials
+LMT,Lockheed Martin Corporation,Industrials
+EME,"EMCOR Group, Inc.",Industrials
+FIX,"Comfort Systems USA, Inc.",Industrials
+SAIA,"Saia, Inc.",Industrials
+XPO,"XPO, Inc.",Industrials
+AOS,A. O. Smith Corporation,Industrials
+CW,Curtiss-Wright Corporation,Industrials
+GGG,Graco Inc.,Industrials
+ITT,ITT Inc.,Industrials
+RBC,RBC Bearings Incorporated,Industrials
+MLI,"Mueller Industries, Inc.",Industrials
+SSD,"Simpson Manufacturing Co., Inc.",Industrials
+CHRW,"C.H. Robinson Worldwide, Inc.",Industrials
+GOOGL,Alphabet Inc.,Communication Services
+META,"Meta Platforms, Inc.",Communication Services
+NFLX,"Netflix, Inc.",Communication Services
+TMUS,"T-Mobile US, Inc.",Communication Services
+DIS,The Walt Disney Company,Communication Services
+VZ,Verizon Communications Inc.,Communication Services
+NYT,The New York Times Company,Communication Services
+ROKU,"Roku, Inc.",Communication Services
+PINS,"Pinterest, Inc.",Communication Services
+MTCH,"Match Group, Inc.",Communication Services
+PG,The Procter & Gamble Company,Consumer Staples
+KO,The Coca-Cola Company,Consumer Staples
+PEP,"PepsiCo, Inc.",Consumer Staples
+COST,Costco Wholesale Corporation,Consumer Staples
+WMT,Walmart Inc.,Consumer Staples
+ELF,"e.l.f. Beauty, Inc.",Consumer Staples
+CELH,"Celsius Holdings, Inc.",Consumer Staples
+BJ,"BJ's Wholesale Club Holdings, Inc.",Consumer Staples
+CASY,"Casey's General Stores, Inc.",Consumer Staples
+SFM,"Sprouts Farmers Market, Inc.",Consumer Staples
+INGR,Ingredion Incorporated,Consumer Staples
+XOM,Exxon Mobil Corporation,Energy
+CVX,Chevron Corporation,Energy
+COP,ConocoPhillips,Energy
+EOG,"EOG Resources, Inc.",Energy
+SLB,SLB,Energy
+FANG,"Diamondback Energy, Inc.",Energy
+MTDR,Matador Resources Company,Energy
+RRC,Range Resources Corporation,Energy
+AR,Antero Resources Corporation,Energy
+DINO,HF Sinclair Corporation,Energy
+PR,Permian Resources Corporation,Energy
+LIN,Linde plc,Materials
+SHW,The Sherwin-Williams Company,Materials
+FCX,Freeport-McMoRan Inc.,Materials
+NUE,Nucor Corporation,Materials
+RPM,RPM International Inc.,Materials
+ATR,"AptarGroup, Inc.",Materials
+EXP,Eagle Materials Inc.,Materials
+CF,"CF Industries Holdings, Inc.",Materials
+RGLD,"Royal Gold, Inc.",Materials
+AVY,Avery Dennison Corporation,Materials
+PLD,"Prologis, Inc.",Real Estate
+AMT,American Tower Corporation,Real Estate
+EQIX,"Equinix, Inc.",Real Estate
+CUBE,CubeSmart,Real Estate
+EGP,"EastGroup Properties, Inc.",Real Estate
+REXR,"Rexford Industrial Realty, Inc.",Real Estate
+NNN,"NNN REIT, Inc.",Real Estate
+ADC,Agree Realty Corporation,Real Estate
+CSGP,"CoStar Group, Inc.",Real Estate
+NEE,"NextEra Energy, Inc.",Utilities
+SO,The Southern Company,Utilities
+DUK,Duke Energy Corporation,Utilities
+ATO,Atmos Energy Corporation,Utilities
+OGE,OGE Energy Corp.,Utilities
+IDA,"IDACORP, Inc.",Utilities
+POR,Portland General Electric Company,Utilities
+PNW,Pinnacle West Capital Corporation,Utilities
+NJR,New Jersey Resources Corporation,Utilities
