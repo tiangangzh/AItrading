@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field
 from aitrading.beliefs.digest import experience_digest, lessons
 from aitrading.beliefs.judge import BayesianJudge, Judge
 from aitrading.beliefs.learner import Learner
-from aitrading.beliefs.ledger import BeliefLedger
+from aitrading.beliefs.ledger import BeliefLedger, CutoffLedger
 from aitrading.beliefs.models import Assessment, Belief, BeliefUpdate
 from aitrading.beliefs.semantics import FEATURE_SEMANTICS, hypothesis_id, hypothesis_shape, similarity
 from aitrading.screen.catalog import FeatureCatalog, default_catalog
@@ -231,6 +231,10 @@ class LLMGenerator:
 # ------------------------------------------------------------------------------------------------
 
 
+#: Evidence of a hypothesis at least this similar that overlaps the holdout window contaminates it.
+CONTAMINATION_SIMILARITY = 0.5
+
+
 @dataclass
 class LoopConfig:
     rounds: int = 3
@@ -373,8 +377,15 @@ class ResearchLoop:
         self.judge = judge if judge is not None else BayesianJudge(ledger)
         self.generator = generator if generator is not None else HeuristicGenerator()
         self.config = config or LoopConfig()
-        self.learner = Learner(ledger, self.judge)
         self._say = progress or (lambda msg: None)
+
+    def research_view(self) -> CutoffLedger:
+        """The ledger as the research rounds see it: no evidence whose data reach the holdout window."""
+        return CutoffLedger(self.ledger, self.windows()[1][0])
+
+    def _bound_judge(self, view: Any) -> Any:
+        bind = getattr(self.judge, "bind", None)
+        return bind(view) if callable(bind) else self.judge
 
     def windows(self) -> tuple[tuple[date | None, date], tuple[date, date]]:
         """((research start or None = start of data, research end), (holdout start, end))."""
@@ -385,11 +396,11 @@ class ResearchLoop:
         r_start = (r_end - timedelta(days=round(c.research_years * 365.25))) if c.research_years else None
         return (r_start, r_end), (h_start, end)
 
-    def _test(self, rnd: int, spec: StrategySpec, statement: str | None, mechanism: str, source: str,
+    def _test(self, learner: Learner, rnd: int, spec: StrategySpec, statement: str | None, mechanism: str, source: str,
               window: tuple[date | None, date], kind: str, oos: bool | None,
               assessment: Assessment | None = None) -> TestRecord:
         s = spec.model_copy(update={"start": window[0], "end": window[1]})
-        pre = self.learner.before(s, purpose=kind, statement=statement, mechanism=mechanism, source=source,  # type: ignore[arg-type]
+        pre = learner.before(s, purpose=kind, statement=statement, mechanism=mechanism, source=source,  # type: ignore[arg-type]
                                   assessment=assessment)
         rec = TestRecord(round=rnd, hypothesis_id=pre.assessment.hypothesis_id, statement=pre.assessment.statement,
                          spec_name=s.name, before=pre.assessment, window=window, kind=kind)
@@ -399,7 +410,7 @@ class ResearchLoop:
             rec.error = f"{type(exc).__name__}: {str(exc)[:200]}"
             return rec
         rec.run_id = result.run_id
-        upd = self.learner.after(s, result, pre, kind=kind, out_of_sample=oos, statement=statement,  # type: ignore[arg-type]
+        upd = learner.after(s, result, pre, kind=kind, out_of_sample=oos, statement=statement,  # type: ignore[arg-type]
                                  mechanism=mechanism, source=source)
         if upd is None:
             rec.error = "no usable Sharpe ratio (too few return periods)"
@@ -412,6 +423,12 @@ class ResearchLoop:
         c = self.config
         research, holdout = self.windows()
         uses_before = self.ledger.holdout_uses_overlapping(*holdout)
+        # Every read during the research rounds goes through the holdout-blind view: digests, forecasts,
+        # beliefs, feedback and the choice of finalists never see data from the holdout years, even when
+        # ordinary backtests in this ledger already cover them.
+        view = self.research_view()
+        judge = self._bound_judge(view)
+        learner = Learner(view, judge)
         report = LoopReport(market=self.ledger.market, theme=theme, generator=getattr(self.generator, "name", "?"),
                             judge=getattr(self.judge, "name", "?"), research_window=research, holdout_window=holdout,
                             holdout_uses_before=uses_before)
@@ -423,7 +440,7 @@ class ResearchLoop:
         feedback: list[str] = []
         tested: dict[str, tuple[StrategySpec, str | None, str, str]] = {}
         for rnd in range(1, c.rounds + 1):
-            model = BayesianJudge(self.ledger).model()
+            model = BayesianJudge(view).model()
             digest = experience_digest(model)
             self._say(f"round {rnd}/{c.rounds}: generating hypotheses ...")
             try:
@@ -443,7 +460,7 @@ class ResearchLoop:
                     report.skipped.append(f"round {rnd}: [{hid}] already tested on this research window (re-testing the "
                                           "same data teaches nothing)")
                     continue
-                a = self.judge.assess(spec, statement=p.statement, mechanism=p.mechanism)
+                a = judge.assess(spec, statement=p.statement, mechanism=p.mechanism)
                 cands.append((a.acquisition, a, p))
             if not cands:
                 report.warnings.append(f"round {rnd}: no untested candidate left" + (f" for theme '{theme}'" if theme else ""))
@@ -452,7 +469,8 @@ class ResearchLoop:
             chosen = self._select(cands, c.per_round)
             for a, p in chosen:
                 self._say(f"  testing [{a.hypothesis_id}] {a.statement[:80]} (predicted {a.mean:+.2f} ± {a.sd:.2f})")
-                rec = self._test(rnd, p.spec, p.statement, p.mechanism, p.source, research, "backtest", None, assessment=a)
+                rec = self._test(learner, rnd, p.spec, p.statement, p.mechanism, p.source, research, "backtest", None,
+                                 assessment=a)
                 report.tests.append(rec)
                 tested[rec.hypothesis_id] = (p.spec, p.statement, p.mechanism, p.source)
                 feedback.append(self._feedback(rec))
@@ -461,16 +479,22 @@ class ResearchLoop:
                 if a.hypothesis_id not in picked and a.verdict == "contradicts_experience":
                     feedback.append(f"Not tested (contradicts experience): [{a.hypothesis_id}] {a.statement} - predicted "
                                     f"{a.mean:+.2f} ± {a.sd:.2f}.")
-        # holdout exam for the most promising hypotheses of this loop
-        model = BayesianJudge(self.ledger).model()
+        # holdout exam for the most promising hypotheses of this loop, chosen on research-view beliefs;
+        # the forecast is the research view's, the update afterwards uses everything in the ledger
+        model = BayesianJudge(view).model()
         ranked = sorted(((b.mean, b) for b in model.beliefs(list(tested))), key=lambda t: -t[0])
         finalists = [b for m, b in ranked if m > 0][: c.holdout_top]
         if finalists:
+            contaminated = {b.hypothesis_id: self.contamination(tested[b.hypothesis_id][0], holdout) for b in finalists}
             self.ledger.note_holdout_use(*holdout)
+            exam = Learner(self.ledger, judge)
             for b in finalists:
                 spec, stmt, mech, src = tested[b.hypothesis_id]
+                why = contaminated[b.hypothesis_id]
+                if why and uses_before == 0:
+                    report.warnings.append(f"[{b.hypothesis_id}] holdout result recorded as in-sample: {why}.")
                 self._say(f"holdout exam: [{b.hypothesis_id}] {b.statement[:80]}")
-                rec = self._test(0, spec, stmt, mech, src, holdout, "holdout", uses_before == 0)
+                rec = self._test(exam, 0, spec, stmt, mech, src, holdout, "holdout", uses_before == 0 and why is None)
                 report.holdout.append(rec)
         model = BayesianJudge(self.ledger).model()
         report.final = sorted(model.beliefs(list(tested)), key=lambda b: -b.mean)
@@ -498,6 +522,24 @@ class ResearchLoop:
             left.remove(best)
             chosen.append((best[1], best[2]))
         return chosen
+
+    def contamination(self, spec: StrategySpec, holdout: tuple[date, date]) -> str | None:
+        """Why the holdout window is not unseen data for ``spec``, or None. It is not unseen when the
+        ledger already holds evidence that overlaps the window for this hypothesis or a closely related
+        one (|similarity| >= ``CONTAMINATION_SIMILARITY``). Typical cause: an ordinary backtest run to
+        the latest data. Whoever chose this loop's theme has seen how such ideas did in those years."""
+        shape = hypothesis_shape(spec)
+        for e in self.ledger.evidence():
+            if e.end < holdout[0] or e.start > holdout[1]:
+                continue
+            h = self.ledger.hypothesis(e.hypothesis_id)
+            if h is None:
+                continue
+            sim = similarity(shape, hypothesis_shape(h.spec))
+            if abs(sim) >= CONTAMINATION_SIMILARITY:
+                return (f"{e.kind} run {e.evidence_id.split(':', 1)[-1]} of a related hypothesis [{h.hypothesis_id}] "
+                        f"(similarity {sim:+.2f}) already covers {max(e.start, holdout[0])} to {min(e.end, holdout[1])}")
+        return None
 
     def _tested_on(self, hid: str, window: tuple[date | None, date]) -> bool:
         for e in self.ledger.evidence_for(hid):

@@ -50,6 +50,9 @@ from aitrading.trading.store import ENV_HOME, StoreError, read_json, slugify_str
 
 __all__ = [
     "BeliefLedger",
+    "CutoffLedger",
+    "LedgerView",
+    "as_view",
     "default_beliefs_root",
     "sharpe_se",
     "evidence_from_backtest",
@@ -469,6 +472,44 @@ class LedgerView:
         return {e.hypothesis_id for e in self._ev}
 
 
-def as_view(source: BeliefLedger | LedgerView) -> LedgerView:
-    return source.view() if isinstance(source, BeliefLedger) else source
+class CutoffLedger:
+    """A ledger whose reads only see evidence whose DATA ENDED before ``cutoff`` (writes go through).
+
+    The research loop works through one of these, with ``cutoff`` = the holdout start. Every belief,
+    digest, forecast and finalist choice made during the research rounds is then blind to the
+    holdout years. This holds even when ordinary backtests in the same ledger (which run to the
+    latest data) have already covered them.
+    """
+
+    def __init__(self, base: BeliefLedger, cutoff: date):
+        self.base = base
+        self.cutoff = cutoff
+
+    def __repr__(self) -> str:
+        return f"CutoffLedger({self.base!r}, cutoff={self.cutoff.isoformat()})"
+
+    def _visible(self, e: Evidence) -> bool:
+        return e.end < self.cutoff
+
+    def view(self, *, before: datetime | None = None, evidence_filter: Any = None) -> "LedgerView":
+        if evidence_filter is None:
+            return self.base.view(before=before, evidence_filter=self._visible)
+        return self.base.view(before=before, evidence_filter=lambda e: self._visible(e) and evidence_filter(e))
+
+    def evidence(self, kinds: Iterable[str] | None = None) -> list[Evidence]:
+        return [e for e in self.base.evidence(kinds) if self._visible(e)]
+
+    def evidence_for(self, hid: str) -> list[Evidence]:
+        return [e for e in self.base.evidence_for(hid) if self._visible(e)]
+
+    def tested_ids(self) -> set[str]:
+        return {e.hypothesis_id for e in self.evidence()}
+
+    def __getattr__(self, name: str) -> Any:  # writes, hypotheses, predictions, market, path ...
+        return getattr(self.base, name)
+
+
+def as_view(source: Any) -> LedgerView:
+    """A :class:`LedgerView` of a ledger, a :class:`CutoffLedger` or a view (returned as is)."""
+    return source if isinstance(source, LedgerView) else source.view()
 

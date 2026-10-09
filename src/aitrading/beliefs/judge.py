@@ -34,7 +34,8 @@ from pydantic import BaseModel, Field
 
 from aitrading.beliefs.bayes import DEFAULT_HURDLE, LLM_PRIOR_MIN_SD, BeliefModel, normal_cdf
 from aitrading.beliefs.digest import experience_digest
-from aitrading.beliefs.ledger import BeliefLedger, LedgerView
+from aitrading.beliefs.grounding import HYP_ID_RE, check_text
+from aitrading.beliefs.ledger import BeliefLedger, LedgerView, as_view
 from aitrading.beliefs.models import Assessment, LLMPrior, Neighbor
 from aitrading.beliefs.semantics import hypothesis_id, hypothesis_shape, hypothesis_statement, similarity, spec_from_any
 from aitrading.llm.base import StructuredLLM
@@ -57,6 +58,10 @@ class Judge(Protocol):
     name: str
 
     def assess(self, spec: Any, *, statement: str | None = None, mechanism: str = "") -> Assessment:
+        ...
+
+    def bind(self, ledger: Any) -> "Judge":
+        """The same judge reading another ledger / view."""
         ...
 
 
@@ -88,8 +93,13 @@ class BayesianJudge:
         self._model: BeliefModel | None = None
         self._sig: tuple | None = None
 
+    def bind(self, ledger: Any) -> "BayesianJudge":
+        """The same judge reading ``ledger`` (e.g. the research loop's holdout-blind view)."""
+        return BayesianJudge(ledger, hurdle=self.hurdle, include_llm_priors=self.include_llm_priors,
+                             max_neighbors=self.max_neighbors)
+
     def _signature(self) -> tuple:
-        view = self.ledger.view() if isinstance(self.ledger, BeliefLedger) else self.ledger
+        view = as_view(self.ledger)
         ev = tuple(sorted((e.evidence_id, e.recorded_at.isoformat()) for e in view.evidence()))
         pri = tuple(sorted((h.hypothesis_id, h.llm_prior.made_at.isoformat()) for h in view.hypotheses()
                            if h.llm_prior is not None)) if self.include_llm_priors else ()
@@ -216,22 +226,8 @@ results. If the log shows related failures, say what would have to be different 
 reasoning under 150 words."""
 
 
-_NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?%?")
-
-
-def _unverified_numbers(text: str, source: str) -> list[str]:
-    """Numbers in ``text`` (with 2+ significant characters) that do not appear in ``source``."""
-    have = {m.group(0).lstrip("+").rstrip("%") for m in _NUM_RE.finditer(source)}
-    have |= {x.lstrip("-") for x in list(have)}
-    out = []
-    for m in _NUM_RE.finditer(text):
-        tok = m.group(0).lstrip("+").rstrip("%")
-        bare = tok.lstrip("-")
-        if len(bare.replace(".", "")) < 2 or bare in {"0", "1", "10", "12", "100"}:
-            continue
-        if tok not in have and bare not in have:
-            out.append(m.group(0))
-    return sorted(set(out))
+def _numbers_in(text: str) -> list[float]:
+    return [float(m.group(0).rstrip("%")) for m in re.finditer(r"[-+]?\d+(?:\.\d+)?%?", text)]
 
 
 def _combine(mean: float, sd: float, prior_mean: float, prior_sd: float) -> tuple[float, float]:
@@ -249,8 +245,12 @@ class LLMJudge:
         self.ledger = ledger
         self.effort = effort
         self.hurdle = hurdle
-        self.record_prior = record_prior and isinstance(ledger, BeliefLedger)
+        self._record_prior_requested = record_prior
+        self.record_prior = record_prior and hasattr(ledger, "set_llm_prior")  # a writable ledger, not a view
         self.base = BayesianJudge(ledger, hurdle=hurdle, include_llm_priors=False)
+
+    def bind(self, ledger: Any) -> "LLMJudge":
+        return LLMJudge(self.llm, ledger, effort=self.effort, hurdle=self.hurdle, record_prior=self._record_prior_requested)
 
     @property
     def name(self) -> str:
@@ -280,12 +280,13 @@ class LLMJudge:
         )
         if not isinstance(view, LLMView):
             view = LLMView.model_validate(view)
-        known_ids = set(re.findall(r"\bh-[0-9a-f]{12}\b", digest + base.critique))
-        unknown = [c for c in view.cited_hypothesis_ids if c not in known_ids]
-        unverified = _unverified_numbers(view.reasoning, digest + "\n" + base.critique)
+        source = digest + "\n" + base.critique
+        known_ids = set(HYP_ID_RE.findall(source))
+        report = check_text(view.reasoning, known_ids=known_ids, numbers=_numbers_in(source))
+        unknown = sorted({c for c in view.cited_hypothesis_ids if c not in known_ids} | set(report.unknown_ids))
+        unverified = report.unverified_numbers
         prior_sd = max(float(view.literature_prior_sd), LLM_PRIOR_MIN_SD)
         if self.record_prior:
-            assert isinstance(self.ledger, BeliefLedger)
             self.ledger.add_hypothesis(s, statement=statement, mechanism=mechanism or view.mechanism, save=False)
             self.ledger.set_llm_prior(base.hypothesis_id, LLMPrior(
                 mean=float(view.literature_prior_sharpe), sd=float(view.literature_prior_sd),
@@ -351,6 +352,10 @@ class OpenAICompatibleJudge:
         self._client = client
         self.hurdle = hurdle
         self.base = BayesianJudge(ledger, hurdle=hurdle)
+
+    def bind(self, ledger: Any) -> "OpenAICompatibleJudge":
+        return OpenAICompatibleJudge(ledger, base_url=self.base_url, model=self.model_name, api_key=self.api_key,
+                                     timeout_s=self.timeout_s, client=self._client, hurdle=self.hurdle)
 
     @property
     def name(self) -> str:

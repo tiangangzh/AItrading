@@ -110,6 +110,25 @@ names and sectors can stay in the file.
 The program still runs end to end with a built-in rule-based translator and explainer (it tells you
 when it does this). Add `--offline` to force that mode even when a key is set.
 
+### With an open-source model (or any OpenAI-compatible API)
+
+Serve a model locally and point the platform at it:
+
+* Ollama: `ollama pull qwen2.5:14b`, base URL `http://localhost:11434/v1`.
+* vLLM: `vllm serve Qwen/Qwen2.5-32B-Instruct`, base URL `http://localhost:8000/v1`.
+
+```powershell
+$env:AITRADING_LLM = "openai"
+$env:AITRADING_LLM_BASE_URL = "http://localhost:11434/v1"
+$env:AITRADING_MODEL = "qwen2.5:14b"
+```
+
+The same works per command: `--llm openai --llm-base-url URL --model NAME`. Set
+`AITRADING_LLM_API_KEY` if your server needs a key (OpenAI and hosted providers do).
+
+Smaller models make more formatting mistakes. Every reply is validated and repaired, but expect more
+"could not produce a valid spec" messages than with Claude. Web search in `discover` needs Claude.
+
 ---
 
 ## Useful commands

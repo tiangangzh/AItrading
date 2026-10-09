@@ -51,6 +51,27 @@ aitrading dashboard
 Without an Anthropic key everything still runs, using built-in rule-based engines instead of Claude
 (the CLI tells you when it does this).
 
+**Open-source models or any OpenAI-compatible API instead of Claude.** Every reasoning role can run on
+any server that speaks the OpenAI chat-completions protocol: translating, explaining, interpreting,
+reading papers, proposing hypotheses and judging them. That includes open-weights models served by
+vLLM, Ollama, llama.cpp or LM Studio, and hosted APIs such as OpenAI or DeepSeek.
+
+```bash
+ollama serve & ollama pull qwen2.5:14b
+aitrading run --llm openai --llm-base-url http://localhost:11434/v1 --model qwen2.5:14b "..."
+# or once for every command:
+export AITRADING_LLM=openai AITRADING_LLM_BASE_URL=http://localhost:8000/v1 AITRADING_MODEL=Qwen/Qwen2.5-32B-Instruct
+export AITRADING_LLM_API_KEY=...                                      # only if the server needs a key
+```
+
+How it works:
+- **Structured output.** It uses the server's JSON-schema mode and falls back to JSON mode or a
+  schema in the prompt when the server lacks it. Every reply is validated, so a weak model gets the
+  same repair rounds Claude does.
+- **Long replies.** Completions are capped at 8192 tokens (`AITRADING_LLM_MAX_TOKENS`).
+- **Claude-only features.** Two features use Claude-specific API tools and need `--llm claude`:
+  web search in `discover`, and the interactive research agent.
+
 ---
 
 ## What you can do
@@ -237,7 +258,7 @@ the data is licensed to live. Rollout is phased behind written vendor and legal 
  Claude: explanation / interpretation  ──►  programmatic grounding checks  ──►  report + audit trail
 ```
 
-How Claude is called:
+How Claude is called (open models: see the quick start; same validation, no Claude-specific features):
 - Structured outputs.
 - Adaptive thinking, with an explicit effort setting.
 - Server-side refusal fallback: if Claude declines a request, the API retries it on a fallback model.

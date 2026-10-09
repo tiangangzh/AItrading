@@ -33,7 +33,7 @@ from aitrading.cli import (
     resolve_engine,
 )
 
-JUDGES = ("bayes", "claude", "open")
+JUDGES = ("bayes", "llm", "claude", "open")  # "claude" = "llm": the engine --llm selects
 
 
 # --------------------------------------------------------------------------------------------
@@ -52,8 +52,9 @@ def learn_options() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False, parents=[no_learn_option()])
     p.add_argument("--judge", choices=JUDGES, default="bayes",
                    help="who forecasts a hypothesis before it is tested: 'bayes' (the belief engine, default), "
-                        "'claude' (Claude reads the experience log; adds a literature prior), 'open' (your own judge "
-                        "model behind an OpenAI-compatible endpoint: --judge-url, --judge-model)")
+                        "'llm' or 'claude' (the LLM engine --llm selects - Claude or an open model - reads the "
+                        "experience log and adds a literature prior), 'open' (a judge model you trained, behind an "
+                        "OpenAI-compatible endpoint: --judge-url, --judge-model)")
     p.add_argument("--judge-url", default=None, metavar="URL", help="OpenAI-compatible base URL for --judge open, e.g. http://localhost:8000/v1")
     p.add_argument("--judge-model", default=None, metavar="NAME", help="served model name for --judge open")
     return p
@@ -69,7 +70,7 @@ def make_judge(args: argparse.Namespace, ledger: Any, llm: Any = None) -> Any:
     from aitrading.beliefs.judge import BayesianJudge, LLMJudge, OpenAICompatibleJudge
 
     kind = getattr(args, "judge", "bayes") or "bayes"
-    if kind == "claude":
+    if kind in ("llm", "claude"):
         if llm is None:
             llm = make_llm(getattr(args, "model", None), getattr(args, "effort", "high"))
         return LLMJudge(llm, ledger, effort="medium")
@@ -155,10 +156,13 @@ def _cmd_research(args: argparse.Namespace) -> int:
     from aitrading.beliefs.loop import HeuristicGenerator, LLMGenerator, LoopConfig, ResearchLoop
 
     theme = " ".join(args.theme or []).strip() or None
-    engine = resolve_engine(args) if args.generator in ("auto", "claude") or args.judge == "claude" else "offline"
+    wants_llm = args.generator in ("auto", "llm", "claude") or args.judge in ("llm", "claude")
+    engine = resolve_engine(args) if wants_llm else "offline"
     llm = make_llm(args.model, args.effort) if engine == "claude" else None
-    if args.generator == "claude" and llm is None:
-        raise UsageError("--generator claude needs Claude (set ANTHROPIC_API_KEY, or use --generator heuristic)")
+    if args.generator in ("llm", "claude") and llm is None:
+        raise UsageError(f"--generator {args.generator} needs an LLM engine (ANTHROPIC_API_KEY for Claude, or --llm openai "
+                         "--llm-base-url URL --model NAME for an open-source / OpenAI-compatible model), or use "
+                         "--generator heuristic")
     provider = cli_lab._lab_provider(args)
     end = args.end or default_as_of(args.provider, provider)
     market = _market(args)
@@ -335,8 +339,9 @@ def register(sub: Any, *, base: argparse.ArgumentParser, engine: argparse.Argume
     rs.add_argument("--research-years", type=float, default=8.0, help="years before the holdout to research on (0 = all; default 8)")
     rs.add_argument("--holdout-top", type=int, default=2, help="best hypotheses that sit the holdout exam (default 2)")
     rs.add_argument("--end", type=_iso_date, default=None, metavar="YYYY-MM-DD", help="last date of data (default: latest)")
-    rs.add_argument("--generator", choices=("auto", "heuristic", "claude"), default="auto",
-                    help="who proposes hypotheses: Claude when available (auto), or the offline generator")
+    rs.add_argument("--generator", choices=("auto", "heuristic", "llm", "claude"), default="auto",
+                    help="who proposes hypotheses: the LLM engine when one is configured (auto; 'llm' / 'claude' require "
+                         "it - Claude or, with --llm openai, an open model), or the offline generator")
     rs.add_argument("--market", default=None, help="ledger name (default: the --provider)")
     rs.set_defaults(func=_cmd_research)
 

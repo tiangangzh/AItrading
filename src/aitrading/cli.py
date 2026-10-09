@@ -23,10 +23,20 @@ business day (the synthetic market's last day for ``--provider synthetic``).
 
 Engines
 -------
-By default Claude (``AnthropicLLM``; ``--model``, ``--effort``) translates and explains when Anthropic
-credentials are configured; otherwise the CLI says so and uses the deterministic offline translator
-and explainer. ``--offline`` forces the offline engine; ``--claude`` requires Claude and fails with
-guidance when it cannot be used.
+The LLM engine translates, explains, interprets, extracts ideas and proposes hypotheses. ``--llm``
+(or ``AITRADING_LLM``) picks it:
+
+* ``claude`` (default) - ``AnthropicLLM`` (``--model``, ``--effort``), used when Anthropic credentials
+  are configured.
+* ``openai`` - ``OpenAICompatibleLLM``: any OpenAI-compatible server, used when ``--llm-base-url`` /
+  ``AITRADING_LLM_BASE_URL`` or an API key (``AITRADING_LLM_API_KEY`` / ``OPENAI_API_KEY``) is
+  configured; ``--model`` names the served model. Examples: open-weights models on vLLM, Ollama,
+  llama.cpp or LM Studio; OpenAI or other hosted endpoints.
+
+Without a configured engine the CLI says so and uses the deterministic offline translator and
+explainer. ``--offline`` forces the offline engine; ``--claude`` (alias ``--require-llm``) requires the
+LLM engine and fails with guidance when it cannot be used. Web search in ``discover`` uses Claude's
+server-side web search tool and is skipped with ``--llm openai``.
 
 Providers are created by :func:`make_provider`, which imports the vendor adapter lazily and
 raises :class:`ProviderUnavailableError` with an installation hint when it is missing.
@@ -59,6 +69,9 @@ __all__ = [
     "make_llm",
     "credentials_configured",
     "credentials_help",
+    "llm_provider",
+    "llm_configured",
+    "LLM_PROVIDERS",
     "is_auth_error",
     "PROVIDERS",
     "DEFAULT_AS_OF",
@@ -86,6 +99,11 @@ DEMO_OBSERVATION = (
 )
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+LLM_PROVIDERS = ("claude", "openai")
+_LLM_ALIASES = {"anthropic": "claude", "openai-compatible": "openai", "oai": "openai", "local": "openai",
+                "vllm": "openai", "ollama": "openai"}
+# --llm / --llm-base-url of the running command (set by main(); the environment is the fallback)
+_LLM_SETTINGS: dict[str, str | None] = {"provider": None, "base_url": None}
 
 # name -> (module, class, what is needed to use it)
 PROVIDERS: dict[str, tuple[str, str, str]] = {
@@ -128,7 +146,7 @@ class ProviderUnavailableError(CLIError):
 
 
 class CredentialsError(CLIError):
-    """Claude could not be reached for lack of (valid) credentials."""
+    """The LLM could not be reached for lack of (valid) credentials or configuration."""
 
 
 # --------------------------------------------------------------------------------------------
@@ -182,8 +200,42 @@ def credentials_configured() -> bool:
     return any(os.environ.get(k, "").strip() for k in CREDENTIAL_ENV)
 
 
+def llm_provider() -> str:
+    """'claude' or 'openai': ``--llm`` of the running command, else ``AITRADING_LLM``, else 'claude'."""
+    raw = (_LLM_SETTINGS.get("provider") or os.environ.get("AITRADING_LLM") or "claude").strip().lower()
+    raw = _LLM_ALIASES.get(raw, raw)
+    return raw if raw in LLM_PROVIDERS else "claude"
+
+
+def _llm_base_url() -> str | None:
+    from aitrading.llm.openai_compatible import configured_base_url
+
+    return (_LLM_SETTINGS.get("base_url") or "").strip() or configured_base_url()
+
+
+def llm_configured() -> bool:
+    """Whether the selected LLM engine has what it needs to be tried (credentials / an endpoint)."""
+    if llm_provider() == "openai":
+        from aitrading.llm.openai_compatible import configured_api_key
+
+        return bool(_llm_base_url() or configured_api_key())
+    return credentials_configured()
+
+
+def _openai_help(detail: str) -> str:
+    return "\n".join([
+        f"The LLM (OpenAI-compatible endpoint) is not available: {detail}",
+        "Point --llm-base-url (or AITRADING_LLM_BASE_URL) at the server, e.g. http://localhost:8000/v1 (vLLM) or",
+        "http://localhost:11434/v1 (Ollama), name the served model with --model (or AITRADING_MODEL), and set",
+        "AITRADING_LLM_API_KEY (or OPENAI_API_KEY) if the server needs a key. Or rerun with --offline to use the",
+        "deterministic heuristic translator and explainer (no LLM needed).",
+    ])
+
+
 def credentials_help(detail: str) -> str:
-    """The message printed when Claude cannot be used; always suggests ``--offline``."""
+    """The message printed when the LLM cannot be used; always suggests ``--offline``."""
+    if llm_provider() == "openai":
+        return _openai_help(detail)
     lines = [f"Claude is not available: {detail}"]
     if not credentials_configured():
         lines += [
@@ -223,7 +275,16 @@ def is_auth_error(exc: BaseException) -> bool:
 
 
 def make_llm(model: str | None = None, effort: str = "high") -> Any:
-    """``AnthropicLLM`` for the live path; construction failures become :class:`CredentialsError`."""
+    """The live LLM: ``AnthropicLLM`` or, with ``--llm openai``, ``OpenAICompatibleLLM``; construction
+    failures become :class:`CredentialsError`."""
+    if llm_provider() == "openai":
+        from aitrading.llm.base import LLMError
+        from aitrading.llm.openai_compatible import OpenAICompatibleLLM
+
+        try:
+            return OpenAICompatibleLLM(model=model, base_url=_llm_base_url(), effort=effort)
+        except (LLMError, ValueError) as exc:
+            raise CredentialsError(credentials_help(str(exc))) from exc
     try:
         from aitrading.llm.anthropic_client import AnthropicLLM
 
@@ -233,15 +294,21 @@ def make_llm(model: str | None = None, effort: str = "high") -> Any:
 
 
 def resolve_engine(args: argparse.Namespace) -> str:
-    """'offline' or 'claude'. Auto mode picks Claude only when credentials are configured."""
+    """'offline' or 'claude' (= the LLM engine, whichever provider ``--llm`` selects). Auto mode picks the
+    LLM only when it is configured."""
     if getattr(args, "offline", False):
         return "offline"
-    if getattr(args, "claude", False) or credentials_configured():
+    if getattr(args, "claude", False) or llm_configured():
         return "claude"
-    _note(
-        "No Anthropic credentials found (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN) - running offline with the "
-        "rule-based translator and explainer. Set ANTHROPIC_API_KEY to let Claude do the reasoning."
-    )
+    if llm_provider() == "openai":
+        _note("--llm openai but no endpoint configured (--llm-base-url / AITRADING_LLM_BASE_URL) - running offline "
+              "with the rule-based translator and explainer.")
+    else:
+        _note(
+            "No Anthropic credentials found (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN) - running offline with the "
+            "rule-based translator and explainer. Set ANTHROPIC_API_KEY to let Claude do the reasoning, or use an "
+            "open-source / OpenAI-compatible model with --llm openai --llm-base-url URL --model NAME."
+        )
     return "offline"
 
 
@@ -332,8 +399,15 @@ def build_parser() -> argparse.ArgumentParser:
     engine = argparse.ArgumentParser(add_help=False)
     mode = engine.add_mutually_exclusive_group()
     mode.add_argument("--offline", action="store_true", help="force the rule-based translator + explainer (no API key needed)")
-    mode.add_argument("--claude", action="store_true", help="require Claude (fail instead of falling back to offline)")
-    engine.add_argument("--model", default=None, help="Claude model id (default: $AITRADING_MODEL or claude-opus-5-5)")
+    mode.add_argument("--claude", "--require-llm", dest="claude", action="store_true",
+                      help="require the LLM engine (fail instead of falling back to offline)")
+    engine.add_argument("--llm", choices=LLM_PROVIDERS, default=None,
+                        help="LLM engine: 'claude' (Anthropic API, default) or 'openai' (any OpenAI-compatible server: "
+                             "vLLM, Ollama, llama.cpp, LM Studio, OpenAI ...); default $AITRADING_LLM or claude")
+    engine.add_argument("--llm-base-url", default=None, metavar="URL",
+                        help="--llm openai: server base URL, e.g. http://localhost:11434/v1 (default $AITRADING_LLM_BASE_URL)")
+    engine.add_argument("--model", default=None, help="model id: Claude model (default: $AITRADING_MODEL or claude-opus-5-5), "
+                                                      "or with --llm openai the served model name (required)")
     engine.add_argument("--effort", choices=EFFORTS, default="high", help="Claude effort level (default: high)")
 
     data = data_options()
@@ -744,6 +818,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _note("aitrading: error: a command is required (see aitrading --help)")
         return EXIT_USAGE
     prog = f"aitrading {args.command}"
+    _LLM_SETTINGS["provider"] = getattr(args, "llm", None)
+    _LLM_SETTINGS["base_url"] = getattr(args, "llm_base_url", None)
     try:
         return int(args.func(args))
     except KeyboardInterrupt:
@@ -756,7 +832,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _note(f"{prog}: error: {exc}")
             return exc.exit_code
         if is_auth_error(exc):
-            _note(f"{prog}: error: " + credentials_help(f"the Claude API call failed with an authentication error ({type(exc).__name__}: {exc})"))
+            who = "the LLM API call" if llm_provider() == "openai" else "the Claude API call"
+            _note(f"{prog}: error: " + credentials_help(f"{who} failed with an authentication error ({type(exc).__name__}: {exc})"))
             return EXIT_ERROR
         _note(f"{prog}: error: {_describe(exc)}")
         return EXIT_ERROR

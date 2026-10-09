@@ -38,6 +38,7 @@ from aitrading.cli import (
     default_as_of,
     default_provider_name,
     explicit_tickers,
+    llm_provider,
     make_llm,
     read_text_file,
     resolve_engine,
@@ -526,7 +527,8 @@ def _gather_documents(args: argparse.Namespace, llm: Any) -> list[Any]:
     sources = {s.strip().lower() for s in args.sources.split(",") if s.strip()}
     cfg = _sources_config()
     web = None
-    if "web" in sources and llm is not None:
+    claude_web = llm is not None and llm_provider() == "claude"
+    if "web" in sources and claude_web:
         # built first so a domain-list mistake in sources.json stops the run before anything is fetched
         from aitrading.discovery.websearch import ClaudeWebSearchSource
 
@@ -552,7 +554,11 @@ def _gather_documents(args: argparse.Namespace, llm: Any) -> list[Any]:
             _note(f"feeds: {w}")
     if "web" in sources:
         if web is None:
-            _note("web search needs Claude (set ANTHROPIC_API_KEY); skipping the 'web' source")
+            if llm is not None and not claude_web:
+                _note("web search uses Claude's server-side web search tool, which --llm openai does not have; "
+                      "skipping the 'web' source (arXiv, feeds, --url and --pdf still work)")
+            else:
+                _note("web search needs Claude (set ANTHROPIC_API_KEY); skipping the 'web' source")
         else:
             brief = " ".join(args.query) if args.query else "recent systematic US equity strategies and anomalies"
             if web.allowed_domains or web.blocked_domains:

@@ -550,3 +550,44 @@ def test_llm_generator_reads_experience_and_feedback(ledger):
     h = ledger.hypothesis(report.tests[0].hypothesis_id)
     assert h is not None and h.mechanism == "underreaction to news" and h.statement.startswith("Claim:")
     assert h.source == "llm:scripted"
+
+
+def test_research_rounds_never_see_holdout_years_and_contamination_is_flagged(ledger):
+    """An ordinary backtest run to the latest data covers the holdout years. The loop's beliefs,
+    forecasts and finalist choice must not use it, and a finalist related to it cannot claim an
+    out-of-sample exam."""
+    from aitrading.beliefs.loop import Proposal
+
+    mom = xs("return_12m_ex_1m_pct")
+    ledger.record_backtest(mom, fake_result(mom, 3.0, start=date(2016, 1, 1), end=date(2026, 9, 30), turnover=70.0))
+
+    class Fixed:
+        name = "fixed"
+
+        def propose(self, theme, digest, feedback, n):
+            assert "12-1 month" not in digest  # the run reaching into the holdout is not in the research view
+            return [Proposal(xs("return_6m_pct")), Proposal(xs("book_to_market"))]
+
+    cfg = LoopConfig(rounds=1, per_round=2, holdout_years=2.0, research_years=8.0, holdout_top=2, end=date(2026, 9, 30))
+    loop = ResearchLoop(FakeRunner(), ledger, generator=Fixed(), config=cfg)
+    assert BeliefModel(loop.research_view()).tested() == [] and len(BeliefModel(ledger).tested()) == 1
+    report = loop.run()
+    six = next(t for t in report.tests if t.hypothesis_id == hypothesis_id(xs("return_6m_pct")))
+    assert six.before.verdict == "novel" and six.before.related_tested == 0  # forecast blind to the +3.0 run
+    exam = next(t for t in report.holdout if t.hypothesis_id == six.hypothesis_id)
+    assert ledger.data.evidence[f"holdout:{exam.run_id}"].out_of_sample is False
+    assert any("recorded as in-sample" in w and hypothesis_id(mom) in w for w in report.warnings)
+    # without the contaminating run the same exam is out of sample
+    clean = BeliefLedger("clean", root=ledger.root, clock=Clock())
+    report2 = ResearchLoop(FakeRunner(), clean, generator=_NoAssert(), config=cfg).run()
+    exam2 = next(t for t in report2.holdout if t.hypothesis_id == six.hypothesis_id)
+    assert clean.data.evidence[f"holdout:{exam2.run_id}"].out_of_sample is True
+
+
+class _NoAssert:
+    name = "fixed"
+
+    def propose(self, theme, digest, feedback, n):
+        from aitrading.beliefs.loop import Proposal
+
+        return [Proposal(xs("return_6m_pct")), Proposal(xs("book_to_market"))]
