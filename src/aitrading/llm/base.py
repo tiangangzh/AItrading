@@ -107,3 +107,51 @@ class ScriptedLLM:
                 raise output_error(purpose, output_model, e) from e
         self.calls.append(LLMCallRecord(purpose=purpose, model=self.name, stop_reason="end_turn"))
         return out
+
+
+class LLMBudgetExceeded(LLMError):
+    """A :class:`BudgetedLLM` refused a call: the budget for the run (or for this purpose) is spent."""
+
+
+class BudgetedLLM:
+    """Hard cap on the calls made through any ``StructuredLLM`` (Claude or an open model).
+
+    Every caller that holds this wrapper is counted: the generator, a judge, and the translator with
+    its repair rounds. ``max_calls`` caps the total; ``per_purpose`` caps purposes by prefix, e.g.
+    ``{"hypothesis_generator": 3}``. A refused call raises :class:`LLMBudgetExceeded`, which callers
+    treat like any other ``LLMError``: they fall back to the offline path. ``used`` counts calls by
+    purpose. ``calls`` is the inner LLM's audit list, so records are not duplicated.
+    """
+
+    def __init__(self, inner: Any, max_calls: int, per_purpose: dict[str, int] | None = None):
+        if max_calls < 0:
+            raise ValueError("max_calls must be >= 0")
+        self.inner = inner
+        self.max_calls = int(max_calls)
+        self.per_purpose = dict(per_purpose or {})
+        self.used: dict[str, int] = {}
+
+    @property
+    def name(self) -> str:
+        return str(getattr(self.inner, "name", "llm"))
+
+    @property
+    def calls(self) -> list[LLMCallRecord]:
+        return self.inner.calls
+
+    @property
+    def total(self) -> int:
+        return sum(self.used.values())
+
+    def remaining(self) -> int:
+        return max(0, self.max_calls - self.total)
+
+    def structured(self, *, purpose, system, user, output_model, effort=None, max_tokens=16_000):
+        if self.total >= self.max_calls:
+            raise LLMBudgetExceeded(f"[{purpose}] LLM call budget of {self.max_calls} spent")
+        for prefix, cap in self.per_purpose.items():
+            if purpose.startswith(prefix) and sum(n for p, n in self.used.items() if p.startswith(prefix)) >= cap:
+                raise LLMBudgetExceeded(f"[{purpose}] LLM call budget of {cap} for '{prefix}' spent")
+        self.used[purpose] = self.used.get(purpose, 0) + 1
+        return self.inner.structured(purpose=purpose, system=system, user=user, output_model=output_model,
+                                     effort=effort, max_tokens=max_tokens)

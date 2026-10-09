@@ -240,3 +240,27 @@ aitrading strategy run NAME                    # paper trading; >= 3 months of r
 Ledgers live in `~/.aitrading/beliefs/<market>/ledger.json` (`$AITRADING_HOME/beliefs/…`). Code:
 `src/aitrading/beliefs/`, which contains `semantics`, `ledger`, `bayes`, `judge`, `digest`,
 `learner`, `loop`, `calibration` and `dataset`.
+
+## Why Bayes AND RL: the loop as a prompt-level actor-critic
+
+`aitrading research --rl` turns the research loop into reinforcement learning without touching model weights.
+
+| RL piece | What it is here |
+|---|---|
+| Policy (actor) | An LLM (Claude or any OpenAI-compatible open model) conditioned on a short **policy text**: at most 12 grounded directives such as "explore value+", each citing tested hypotheses. It proposes structured sketches (1-3 catalog features, rebalance, menu filters). The program sets costs, dates and construction. |
+| Critic (value model) | The Bayesian Gaussian process over hypothesis space, frozen per episode. It is text-blind: it ignores LLM priors and reads only the structured definition. |
+| Step reward | `tau x kappa x rho - c_test - c_complex`. kappa is the robust batch-marginal knowledge gradient (value of testing). rho is new information (1 - adjusted R^2 against already-tested runs). tau is per-bucket trust. Rewards are **outcome-blind**: a lucky backtest Sharpe earns nothing, and a disguised copy earns nothing. |
+| Terminal reward | One out-of-sample exam per episode on an unseen holdout. A TD z-score is credited back to proposals through the smoother's influence shares. Paper-trading results arrive later as a delayed reward. |
+| Policy update | A reflector LLM proposes an edit. The edit becomes a **challenger** arm, run beside the champion each round. Paired arm scores feed a Wald SPRT that promotes or rejects the challenger. Rejected texts go on a tabu list, and an out-of-sample veto can demote a champion. |
+| Leakage rules | Directives may contain no numbers or years. Every prompt passes through a tripwire, and statements are scrubbed. The policy store is an event log replayed by information horizon, so nothing written after a cutoff is visible before it. |
+
+Raw backtest Sharpe would be a bad reward: it pays for overfitting, mirror images and repackaged copies. The Bayesian critic is what makes the reward safe to optimise. That is why the loop is Bayes **and** RL.
+
+LLM APIs: every role uses the `StructuredLLM` protocol.
+- `--llm claude` (default) uses the Anthropic API; set the model with `AITRADING_MODEL`.
+- `--llm openai --llm-base-url http://host/v1 --model NAME` uses any OpenAI-compatible server: vLLM, Ollama, llama.cpp, LM Studio or OpenAI.
+- `--offline` uses the heuristic actor with no LLM at all.
+
+Weight-level RL: `aitrading beliefs rl export FILE --format sft|dpo|kto|grpo --t-split DATE` writes point-in-time training data for an open-weights actor. GRPO uses the frozen critic as the reward model (`beliefs.rl.export.grpo_reward`). Time splits use a 182-day embargo. The training scripts are examples and are not run in CI.
+
+Other commands: `beliefs rl show|history|episodes|brief|reset|rollback`.

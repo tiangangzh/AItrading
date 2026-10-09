@@ -8,6 +8,10 @@
 * ``aitrading beliefs calibration``  how good each judge's pre-registered forecasts were.
 * ``aitrading beliefs export FILE``  point-in-time JSONL to train a judge model of your own.
 * ``aitrading beliefs forget ID``    remove a hypothesis and its evidence.
+* ``aitrading research --rl``        the same loop as reinforcement learning through the prompt: an LLM policy
+                                     improved by paired tests, the Bayesian critic as reward, a holdout TD error.
+* ``aitrading beliefs rl ...``       the RL policy and episodes: show / history / episodes / brief / reset /
+                                     rollback VERSION / export FILE (actor training data).
 
 ``backtest``, ``discover`` / ``ideas try`` and ``strategy run`` record their results in the ledger of
 their market (the data provider) unless ``--no-learn`` is given; see docs/LEARNING_LOOP.md.
@@ -156,6 +160,8 @@ def _cmd_research(args: argparse.Namespace) -> int:
     from aitrading.beliefs.loop import HeuristicGenerator, LLMGenerator, LoopConfig, ResearchLoop
 
     theme = " ".join(args.theme or []).strip() or None
+    if getattr(args, "rl", False):
+        return _cmd_research_rl(args, theme)
     wants_llm = args.generator in ("auto", "llm", "claude") or args.judge in ("llm", "claude")
     engine = resolve_engine(args) if wants_llm else "offline"
     llm = make_llm(args.model, args.effort) if engine == "claude" else None
@@ -194,6 +200,145 @@ def _cmd_research(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_research_rl(args: argparse.Namespace, theme: str | None) -> int:
+    from aitrading import cli_lab
+    from aitrading.beliefs.rl.actor import HeuristicActor, PromptPolicyActor
+    from aitrading.beliefs.rl.loop import RLConfig, RLResearchLoop
+    from aitrading.beliefs.rl.reflect import Reflector
+
+    wants_llm = args.generator in ("auto", "llm", "claude")
+    engine = resolve_engine(args) if wants_llm else "offline"
+    llm = make_llm(args.model, args.effort) if engine == "claude" else None
+    if args.generator in ("llm", "claude") and llm is None:
+        raise UsageError(f"--generator {args.generator} needs an LLM engine (ANTHROPIC_API_KEY for Claude, or --llm openai "
+                         "--llm-base-url URL --model NAME), or use --generator heuristic")
+    provider = cli_lab._lab_provider(args)
+    end = args.end or default_as_of(args.provider, provider)
+    ledger = ledger_for(_market(args))
+    actor: Any = PromptPolicyActor(llm, effort=args.effort, proposals_per_call=args.proposals_per_call) if llm else HeuristicActor()
+    reflector = Reflector(llm) if llm is not None and not args.no_reflect else None
+    cfg = RLConfig(rounds=args.rounds, per_round=args.per_round, candidates_per_round=max(args.candidates, 2),
+                   holdout_years=args.holdout_years, research_years=args.research_years or None, holdout_top=args.holdout_top,
+                   end=end, costs_bps=args.costs_bps if args.costs_bps is not None else 10.0,
+                   max_llm_calls=args.max_llm_calls)
+    loop = RLResearchLoop(cli_lab._runner(provider), ledger, actor=actor, reflector=reflector, config=cfg,
+                          progress=lambda m: _note(m))
+    if args.walk_forward:
+        from datetime import date as _date
+
+        try:
+            ends = [_date.fromisoformat(x.strip()) for x in args.walk_forward.split(",") if x.strip()]
+            reports = loop.run_walk_forward(theme, ends)
+        except ValueError as exc:
+            raise UsageError(f"--walk-forward: {exc}") from exc
+    else:
+        reports = [loop.run(theme)]
+    md = "\n".join(r.to_markdown() for r in reports)
+    _emit(md)
+    folder = Path(getattr(args, "out", None) or "aitrading_output") / "research" / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "report.md").write_text(md, encoding="utf-8")
+        (folder / "report.json").write_text("[" + ",".join(r.to_json() for r in reports) + "]", encoding="utf-8")
+        _note(f"research report: {folder / 'report.md'}; ledger: {ledger.path}")
+    except OSError as exc:
+        _note(f"warning: could not write the research report under {folder} ({exc}); the ledger is up to date")
+    return EXIT_OK
+
+
+def _cmd_beliefs_rl(args: argparse.Namespace, ledger: Any) -> int:
+    from datetime import date as _date
+
+    from aitrading.beliefs.rl.episodes import EpisodeStore
+    from aitrading.beliefs.rl.policy import PolicyStore
+
+    sub = (args.target or "show").lower()
+    store = PolicyStore(ledger)
+    if sub == "show":
+        st = store.state(None)
+        lines = [f"# RL policy - market '{ledger.market}'", "", f"Champion: {st.champion}"
+                 + (f"; challenger {st.challenger} (SPRT {st.sprt.wins} wins, {st.sprt.losses} losses, LLR {st.sprt.llr:+.2f})"
+                    if st.challenger else "; no challenger") + f"; {len(st.tabu)} tabu text(s).", ""]
+        for vid in [st.champion] + ([st.challenger] if st.challenger else []):
+            v = store.version(vid)
+            lines.append(f"## {vid} ({v.author}; parent {v.parent or '-'}; horizon {v.info_horizon or '-'})")
+            lines += [f"- [{d.directive_id}] {d.kind}: {d.text}" + (f" (cites {', '.join(d.cites)})" if d.cites else "")
+                      for d in v.directives]
+            zs = st.terminal_z.get(vid)
+            if zs:
+                lines.append(f"Exam TD errors: n {len(zs)}, mean {sum(zs) / len(zs):+.2f}")
+            lines.append("")
+        lines += [f"- {h}" for h in st.history]
+        _emit("\n".join(lines) + "\n")
+        return EXIT_OK
+    if sub == "history":
+        evs = store.load().events
+        lines = ["| Seq | Kind | Horizon | Champion | Challenger / version | Outcome | z | Reasons |", "|---:|---|---|---|---|---|---:|---|"]
+        for e in evs[-args.limit:]:
+            lines.append(f"| {e.seq} | {e.kind} | {e.info_horizon} | {e.champion or ''} | {e.challenger or e.version or ''} | "
+                         f"{e.outcome or ''} | {'' if e.z is None else f'{e.z:+.2f}'} | {', '.join(e.reasons)} |")
+        _emit("\n".join(lines) + "\n")
+        return EXIT_OK
+    if sub == "episodes":
+        rows = EpisodeStore(ledger).index()
+        if not rows:
+            _emit("No RL episodes yet. Run: aitrading research --rl\n")
+            return EXIT_OK
+        lines = ["| Episode | Status | Holdout | Tested | Finalists | Exam utility |", "|---|---|---|---:|---:|---:|"]
+        for r in rows[-args.limit:]:
+            lines.append(f"| {r.episode_id} | {r.status} | {r.holdout_window[0]}..{r.holdout_window[1]} | {r.n_tested} | "
+                         f"{r.n_finalists} | {'' if r.r_oos is None else f'{r.r_oos:+.2f}'} |")
+        _emit("\n".join(lines) + "\n")
+        return EXIT_OK
+    if sub == "brief":
+        from aitrading.beliefs.rl.brief import brief_for_agent
+
+        _emit(brief_for_agent(ledger, _date.today()) + "\n")
+        return EXIT_OK
+    if sub == "reset":
+        store.reset(at_horizon=_date.min)
+        store.save()
+        _emit("the RL policy is back to the seed policy (learned versions are kept for the record)\n")
+        return EXIT_OK
+    if sub == "rollback":
+        vid = (args.rest or [None])[0]
+        if not vid:
+            raise UsageError("aitrading beliefs rl rollback needs a VERSION (see: aitrading beliefs rl history)")
+        try:
+            v = store.version(vid)
+        except KeyError:
+            raise CLIError(f"no policy version '{vid}'") from None
+        store.rollback(vid, at_horizon=v.info_horizon or _date.min)
+        store.save()
+        _emit(f"champion set to {vid} (for research runs whose holdout starts after {v.info_horizon or 'any date'})\n")
+        return EXIT_OK
+    if sub == "export":
+        import json as _json
+
+        from aitrading.beliefs.rl.export import actor_examples, dpo_pairs, grpo_prompts, kto_rows, sft_rows
+
+        target = (args.rest or [None])[0]
+        if not target:
+            raise UsageError("aitrading beliefs rl export needs an output FILE")
+        if not args.t_split:
+            raise UsageError("aitrading beliefs rl export needs --t-split YYYY-MM-DD (train labels before it, eval after)")
+        rows, dropped = actor_examples(ledger, EpisodeStore(ledger), t_split=args.t_split, llm_cutoff=args.llm_cutoff)
+        fmt = args.format
+        data = {"all": rows, "sft": sft_rows(rows), "dpo": dpo_pairs(rows), "kto": kto_rows(rows), "grpo": grpo_prompts(rows)}[fmt]
+        path = Path(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as fh:
+            for r in data:
+                fh.write(_json.dumps(r, ensure_ascii=False, default=str) + "\n")
+        reasons: dict[str, int] = {}
+        for d in dropped:
+            reasons[d["reason"]] = reasons.get(d["reason"], 0) + 1
+        _emit(f"wrote {len(data)} {fmt} row(s) to {path} from {len(rows)} logged proposal(s)"
+              + (f"; dropped: {', '.join(f'{k} {v}' for k, v in sorted(reasons.items()))}" if reasons else "") + "\n")
+        return EXIT_OK
+    raise UsageError(f"unknown rl action '{sub}' (show, history, episodes, brief, reset, rollback, export)")
+
+
 # --------------------------------------------------------------------------------------------
 # beliefs
 # --------------------------------------------------------------------------------------------
@@ -205,6 +350,8 @@ def _cmd_beliefs(args: argparse.Namespace) -> int:
     market = _market(args)
     ledger = ledger_for(market)
     action = args.action
+    if action == "rl":
+        return _cmd_beliefs_rl(args, ledger)
     if action == "list":
         model = BayesianJudge(ledger).model()
         beliefs = model.beliefs()
@@ -343,12 +490,23 @@ def register(sub: Any, *, base: argparse.ArgumentParser, engine: argparse.Argume
                     help="who proposes hypotheses: the LLM engine when one is configured (auto; 'llm' / 'claude' require "
                          "it - Claude or, with --llm openai, an open model), or the offline generator")
     rs.add_argument("--market", default=None, help="ledger name (default: the --provider)")
+    rl = rs.add_argument_group("reinforcement learning (--rl)")
+    rl.add_argument("--rl", action="store_true",
+                    help="run the loop as RL through the prompt: the LLM's research policy text is improved by paired "
+                         "tests, the Bayesian critic values every proposal, a holdout exam gives the TD error")
+    rl.add_argument("--no-reflect", action="store_true", help="--rl: no reflection call (the policy text does not change)")
+    rl.add_argument("--walk-forward", default=None, metavar="END1,END2,...",
+                    help="--rl: one episode per end date, with chronological non-overlapping holdouts")
+    rl.add_argument("--max-llm-calls", type=int, default=None, help="--rl: hard cap on LLM calls per episode")
+    rl.add_argument("--costs-bps", type=float, default=None, help="--rl: one-way costs set on every proposal (default 10)")
+    rl.add_argument("--proposals-per-call", type=int, default=None,
+                    help="--rl: 1 = one proposal per LLM call (the format for small or fine-tuned open models)")
     rs.set_defaults(func=_cmd_research)
 
     bl = sub.add_parser("beliefs", parents=[base, engine, judge],
                         help="the belief ledger: list / show / judge / lessons / calibration / export / forget",
                         description="What the platform has learned from every backtest, holdout and paper record.")
-    bl.add_argument("action", choices=("list", "show", "judge", "lessons", "calibration", "export", "forget"))
+    bl.add_argument("action", choices=("list", "show", "judge", "lessons", "calibration", "export", "forget", "rl"))
     bl.add_argument("target", nargs="?", default=None, help="hypothesis ID (show / forget), idea (judge), file (export)")
     bl.add_argument("rest", nargs="*", help=argparse.SUPPRESS)
     bl.add_argument("--market", default=None, help=f"ledger name = data provider (default: {default_provider_name()})")
@@ -359,4 +517,8 @@ def register(sub: Any, *, base: argparse.ArgumentParser, engine: argparse.Argume
                     help="export: targets whose data start on/after this date go to the test split")
     bl.add_argument("--llm-cutoff", type=_iso_date, default=None, metavar="YYYY-MM-DD",
                     help="export: the base model's knowledge cutoff (flags targets free of pretraining look-ahead)")
+    bl.add_argument("--format", choices=("all", "sft", "dpo", "kto", "grpo"), default="all",
+                    help="rl export: which actor-training rows to write")
+    bl.add_argument("--t-split", type=_iso_date, default=None, metavar="YYYY-MM-DD",
+                    help="rl export: train rows' labels end before this date; eval rows start 182 days after it")
     bl.set_defaults(func=_cmd_beliefs)

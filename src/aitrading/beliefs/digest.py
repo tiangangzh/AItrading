@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from aitrading.beliefs.bayes import BeliefModel
+from aitrading.beliefs.grounding import render_safe
 from aitrading.beliefs.models import Belief
 from aitrading.beliefs.semantics import FAMILY_LABELS, HypothesisShape, similarity
 
@@ -97,7 +98,7 @@ def belief_line(b: Belief, *, similarity_to_target: float | None = None) -> str:
     sim = f" | similarity {similarity_to_target:+.2f}" if similarity_to_target is not None else ""
     oos = (f"out-of-sample {b.oos_sharpe:+.2f} over {b.oos_years:.1f}y" if b.oos_sharpe is not None
            else "no out-of-sample evidence yet")
-    return (f"- [{b.hypothesis_id}] {b.statement}{sim} | belief: net Sharpe {b.mean:+.2f} ± {b.sd:.2f} "
+    return (f"- [{b.hypothesis_id}] {render_safe(b.statement)}{sim} | belief: net Sharpe {b.mean:+.2f} ± {b.sd:.2f} "
             f"(gross {b.gross_mean:+.2f}, costs {b.cost:.2f}), "
             f"P(>0) = {b.p_positive:.0%}, {b.status}; {b.n_evidence} run(s) over {b.years:.1f}y; {oos}")
 

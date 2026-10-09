@@ -35,6 +35,7 @@ from typing import Any, Callable
 from pydantic import BaseModel, Field
 
 from aitrading.beliefs.digest import experience_digest, lessons
+from aitrading.beliefs.grounding import sanitize_llm_text
 from aitrading.beliefs.judge import BayesianJudge, Judge
 from aitrading.beliefs.learner import Learner
 from aitrading.beliefs.ledger import BeliefLedger, CutoffLedger
@@ -222,7 +223,11 @@ class LLMGenerator:
                 if self.on_error:
                     self.on_error(f"could not make '{p.statement[:80]}' testable: {type(exc).__name__}: {str(exc)[:160]}")
                 continue
-            out.append(Proposal(spec, statement=p.statement, mechanism=p.mechanism, source=self.name))
+            statement, s_issues = sanitize_llm_text(p.statement, max_chars=300)
+            mechanism, m_issues = sanitize_llm_text(p.mechanism, max_chars=500, mask_numbers=True)
+            if (s_issues or m_issues) and self.on_error:
+                self.on_error(f"sanitised the proposal text ({', '.join([*s_issues, *m_issues])})")
+            out.append(Proposal(spec, statement=statement or None, mechanism=mechanism, source=self.name))
         return out
 
 
@@ -398,10 +403,10 @@ class ResearchLoop:
 
     def _test(self, learner: Learner, rnd: int, spec: StrategySpec, statement: str | None, mechanism: str, source: str,
               window: tuple[date | None, date], kind: str, oos: bool | None,
-              assessment: Assessment | None = None) -> TestRecord:
+              assessment: Assessment | None = None, text_horizon: date | None = None) -> TestRecord:
         s = spec.model_copy(update={"start": window[0], "end": window[1]})
         pre = learner.before(s, purpose=kind, statement=statement, mechanism=mechanism, source=source,  # type: ignore[arg-type]
-                                  assessment=assessment)
+                             assessment=assessment, text_horizon=text_horizon)
         rec = TestRecord(round=rnd, hypothesis_id=pre.assessment.hypothesis_id, statement=pre.assessment.statement,
                          spec_name=s.name, before=pre.assessment, window=window, kind=kind)
         try:
@@ -411,7 +416,7 @@ class ResearchLoop:
             return rec
         rec.run_id = result.run_id
         upd = learner.after(s, result, pre, kind=kind, out_of_sample=oos, statement=statement,  # type: ignore[arg-type]
-                                 mechanism=mechanism, source=source)
+                            mechanism=mechanism, source=source, text_horizon=text_horizon)
         if upd is None:
             rec.error = "no usable Sharpe ratio (too few return periods)"
         else:
@@ -470,7 +475,7 @@ class ResearchLoop:
             for a, p in chosen:
                 self._say(f"  testing [{a.hypothesis_id}] {a.statement[:80]} (predicted {a.mean:+.2f} ± {a.sd:.2f})")
                 rec = self._test(learner, rnd, p.spec, p.statement, p.mechanism, p.source, research, "backtest", None,
-                                 assessment=a)
+                                 assessment=a, text_horizon=research[1])
                 report.tests.append(rec)
                 tested[rec.hypothesis_id] = (p.spec, p.statement, p.mechanism, p.source)
                 feedback.append(self._feedback(rec))
@@ -494,7 +499,8 @@ class ResearchLoop:
                 if why and uses_before == 0:
                     report.warnings.append(f"[{b.hypothesis_id}] holdout result recorded as in-sample: {why}.")
                 self._say(f"holdout exam: [{b.hypothesis_id}] {b.statement[:80]}")
-                rec = self._test(exam, 0, spec, stmt, mech, src, holdout, "holdout", uses_before == 0 and why is None)
+                rec = self._test(exam, 0, spec, stmt, mech, src, holdout, "holdout", uses_before == 0 and why is None,
+                                 text_horizon=research[1])
                 report.holdout.append(rec)
         model = BayesianJudge(self.ledger).model()
         report.final = sorted(model.beliefs(list(tested)), key=lambda b: -b.mean)

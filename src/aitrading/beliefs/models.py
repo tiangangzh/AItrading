@@ -24,6 +24,9 @@ class LLMPrior(BaseModel):
     model: str
     made_at: datetime
     reasoning: str = ""
+    info_horizon: date | None = Field(
+        None, description="Last date of the evidence data the model was shown when it formed this prior (None = unknown). "
+                          "A view whose holdout starts on or before it does not use the prior.")
 
 
 class Hypothesis(BaseModel):
@@ -38,6 +41,9 @@ class Hypothesis(BaseModel):
     names: list[str] = Field(default_factory=list, description="Spec names this hypothesis was tested under.")
     created_at: datetime
     llm_prior: LLMPrior | None = None
+    text_horizon: date | None = Field(
+        None, description="Set when a language model wrote the statement / mechanism: the last date of the evidence data it "
+                          "had seen. A view whose holdout starts on or before it shows the deterministic statement instead.")
 
 
 class Evidence(BaseModel):

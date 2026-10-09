@@ -302,11 +302,15 @@ class BeliefLedger:
 
     # ------------------------------------------------------------------ writes
     def add_hypothesis(self, spec: StrategySpec | dict, *, statement: str | None = None, mechanism: str = "",
-                       source: str = "user", save: bool = True) -> Hypothesis:
-        """Register the claim behind ``spec`` (idempotent; a later call can add a mechanism / name)."""
+                       source: str = "user", text_horizon: date | None = None, save: bool = True) -> Hypothesis:
+        """Register the claim behind ``spec`` (idempotent; a later call can add a mechanism / name).
+
+        ``text_horizon``: when a language model wrote ``statement`` / ``mechanism``, the last date of the
+        evidence data it had seen (see :class:`CutoffLedger`)."""
         s = spec_from_any(spec)
         hid = hypothesis_id(s)
         h = self.data.hypotheses.get(hid)
+        llm_text = bool((statement or "").strip() or mechanism.strip()) and text_horizon is not None
         if h is None:
             fam, sign, hor = primary_concept(s)
             h = Hypothesis(
@@ -320,11 +324,14 @@ class BeliefLedger:
                 source=source,
                 names=[s.name] if s.name else [],
                 created_at=self.now(),
+                text_horizon=text_horizon if llm_text else None,
             )
             self.data.hypotheses[hid] = h
         else:
             if mechanism.strip() and not h.mechanism:
                 h.mechanism = mechanism.strip()
+                if text_horizon is not None:
+                    h.text_horizon = max(h.text_horizon or text_horizon, text_horizon)
             if s.name and s.name not in h.names:
                 h.names.append(s.name)
         if save:
@@ -350,12 +357,13 @@ class BeliefLedger:
 
     def record_backtest(self, spec: StrategySpec | dict, result: BacktestResult, *, kind: EvidenceKind = "backtest",
                         out_of_sample: bool | None = None, statement: str | None = None, mechanism: str = "",
-                        source: str = "user", save: bool = True) -> Evidence | None:
+                        source: str = "user", text_horizon: date | None = None, save: bool = True) -> Evidence | None:
         """Register the hypothesis and record the run (None when the run has no usable Sharpe ratio).
 
         ``out_of_sample`` defaults to True for holdout runs and for backtests whose data start after
         the hypothesis was first registered."""
-        h = self.add_hypothesis(spec, statement=statement, mechanism=mechanism, source=source, save=False)
+        h = self.add_hypothesis(spec, statement=statement, mechanism=mechanism, source=source, text_horizon=text_horizon,
+                                save=False)
         ev = evidence_from_backtest(spec, result, kind=kind, out_of_sample=False, recorded_at=self.now())
         if ev is None:
             if save:
@@ -493,8 +501,29 @@ class CutoffLedger:
 
     def view(self, *, before: datetime | None = None, evidence_filter: Any = None) -> "LedgerView":
         if evidence_filter is None:
-            return self.base.view(before=before, evidence_filter=self._visible)
-        return self.base.view(before=before, evidence_filter=lambda e: self._visible(e) and evidence_filter(e))
+            v = self.base.view(before=before, evidence_filter=self._visible)
+        else:
+            v = self.base.view(before=before, evidence_filter=lambda e: self._visible(e) and evidence_filter(e))
+        return LedgerView(market=v.market, hypotheses=[self._gate(h) for h in v.hypotheses()], evidence=v.evidence())
+
+    def _gate(self, h: Hypothesis) -> Hypothesis:
+        """Hide model-written text and priors formed with knowledge of data from the cutoff on."""
+        upd: dict[str, Any] = {}
+        horizon = h.text_horizon
+        if horizon is None and (h.mechanism or h.statement != hypothesis_statement(h.spec)):
+            horizon = h.created_at.date()  # model-written text of unknown provenance: as late as its creation
+        if horizon is not None and horizon >= self.cutoff:
+            upd.update(statement=hypothesis_statement(h.spec), mechanism="", text_horizon=None)
+        if h.llm_prior is not None and (h.llm_prior.info_horizon is None or h.llm_prior.info_horizon >= self.cutoff):
+            upd["llm_prior"] = None
+        return h.model_copy(update=upd) if upd else h
+
+    def hypothesis(self, hid: str) -> Hypothesis | None:
+        h = self.base.hypothesis(hid)
+        return self._gate(h) if h is not None else None
+
+    def hypotheses(self) -> list[Hypothesis]:
+        return [self._gate(h) for h in self.base.hypotheses()]
 
     def evidence(self, kinds: Iterable[str] | None = None) -> list[Evidence]:
         return [e for e in self.base.evidence(kinds) if self._visible(e)]

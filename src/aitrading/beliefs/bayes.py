@@ -61,6 +61,9 @@ from aitrading.beliefs.semantics import HypothesisShape, hypothesis_shape, simil
 __all__ = [
     "BeliefModel",
     "Hyper",
+    "PlannedTest",
+    "JointGaussian",
+    "bayes_hash",
     "REGIME_SD",
     "IMPL_SD",
     "DEFAULT_PRIOR_MEAN",
@@ -113,6 +116,26 @@ class _Obs:
     var: float  # sampling + regime variance (correlated part)
     extra: float  # independent variance (implementation, cost estimate, prior width)
     months: dict[str, float] = field(default_factory=dict)
+    evidence_id: str | None = None  # None for an LLM-prior pseudo-observation
+
+
+@dataclass
+class PlannedTest:
+    """A backtest not run yet: the hypothesis, the calendar months its returns will cover, its length."""
+
+    shape: HypothesisShape
+    months: list[str]
+    years: float
+
+
+@dataclass
+class JointGaussian:
+    """Posterior joint distribution of ``n_latent`` gross Sharpe ratios followed by planned observations."""
+
+    labels: list[str]
+    mean: np.ndarray
+    cov: np.ndarray
+    n_latent: int
 
 
 def _psd_correlation(r: np.ndarray) -> np.ndarray:
@@ -222,7 +245,7 @@ class BeliefModel:
             else:
                 cost, csd = self.cost_estimate(self.shape(e.hypothesis_id), e.costs_bps)
                 extra += csd * csd
-            obs.append(_Obs(e.hypothesis_id, float(e.sharpe) + cost, var, extra, dict(e.monthly)))
+            obs.append(_Obs(e.hypothesis_id, float(e.sharpe) + cost, var, extra, dict(e.monthly), e.evidence_id))
         if self.include_llm_priors:
             for h in self._hyps.values():
                 if h.llm_prior is not None:
@@ -312,6 +335,70 @@ class BeliefModel:
         var = h.s0 ** 2 - np.sum(kt * v.T, axis=1)
         return mean, np.sqrt(np.clip(var, 1e-8, None))
 
+    # ------------------------------------------------------------------ planned tests (the RL critic)
+    @staticmethod
+    def planned_variance(years: float) -> tuple[float, float]:
+        """(total, correlated part) of the noise variance of a planned run of ``years``. Lo's variance is
+        taken at Sharpe 0, so it does not depend on any outcome."""
+        y = max(float(years), 0.25)
+        corr = 1.0 / y + REGIME_SD ** 2 / y
+        return corr + IMPL_SD ** 2, corr
+
+    def joint_planned(self, latent: list[HypothesisShape], planned: list[PlannedTest]) -> JointGaussian:
+        """Joint posterior of the gross Sharpe ratios of ``latent`` and the gross Sharpe a run of each
+        ``planned`` test would report, given every observation so far.
+
+        Planned noise is correlated, through the SIGNED kernel, with existing runs whose months it
+        shares (similarity x n_common / sqrt(n_i n_c) x sd_i sd_c) and with the other planned tests
+        (similarity x correlated variance). So a re-test of the same years, a near-copy or a mirror of
+        a planned test carries little new information. Trading-cost uncertainty is ignored here."""
+        h = self.hyper
+        s2 = h.s0 ** 2
+        L, P = len(latent), len(planned)
+        shapes = list(latent) + [p.shape for p in planned]
+        K = s2 * np.array([[similarity(a, b) for b in shapes] for a in shapes], dtype=float).reshape(L + P, L + P)
+        pv = [self.planned_variance(p.years) for p in planned]
+        for i in range(P):
+            for j in range(P):
+                if i == j:
+                    K[L + i, L + j] += pv[i][0]
+                else:
+                    common = len(set(planned[i].months) & set(planned[j].months))
+                    ov = common / math.sqrt(max(len(planned[i].months), 1) * max(len(planned[j].months), 1))
+                    K[L + i, L + j] += similarity(planned[i].shape, planned[j].shape) * ov * math.sqrt(pv[i][1] * pv[j][1])
+        mean = np.full(L + P, h.m0)
+        labels = [f"g{i}" for i in range(L)] + [f"y{i}" for i in range(P)]
+        if self._L is None:
+            return JointGaussian(labels, mean, _psd_cov(K), L)
+        obs_shapes = [self.shape(x) for x in self._obs_hids]
+        Kzo = s2 * np.array([[similarity(z, o) for o in obs_shapes] for z in shapes], dtype=float).reshape(L + P, len(obs_shapes))
+        for i, p in enumerate(planned):
+            pm = set(p.months)
+            for j, o in enumerate(self._obs):
+                if not o.months or o.var <= 0:
+                    continue
+                common = len(pm & set(o.months))
+                if not common:
+                    continue
+                ov = common / math.sqrt(max(len(p.months), 1) * len(o.months))
+                rho = max(-1.0, min(1.0, similarity(p.shape, obs_shapes[j]) * ov))
+                Kzo[L + i, j] += rho * math.sqrt(o.var * pv[i][1])
+        mean = h.m0 + Kzo @ self._alpha
+        V = _solve(self._L, Kzo.T)
+        cov = K - Kzo @ V
+        return JointGaussian(labels, mean, _psd_cov(cov), L)
+
+    def smoother_row(self, shape: HypothesisShape) -> tuple[np.ndarray, list[str | None], np.ndarray]:
+        """``(w, evidence_ids, resid)`` with posterior gross mean = m0 + w @ resid: how much each observation
+        moves the belief about ``shape`` (used to share a finalist's exam result among the tests behind it)."""
+        if self._L is None:
+            return np.zeros(0), [], np.zeros(0)
+        h = self.hyper
+        obs_shapes = [self.shape(x) for x in self._obs_hids]
+        k = h.s0 ** 2 * np.array([similarity(shape, o) for o in obs_shapes], dtype=float)
+        w = _solve(self._L, k)
+        return w, [o.evidence_id for o in self._obs], self._y - h.m0
+
     def predict_net(self, shapes: list[HypothesisShape], costs_bps: list[float | None]
                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """(net mean, net sd, gross mean, cost) for each shape traded at the given cost level."""
@@ -392,6 +479,31 @@ class BeliefModel:
 
     def hypotheses(self) -> list[Hypothesis]:
         return list(self._hyps.values())
+
+
+def _psd_cov(c: np.ndarray) -> np.ndarray:
+    c = 0.5 * (c + c.T)
+    w, v = np.linalg.eigh(c)
+    if w.min() >= 0:
+        return c
+    return (v * np.clip(w, 0.0, None)) @ v.T
+
+
+def bayes_hash() -> str:
+    """Fingerprint of everything that defines the belief model (noise, priors, cost prior, kernel), so
+    logged rewards can be matched to the model that computed them."""
+    import hashlib
+    import json
+
+    from aitrading.beliefs import semantics
+
+    blob = json.dumps({
+        "regime": REGIME_SD, "impl": IMPL_SD, "m0": DEFAULT_PRIOR_MEAN, "s0": DEFAULT_PRIOR_SD,
+        "hyper": [HYPER_MEAN_SD, HYPER_LOGSD_SD], "cost_prior": COST_PRIOR, "cost_w": COST_PRIOR_WEIGHT,
+        "bandwidth": semantics.HORIZON_BANDWIDTH, "family_share": semantics.FAMILY_SHARE,
+        "default_share": semantics.DEFAULT_FAMILY_SHARE, "kind": {f"{a}|{b}": v for (a, b), v in semantics._KIND_SIM.items()},
+    }, sort_keys=True)
+    return "b-" + hashlib.sha1(blob.encode()).hexdigest()[:12]
 
 
 def _union_years(ev: list[Evidence]) -> float:

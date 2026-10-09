@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
+from datetime import date
 from statistics import NormalDist
 from typing import Any, Protocol
 
@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 
 from aitrading.beliefs.bayes import DEFAULT_HURDLE, LLM_PRIOR_MIN_SD, BeliefModel, normal_cdf
 from aitrading.beliefs.digest import experience_digest
-from aitrading.beliefs.grounding import HYP_ID_RE, check_text
+from aitrading.beliefs.grounding import HYP_ID_RE, check_text, sanitize_llm_text, structured_refs
 from aitrading.beliefs.ledger import BeliefLedger, LedgerView, as_view
 from aitrading.beliefs.models import Assessment, LLMPrior, Neighbor
 from aitrading.beliefs.semantics import hypothesis_id, hypothesis_shape, hypothesis_statement, similarity, spec_from_any
@@ -82,21 +82,21 @@ def _verdict(novel: bool, p_positive: float) -> str:
 class BayesianJudge:
     """The belief engine as a judge (see the module docstring)."""
 
-    name = "bayes"
-
     def __init__(self, ledger: BeliefLedger | LedgerView, *, hurdle: float = DEFAULT_HURDLE,
-                 include_llm_priors: bool = True, max_neighbors: int = 5):
+                 include_llm_priors: bool = True, max_neighbors: int = 5, hyper: Any = None, name: str = "bayes"):
         self.ledger = ledger
         self.hurdle = hurdle
         self.include_llm_priors = include_llm_priors
         self.max_neighbors = max_neighbors
+        self.hyper = hyper  # fixed hyperparameters (the RL critic freezes them for an episode); None = empirical Bayes
+        self.name = name
         self._model: BeliefModel | None = None
         self._sig: tuple | None = None
 
     def bind(self, ledger: Any) -> "BayesianJudge":
         """The same judge reading ``ledger`` (e.g. the research loop's holdout-blind view)."""
         return BayesianJudge(ledger, hurdle=self.hurdle, include_llm_priors=self.include_llm_priors,
-                             max_neighbors=self.max_neighbors)
+                             max_neighbors=self.max_neighbors, hyper=self.hyper, name=self.name)
 
     def _signature(self) -> tuple:
         view = as_view(self.ledger)
@@ -108,7 +108,8 @@ class BayesianJudge:
     def model(self) -> BeliefModel:
         sig = self._signature()
         if self._model is None or sig != self._sig:
-            self._model = BeliefModel(self.ledger, hurdle=self.hurdle, include_llm_priors=self.include_llm_priors)
+            self._model = BeliefModel(self.ledger, hurdle=self.hurdle, include_llm_priors=self.include_llm_priors,
+                                      hyper=self.hyper)
             self._sig = sig
         return self._model
 
@@ -226,10 +227,6 @@ results. If the log shows related failures, say what would have to be different 
 reasoning under 150 words."""
 
 
-def _numbers_in(text: str) -> list[float]:
-    return [float(m.group(0).rstrip("%")) for m in re.finditer(r"[-+]?\d+(?:\.\d+)?%?", text)]
-
-
 def _combine(mean: float, sd: float, prior_mean: float, prior_sd: float) -> tuple[float, float]:
     """Precision-weighted combination of two independent Gaussian opinions."""
     w1, w2 = 1.0 / sd ** 2, 1.0 / prior_sd ** 2
@@ -281,16 +278,25 @@ class LLMJudge:
         if not isinstance(view, LLMView):
             view = LLMView.model_validate(view)
         source = digest + "\n" + base.critique
-        known_ids = set(HYP_ID_RE.findall(source))
-        report = check_text(view.reasoning, known_ids=known_ids, numbers=_numbers_in(source))
+        # known ids: hypotheses the model was actually shown AND that have evidence; reference numbers:
+        # the structured beliefs behind them (never digits harvested from rendered ids or dates)
+        known_ids = set(HYP_ID_RE.findall(source)) & set(model.tested())
+        refs = structured_refs(model, known_ids) + [base.mean, base.sd, base.p_positive, base.p_hurdle,
+                                                     *(float(x) for x in base.details.values() if isinstance(x, (int, float)))]
+        report = check_text(view.reasoning, known_ids=known_ids, numbers=refs)
         unknown = sorted({c for c in view.cited_hypothesis_ids if c not in known_ids} | set(report.unknown_ids))
         unverified = report.unverified_numbers
         prior_sd = max(float(view.literature_prior_sd), LLM_PRIOR_MIN_SD)
+        llm_mechanism, _ = sanitize_llm_text(view.mechanism, max_chars=500, mask_numbers=True)
         if self.record_prior:
-            self.ledger.add_hypothesis(s, statement=statement, mechanism=mechanism or view.mechanism, save=False)
+            seen = [e.end for e in model.view.evidence()]
+            horizon = max(seen) if seen else date.min  # the latest data the judge was shown (date.min: none)
+            self.ledger.add_hypothesis(s, statement=statement, mechanism=mechanism or llm_mechanism,
+                                       text_horizon=None if mechanism else horizon, save=False)
             self.ledger.set_llm_prior(base.hypothesis_id, LLMPrior(
                 mean=float(view.literature_prior_sharpe), sd=float(view.literature_prior_sd),
-                model=str(getattr(self.llm, "name", "llm")), made_at=self.ledger.now(), reasoning=view.mechanism[:500]))
+                model=str(getattr(self.llm, "name", "llm")), made_at=self.ledger.now(), reasoning=llm_mechanism,
+                info_horizon=horizon))
             combined = BayesianJudge(self.ledger, hurdle=self.hurdle, include_llm_priors=True).assess(
                 s, statement=statement, mechanism=mechanism)
             mean, sd = combined.mean, combined.sd
