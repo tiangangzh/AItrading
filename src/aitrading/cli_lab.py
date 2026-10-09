@@ -8,6 +8,9 @@
 * ``aitrading ideas ...``            the idea inbox: list / show / try / reject / later.
 * ``aitrading dashboard``            index page linking every report, strategy and idea.
 
+``backtest``, ``discover`` / ``ideas try`` and ``strategy run`` record their results in the market's
+belief ledger (:mod:`aitrading.cli_beliefs`) unless ``--no-learn`` is given.
+
 Simulated trading only: nothing here places orders with a broker.
 """
 
@@ -68,14 +71,21 @@ def _llm_or_none(args: argparse.Namespace) -> Any:
     return make_llm(args.model, args.effort) if resolve_engine(args) == "claude" else None
 
 
+def _market_name(args: argparse.Namespace) -> str:
+    return getattr(args, "provider", None) or default_provider_name()
+
+
 def _lab(args: argparse.Namespace, provider: Any, llm: Any) -> Any:
+    from aitrading.cli_beliefs import make_learner
     from aitrading.idealab import IdeaLab
     from aitrading.strategy.interpret import BacktestInterpreter, HeuristicInterpreter
     from aitrading.strategy.nl import HeuristicStrategyTranslator, StrategyTranslator
 
     translator = StrategyTranslator(llm, effort=args.effort) if llm is not None else HeuristicStrategyTranslator()
     interpreter = BacktestInterpreter(llm, effort=args.effort) if llm is not None else HeuristicInterpreter()
-    return IdeaLab(provider, translator=translator, interpreter=interpreter, out_dir=_out_dir(args) / "backtests")
+    learner = make_learner(args, _market_name(args), llm)
+    return IdeaLab(provider, translator=translator, interpreter=interpreter, out_dir=_out_dir(args) / "backtests",
+                   learner=learner)
 
 
 def _apply_overrides(spec: Any, args: argparse.Namespace) -> Any:
@@ -186,6 +196,12 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         _emit(result.model_dump_json(indent=2) + "\n")
     else:
         _emit("\n".join(_summary_lines(result)) + "\n")
+    if args.format != "json":
+        from aitrading.cli_beliefs import report_learning
+
+        report_learning(out)
+    elif out.belief_error:  # stdout stays pure JSON
+        _note(f"warning: {out.belief_error} (the backtest itself is fine)")
     if out.html_path is not None:
         _note(f"report: {out.html_path}")
     if args.save:
@@ -376,6 +392,8 @@ def _cmd_strategy(args: argparse.Namespace) -> int:
             _emit("\n".join(lines) + "\n")
         for w in report.warnings:
             _note(f"warning: {w}")
+        if not getattr(args, "no_learn", False):
+            _learn_from_paper(store, name, spec, account, backtest, provider_name)
     page = _write_strategy_page(store, name, args)
     if action == "status":
         account = PaperAccount(store, name)
@@ -393,6 +411,17 @@ def _cmd_strategy(args: argparse.Namespace) -> int:
         _note(f"strategy page: {page}")
         _open(page, args)
     return EXIT_OK
+
+
+def _learn_from_paper(store: Any, name: str, spec: Any, account: Any, backtest: Any, market: str) -> None:
+    """The simulated track record is out-of-sample evidence about the strategy's hypothesis."""
+    from aitrading.cli_beliefs import record_paper
+
+    try:
+        summary = account.summary(backtest=backtest)
+    except Exception:  # noqa: BLE001 - nothing to learn from an account that has not started
+        return
+    record_paper(market, name, store.path(name).name, spec, summary)
 
 
 def _account_started(account: Any) -> date | None:
@@ -669,6 +698,9 @@ def _try_idea(c: Any, args: argparse.Namespace, *, lab: Any, inbox: Any, ask: Pr
     if html_path is not None:
         lines.append(f"  Report: {html_path}")
     _emit("\n".join(lines) + "\n")
+    from aitrading.cli_beliefs import report_learning
+
+    report_learning(lab)
     if _ask("  Save it as a strategy for simulated trading? [y/N] ", "yn", "n", ask) == "y":
         name = _save_idea(c, spec, result, args)
         inbox.set_status(c.idea_id, "saved")
@@ -797,13 +829,16 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 
 def register(sub: Any, *, base: argparse.ArgumentParser, engine: argparse.ArgumentParser, data: argparse.ArgumentParser) -> None:
     """Add the idea-lab subcommands to the main CLI parser."""
+    from aitrading.cli_beliefs import learn_options, no_learn_option
+
+    learn = learn_options()
     out = argparse.ArgumentParser(add_help=False)
     out.add_argument("--out", default="aitrading_output", metavar="DIR", help="output folder (default: aitrading_output)")
     browser = out.add_mutually_exclusive_group()
     browser.add_argument("--open", dest="open_browser", action="store_true", default=None, help="open the HTML page")
     browser.add_argument("--no-open", dest="open_browser", action="store_false", help="do not open the HTML page")
 
-    bt = sub.add_parser("backtest", parents=[base, engine, data, out], help="backtest a research idea",
+    bt = sub.add_parser("backtest", parents=[base, engine, data, out, learn], help="backtest a research idea",
                         description="Translate an idea into a strategy, backtest it point-in-time and judge the result.")
     bt.add_argument("idea", nargs="*", help='the idea, e.g. "Fama-French 3 factor model" or "12-1 momentum deciles"')
     bt.add_argument("--spec-file", metavar="JSON", help="backtest a StrategySpec JSON file instead of translating an idea")
@@ -819,7 +854,7 @@ def register(sub: Any, *, base: argparse.ArgumentParser, engine: argparse.Argume
     lib = sub.add_parser("library", parents=[base], help="list the built-in idea library")
     lib.set_defaults(func=_cmd_library)
 
-    st = sub.add_parser("strategy", parents=[base, data_options(None), out], help="saved strategies and simulated trading",
+    st = sub.add_parser("strategy", parents=[base, data_options(None), out, no_learn_option()], help="saved strategies and simulated trading",
                         description="Simulated (paper) trading of saved strategies. No broker is involved. 'run' uses the "
                                     "data (provider and universe) the strategy was backtested and is paper-trading on, "
                                     "unless --provider / --tickers say otherwise.")
@@ -829,7 +864,7 @@ def register(sub: Any, *, base: argparse.ArgumentParser, engine: argparse.Argume
     st.add_argument("--capital", type=float, default=None, help="initial capital for a new or reset account (default 100,000)")
     st.set_defaults(func=_cmd_strategy)
 
-    disc = sub.add_parser("discover", parents=[base, engine, data, out], help="find strategy ideas in papers and on the web",
+    disc = sub.add_parser("discover", parents=[base, engine, data, out, learn], help="find strategy ideas in papers and on the web",
                           description="Find ideas (arXiv, your feeds, Claude web search, or a URL/PDF), verify their quotes, "
                                       "then ask idea by idea whether to backtest and stress-test them.")
     disc.add_argument("--query", action="append", default=None, help="search terms (repeatable)")
@@ -845,7 +880,7 @@ def register(sub: Any, *, base: argparse.ArgumentParser, engine: argparse.Argume
                       help="read documents an earlier run already read again (by default they are skipped, which saves Claude calls)")
     disc.set_defaults(func=_cmd_discover)
 
-    ideas = sub.add_parser("ideas", parents=[base, engine, data, out], help="the idea inbox",
+    ideas = sub.add_parser("ideas", parents=[base, engine, data, out, learn], help="the idea inbox",
                            description="List, inspect, try, reject or defer ideas found by 'aitrading discover'.")
     ideas.add_argument("action", choices=("list", "show", "try", "reject", "later"))
     ideas.add_argument("idea_id", nargs="?", default=None)

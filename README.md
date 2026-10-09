@@ -13,6 +13,10 @@ and research ideas into **tested** strategies:
   asks you idea by idea whether to try them, then backtests and stress-tests the ones you accept.
 * **Simulated trading**: save a strategy and run it forward as a paper portfolio, using the same code
   path as the backtest. No broker is involved.
+* **Learning from backtests**: every backtest, holdout test and paper record becomes evidence about a
+  *hypothesis*. Bayesian beliefs are shared between related ideas (and net of costs), and a judge
+  forecasts each new idea against that experience before it is tested. `aitrading research` runs a
+  propose, judge, test, learn loop that ends with an out-of-sample exam.
 
 Claude (`claude-opus-5-5`) does the reasoning: translating intent, explaining, interpreting, reading
 papers. **It never computes the numbers that select stocks or score a backtest.** Those come from a
@@ -158,6 +162,30 @@ the web search and the arXiv search. Documents read in an earlier run are not se
 
 An index page linking every screen, backtest, strategy and idea.
 
+### 6. Learn from every result: `aitrading research`, `aitrading beliefs`
+
+```bash
+aitrading backtest "3-day momentum"            # also records what the run taught (--no-learn to skip)
+aitrading beliefs judge "5-day momentum"       # forecast + related experience BEFORE testing
+aitrading beliefs list                         # beliefs about every tested hypothesis
+aitrading research "short-term momentum"       # propose, judge, test, learn rounds, then a holdout exam
+aitrading beliefs calibration                  # were the forecasts any good?
+aitrading beliefs export judge.jsonl           # point-in-time data to train your own judge model
+```
+
+How it works:
+- **Beliefs.** One Gaussian process over hypothesis space. 3-day and 5-day momentum share evidence;
+  momentum and reversal are opposite bets. Gross Sharpe and cost drag are modelled separately, so an
+  opposite bet does not inherit a mirror-image success.
+- **Repeated tests.** Re-tests of the same years are discounted through overlap-correlated errors.
+- **Skepticism.** How skeptical to be is learned from the ledger.
+- **Judges.** The judge is the Bayesian engine (default), Claude reading the ledger, or your own
+  model trained by RL (`scripts/train_judge_grpo.py`) and served on an OpenAI-compatible endpoint.
+- **Pre-registration.** Every forecast is recorded before the test it predicts.
+
+Paper-trading records become out-of-sample evidence. Details, a worked example and when RL training
+is (not) worth it: **[docs/LEARNING_LOOP.md](docs/LEARNING_LOOP.md)**.
+
 ---
 
 ## Data
@@ -232,9 +260,11 @@ src/aitrading/
   factors/     Kenneth French data loader, Fama-French factor construction
   discovery/   idea sources (arXiv, feeds, web search, URL/PDF), extraction, ranking, inbox, replication
   trading/     strategy store, paper-trading ledger
+  beliefs/     hypothesis ledger, Bayesian beliefs, judges, calibration, judge-training export, research loop
   report/      Markdown/HTML reports, SVG charts, dashboard
-  pipeline.py idealab.py cli.py cli_lab.py
-docs/          ARCHITECTURE.md (ADR), VENDOR_REFERENCE.md, QUICKSTART_PC.md
+  pipeline.py idealab.py cli.py cli_lab.py cli_beliefs.py
+docs/          ARCHITECTURE.md (ADR), VENDOR_REFERENCE.md, QUICKSTART_PC.md, LEARNING_LOOP.md
+scripts/       installers, train_judge_grpo.py (optional RL training of a judge model)
 tests/         offline test suite (no network, no API key)
 ```
 

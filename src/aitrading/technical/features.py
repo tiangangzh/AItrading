@@ -28,7 +28,7 @@ Conventions
   ``price`` by later splits too; ``ResearchPipeline`` / ``StrategyRunner`` suspend the price floor
   there and the pipeline flags the dollar-volume caveat (only as-traded prices would remove it).
 
-Bars needed (gap-free data): price 1; returns n + 1 (12-1 momentum 253); sma_n n; sma_200 slope
+Bars needed (gap-free data): price 1; returns n + 1 (3d 4, 5d 6, 10d 11, 12-1 momentum 253); sma_n n; sma_200 slope
 221; golden cross 220; rsi_14 15; macd line 26, signal 34, bullish cross 44; 52w range 252;
 volatility n + 1; atr_14 14; beta 253; volume ratios 60 / 120; up/down volume 51.
 """
@@ -267,6 +267,8 @@ def compute_technical_features(prices: PricePanel, benchmark: pd.Series | None, 
 
         # momentum and relative strength (benchmark over the ticker's own bar dates)
         bench_now = _row(B, 0)
+        for label, w in (("3d", 3), ("5d", 5), ("10d", 10)):
+            f[f"return_{label}_pct"] = _pct(price, _row(C, w))
         for label, w in (("1m", W_1M), ("3m", W_3M), ("6m", W_6M), ("12m", W_12M)):
             f[f"return_{label}_pct"] = _pct(price, _row(C, w))
             if label != "1m":

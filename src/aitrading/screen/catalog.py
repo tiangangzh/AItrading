@@ -4,7 +4,7 @@ Each feature has a precise definition (implemented by the technical / fundamenta
 modules), a unit, and a source. The NL layer may only reference features listed here; anything it
 cannot express goes into ``ScreenSpec.unsupported_requests`` rather than being silently dropped.
 
-Window conventions (trading sessions): 1m = 21, 3m = 63, 6m = 126, 12m / 52w = 252.
+Window conventions (trading sessions): 3d = 3, 5d = 5, 10d = 10, 1m = 21, 3m = 63, 6m = 126, 12m / 52w = 252.
 "Price" is the latest split- and dividend-adjusted close on or before the as-of date.
 A feature whose inputs are insufficient (short history, non-positive denominator) is NaN.
 The ``factor_characteristics`` features are the sort variables of the academic factors (HML, RMW,
@@ -60,6 +60,9 @@ _FEATURES: list[FeatureDef] = [
     _f("sma_200_slope_1m_pct", "technical", "trend", "number", "%", "(sma_200 today / sma_200 21 sessions ago - 1) x 100. Positive = rising 200-day."),
     _f("golden_cross_20d", "technical", "trend", "bool", "bool", "1 if sma_50 crossed above sma_200 within the last 20 sessions, else 0."),
     # ---------------- momentum & relative strength ----------------
+    _f("return_3d_pct", "technical", "momentum", "number", "%", "Total return over the last 3 sessions, %. Short-horizon signal: pair it with weekly or daily rebalancing.", True),
+    _f("return_5d_pct", "technical", "momentum", "number", "%", "Total return over the last 5 sessions (one week), %. Short-horizon signal: pair it with weekly or daily rebalancing.", True),
+    _f("return_10d_pct", "technical", "momentum", "number", "%", "Total return over the last 10 sessions (two weeks), %. Short-horizon signal: pair it with weekly or daily rebalancing.", True),
     _f("return_1m_pct", "technical", "momentum", "number", "%", "Total return over the last 21 sessions, %.", True),
     _f("return_3m_pct", "technical", "momentum", "number", "%", "Total return over the last 63 sessions, %.", True),
     _f("return_6m_pct", "technical", "momentum", "number", "%", "Total return over the last 126 sessions, %.", True),

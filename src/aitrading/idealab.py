@@ -11,7 +11,12 @@
    skeptical reviewer whose every cited number is verified) or the offline
    :class:`~aitrading.strategy.interpret.HeuristicInterpreter` (default). If the LLM interpreter fails,
    the heuristic one is used and a warning says so. The interpretation is attached to the result.
-4. **Save** ``<out_dir>/backtests/<run_id>/result.json`` (the full ``BacktestResult``) and
+4. **Learn** (only with a ``learner``, :class:`~aitrading.beliefs.learner.Learner`): before the
+   backtest the judge's forecast for the hypothesis is recorded in the market's belief ledger
+   (pre-registration); after it the result is recorded as evidence and ``IdeaLabResult.belief``
+   says what the run taught (prediction, observation, surprise, posterior). A ledger problem never
+   loses the backtest: it is reported in ``IdeaLabResult.belief_error``.
+5. **Save** ``<out_dir>/backtests/<run_id>/result.json`` (the full ``BacktestResult``) and
    ``report.html`` (``render_backtest_html``, with the template's title / description / references
    when ``spec.name`` is a library template key). When ``out_dir`` itself is a folder named
    ``backtests`` the run folders go directly below it (so ``.../backtests/backtests`` never
@@ -62,6 +67,8 @@ class IdeaLabResult:
     checks: list[EvidenceCheck] = field(default_factory=list)  # verification of the interpretation's cited metrics
     html_path: Path | None = None
     json_path: Path | None = None
+    belief: Any = None  # BeliefUpdate when a learner recorded the run
+    belief_error: str | None = None
 
     @property
     def interpretation(self) -> Any:
@@ -93,6 +100,8 @@ class IdeaLab:
         runner: a :class:`~aitrading.backtest.protocols.BacktestRunner` (default: ``StrategyRunner(provider)``).
         out_dir: where run folders are written (``None`` = do not write files).
         catalog: feature catalog for the default translator / runner.
+        learner: a :class:`~aitrading.beliefs.learner.Learner` that records every run in a belief
+            ledger (``None`` = no learning).
     """
 
     def __init__(
@@ -104,8 +113,12 @@ class IdeaLab:
         runner: Any | None = None,
         out_dir: Path | str | None = "aitrading_output",
         catalog: FeatureCatalog | None = None,
+        learner: Any | None = None,
     ) -> None:
         self.provider = provider
+        self.learner = learner
+        self.last_belief: Any = None
+        self.last_belief_error: str | None = None
         self.catalog = catalog or default_catalog()
         self.translator = translator if translator is not None else HeuristicStrategyTranslator(self.catalog)
         self.interpreter = interpreter if interpreter is not None else HeuristicInterpreter()
@@ -209,12 +222,36 @@ class IdeaLab:
                 raise ValueError("give an idea (e.g. 'Fama-French 3 factor model') or a StrategySpec")
             translation = self.translator.translate(str(idea))
             spec = translation.spec
+        pre = self._learn_before(spec)
         result = self.runner.backtest(spec)
+        belief = self._learn_after(spec, result, pre)
         checks = self._interpret(result) if interpret else []
         self._finish(result, marks)
         html_path, json_path = self._write(result, spec, checks)
         return IdeaLabResult(spec=spec, translation=translation, result=result, checks=checks,
-                             html_path=html_path, json_path=json_path)
+                             html_path=html_path, json_path=json_path, belief=belief,
+                             belief_error=self.last_belief_error)
+
+    # ------------------------------------------------------------------ learning
+    def _learn_before(self, spec: StrategySpec, *, source: str = "user") -> Any:
+        self.last_belief, self.last_belief_error = None, None
+        if self.learner is None:
+            return None
+        try:
+            return self.learner.before(spec, purpose="backtest", source=source)
+        except Exception as exc:  # noqa: BLE001 - the ledger must never cost a backtest
+            self.last_belief_error = f"belief ledger: {type(exc).__name__}: {str(exc)[:200]}"
+            return None
+
+    def _learn_after(self, spec: StrategySpec, result: BacktestResult, pre: Any, *, source: str = "user") -> Any:
+        if self.learner is None or self.last_belief_error:
+            return None
+        try:
+            self.last_belief = self.learner.after(spec, result, pre, kind="backtest", source=source)
+        except Exception as exc:  # noqa: BLE001
+            self.last_belief_error = f"belief ledger: {type(exc).__name__}: {str(exc)[:200]}"
+            self.last_belief = None
+        return self.last_belief
 
     def replicate_idea(
         self,
@@ -234,7 +271,9 @@ class IdeaLab:
         from aitrading.report.html import _replication_html, _section
 
         marks = self._marks()
+        pre = self._learn_before(spec, source="discovery" if candidate is not None else "user")
         result, report = replicate(candidate, spec, self.runner, progress=progress, **kwargs)
+        self._learn_after(spec, result, pre, source="discovery" if candidate is not None else "user")
         checks = self._interpret(result) if interpret else []
         self._finish(result, marks)
         section = _section("replication", "Replication and robustness", _replication_html(report),

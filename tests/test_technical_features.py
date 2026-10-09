@@ -177,6 +177,9 @@ def test_geometric_ticker(demo):
     _, _, out = demo
     r = out.loc["GEO"]
     assert r["return_1m_pct"] == pytest.approx((1.002**21 - 1) * 100)
+    assert r["return_3d_pct"] == pytest.approx((1.002**3 - 1) * 100)
+    assert r["return_5d_pct"] == pytest.approx((1.002**5 - 1) * 100)
+    assert r["return_10d_pct"] == pytest.approx((1.002**10 - 1) * 100)
     assert r["return_12m_ex_1m_pct"] == pytest.approx((1.002**231 - 1) * 100)
     assert r["volatility_20d_pct"] == pytest.approx(0.0, abs=1e-6)
     assert r["rsi_14"] == 100.0

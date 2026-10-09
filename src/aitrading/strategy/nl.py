@@ -21,6 +21,7 @@ from __future__ import annotations
 import calendar
 import difflib
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import date
@@ -832,8 +833,45 @@ class HeuristicStrategyTranslator:
             spec.name = "_plus_".join([spec.name, *merged])
         return spec
 
+    def _short_horizon(self, spec: StrategySpec, t: str, p: _Parse) -> bool:
+        """'3-day momentum', '5-day reversal', 'two-week winners' -> a short-horizon return signal
+        (3 / 5 / 10 sessions, or the 1-month return for ~20 days) with weekly rebalancing unless
+        the idea names a frequency. Returns True when the horizon was set."""
+        old = next((s.feature for s in spec.signal if s.feature in ("return_12m_ex_1m_pct", "return_1m_pct")), None)
+        if old is None:
+            return False
+        what = r"(?:price\s+|total\s+)?(?:momentum|returns?|winners|losers|performance|lookback|revers\w*|mean[\s-]*revers\w*)"
+        m = re.search(r"\b(\d{1,2})[\s-]*(?:trading[\s-]*)?(?:days?|d|sessions?)\b[\s-]*(?:'s\s+)?" + what, t)
+        days: int | None = int(m.group(1)) if m else None
+        if m is None:
+            m = re.search(r"\b([12])[\s-]*(?:weeks?|wks?)\b[\s-]*(?:'s\s+)?" + what, t) or re.search(
+                r"\b(?:last|past|prior)\s+week'?s?\s+(?:winners|losers|returns?|performance)", t)
+            if m is None:
+                return False
+            days = 5 * int(m.group(1)) if m.lastindex else 5
+        assert days is not None and m is not None
+        windows = {3: "return_3d_pct", 5: "return_5d_pct", 10: "return_10d_pct", 21: "return_1m_pct"}
+        nearest = min(windows, key=lambda w: (abs(math.log(max(days, 1) / w)), w))
+        new = windows[nearest]
+        if days not in windows and not (nearest == 21 and 19 <= days <= 23):
+            p.unsupported.append(f"{days}-day lookback (catalog has 3, 5, 10-day and 1-month returns; used {new})")
+        if new != old:
+            self._swap_feature(spec, old, new)
+            label = {3: "3d", 5: "5d", 10: "10d", 21: "1m"}[nearest]
+            # a different horizon is a different idea: do not present it under the 12-1 / 1-month template
+            spec.name = f"{'reversal' if old == 'return_1m_pct' else 'momentum'}_{label}"
+        p.notes.append(f"'{m.group(0)}' -> signal {new} ({nearest} sessions).")
+        if nearest <= 10:
+            spec.rebalance = "weekly"
+            p.overridden.add("rebalance")
+            p.notes.append("A signal this short decays within days, so the default rebalance is weekly (say 'daily' or "
+                           "'monthly rebalance' to change it).")
+        return True
+
     def _signal_variants(self, spec: StrategySpec, t: str, p: _Parse) -> None:
         if spec.kind != "cross_sectional":
+            return
+        if self._short_horizon(spec, t, p):
             return
         feats = [s.feature for s in spec.signal]
         if "return_12m_ex_1m_pct" in feats:

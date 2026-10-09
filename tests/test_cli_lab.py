@@ -433,3 +433,73 @@ def test_backtest_summary_flags_numbers_not_in_the_results():
     assert any(line.startswith("UNVERIFIED: the verdict text states 1.4, 3.2") for line in lines)
     honest = HeuristicInterpreter().interpret(res)[0]
     assert not any("UNVERIFIED" in line for line in cli_lab._summary_lines(res.model_copy(update={"interpretation": honest})))
+
+
+# --------------------------------------------------------------------------------------------
+# Learning from backtests (belief ledger, research loop)
+# --------------------------------------------------------------------------------------------
+
+
+def test_backtest_records_what_it_taught_and_beliefs_commands(capsys, env):
+    out_dir = env / "out"
+    code, out, err = run(capsys, "backtest", "--offline", "--no-open", "--out", str(out_dir), "12-1 momentum deciles")
+    assert code == 0, err
+    assert "Learning: [h-" in out and "Before the run, bayes predicted" in out and "Belief now" in out
+    ledger = env / "home" / "beliefs" / "synthetic" / "ledger.json"
+    assert ledger.exists()
+    data = json.loads(ledger.read_text(encoding="utf-8"))
+    assert len(data["evidence"]) == 1 and len(data["predictions"]) == 1
+    assert data["predictions"][0]["target_evidence_id"]
+
+    code, out, _ = run(capsys, "beliefs", "list")
+    assert code == 0 and "| h-" in out and "12-1 month return" in out
+    hid = next(iter(data["hypotheses"]))
+    code, out, _ = run(capsys, "beliefs", "show", hid)
+    assert code == 0 and "Belief: net Sharpe" in out and "| backtest |" in out
+    code, out, _ = run(capsys, "beliefs", "judge", "6-month momentum")
+    assert code == 0 and "Prediction: Sharpe" in out and hid in out  # the related experience is cited
+    code, out, _ = run(capsys, "beliefs", "lessons")
+    assert code == 0 and "Lessons" in out
+    code, out, _ = run(capsys, "beliefs", "calibration")
+    assert code == 0 and "| bayes | backtest | 1 |" in out
+    code, out, _ = run(capsys, "beliefs", "export", str(env / "judge.jsonl"))
+    assert code == 0 and "wrote 1 example(s)" in out and (env / "judge.jsonl").exists()
+    code, out, _ = run(capsys, "beliefs", "forget", hid)
+    assert code == 0 and "removed" in out
+    code, out, _ = run(capsys, "beliefs", "list")
+    assert code == 0 and "No tested hypotheses" in out
+
+
+def test_backtest_no_learn_writes_no_ledger(capsys, env):
+    code, out, err = run(capsys, "backtest", "--offline", "--no-open", "--no-learn", "--out", str(env / "out"),
+                         "12-1 momentum deciles")
+    assert code == 0, err
+    assert "Learning" not in out and not (env / "home" / "beliefs").exists()
+
+
+def test_research_command_runs_the_loop(capsys, env, monkeypatch):
+    from test_beliefs import FakeRunner
+
+    monkeypatch.setattr(cli_lab, "_runner", lambda provider: FakeRunner())
+    out_dir = env / "out"
+    code, out, err = run(capsys, "research", "--offline", "--out", str(out_dir), "--rounds", "2", "--per-round", "2",
+                         "--end", "2026-09-30", "momentum")
+    assert code == 0, err
+    assert "# Research loop - market 'synthetic', theme: momentum" in out and "Holdout exam" in out
+    assert "round 1/2" in err and list((out_dir / "research").glob("*/report.json"))
+    code, out, _ = run(capsys, "beliefs", "list")
+    assert code == 0 and out.count("| h-") == 4
+
+
+def test_research_judge_open_needs_its_endpoint(capsys, env):
+    code, _, err = run(capsys, "research", "--offline", "--judge", "open", "--end", "2026-09-30")
+    assert code == 2 and "--judge-url" in err
+
+
+def test_paper_trading_feeds_the_ledger_without_breaking_on_short_records(capsys, env):
+    out_dir = env / "out"
+    assert run(capsys, "backtest", "--offline", "--no-open", "--out", str(out_dir), "12-1 momentum deciles", "--save", "mom")[0] == 0
+    code, out, err = run(capsys, "strategy", "run", "mom", "--out", str(out_dir), "--no-open")
+    assert code == 0, err  # one day of paper trading is not evidence yet: nothing is recorded, nothing breaks
+    data = json.loads((env / "home" / "beliefs" / "synthetic" / "ledger.json").read_text(encoding="utf-8"))
+    assert [e["kind"] for e in data["evidence"].values()] == ["backtest"]

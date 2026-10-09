@@ -367,6 +367,9 @@ _REBAL_ADJ = {"daily": "daily", "weekly": "weekly", "monthly": "monthly", "quart
 
 _FEATURE_LABELS = {
     "return_12m_ex_1m_pct": "12-1 momentum (return from 12 months to 1 month ago)",
+    "return_3d_pct": "3-day return",
+    "return_5d_pct": "1-week (5-day) return",
+    "return_10d_pct": "2-week (10-day) return",
     "return_1m_pct": "last month's return",
     "return_3m_pct": "3-month return",
     "return_6m_pct": "6-month return",

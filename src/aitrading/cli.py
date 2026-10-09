@@ -1,6 +1,6 @@
 """Command-line interface: ``aitrading run | screen | spec | catalog | demo`` plus the idea-lab
 commands registered by :mod:`aitrading.cli_lab` (``backtest | library | strategy | discover | ideas |
-dashboard``).
+dashboard``) and the learning commands of :mod:`aitrading.cli_beliefs` (``research | beliefs``).
 
 Commands
 --------
@@ -383,6 +383,9 @@ def build_parser() -> argparse.ArgumentParser:
     from aitrading import cli_lab  # idea lab, simulated trading, discovery, dashboard
 
     cli_lab.register(sub, base=base, engine=engine, data=data)
+    from aitrading import cli_beliefs  # belief ledger and research loop
+
+    cli_beliefs.register(sub, base=base, engine=engine, data=data)
     return parser
 
 
